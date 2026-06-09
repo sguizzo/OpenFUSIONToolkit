@@ -191,11 +191,6 @@ dthist=self%dt
 dtin=self%dt
 
 !---------------------------------------------------------------------------
-! Set parameters of nonlinear function
-!---------------------------------------------------------------------------
-ALLOCATE(self%nlfun)
-self%nlfun%parent_sim=>self
-!---------------------------------------------------------------------------
 ! Setup linear solver
 !---------------------------------------------------------------------------
 self%jac_dt=self%dt
@@ -1671,7 +1666,11 @@ CALL fem_dirichlet_diag(oft_blagrange,self%jacobian,self%n_bc,1)
 CALL fem_dirichlet_diag(oft_blagrange,self%jacobian,self%velx_bc,2)
 CALL fem_dirichlet_diag(oft_blagrange,self%jacobian,self%vely_bc,3)
 CALL fem_dirichlet_diag(oft_blagrange,self%jacobian,self%velz_bc,4)
-CALL fem_dirichlet_diag(oft_blagrange,self%jacobian,self%T_bc,5)
+IF (self%incomp) THEN
+  CALL fem_dirichlet_diag(oft_blagrange_p,self%jacobian,self%T_bc,5)
+ELSE
+  CALL fem_dirichlet_diag(oft_blagrange,self%jacobian,self%T_bc,5)
+END IF
 CALL fem_dirichlet_diag(oft_blagrange,self%jacobian,self%psi_bc,6)
 CALL fem_dirichlet_diag(oft_blagrange,self%jacobian,self%by_bc,7)
 !
@@ -1702,7 +1701,7 @@ END SUBROUTINE update_jacobian
 !> Setup composite FE representation and ML environment
 !---------------------------------------------------------------------------
 subroutine setup(self,mg_mesh_in, order, fe_rep_in)
-class(oft_xmhd_2d_sim), intent(inout) :: self
+class(oft_xmhd_2d_sim), intent(inout), target :: self
 CLASS(multigrid_mesh), TARGET, intent(in) :: mg_mesh_in
 integer(i4), intent(in) :: order
 CLASS(oft_scalar_bfem), TARGET,optional, intent(in) :: fe_rep_in
@@ -1810,6 +1809,12 @@ IF (.NOT. ALLOCATED(self%gamma)) THEN
 END IF
 ! Set boundary conditions not alreadys set
 CALL self%setup_bc()
+
+!---------------------------------------------------------------------------
+! Allocate nonlinear function object
+!---------------------------------------------------------------------------
+ALLOCATE(self%nlfun)
+self%nlfun%parent_sim=>self
 end subroutine setup
 
 !---------------------------------------------------------------------------
@@ -1821,7 +1826,11 @@ IF(.NOT.ASSOCIATED(self%n_bc))self%n_bc=>oft_blagrange%global%gbe
 IF(.NOT.ASSOCIATED(self%velx_bc))self%velx_bc=>oft_blagrange%global%gbe
 IF(.NOT.ASSOCIATED(self%vely_bc))self%vely_bc=>oft_blagrange%global%gbe
 IF(.NOT.ASSOCIATED(self%velz_bc))self%velz_bc=>oft_blagrange%global%gbe
-IF(.NOT.ASSOCIATED(self%T_bc))self%T_bc=>oft_blagrange%global%gbe
+IF (self%incomp) THEN
+   IF(.NOT.ASSOCIATED(self%T_bc))self%T_bc=>oft_blagrange_p%global%gbe
+ELSE
+  IF(.NOT.ASSOCIATED(self%T_bc))self%T_bc=>oft_blagrange%global%gbe
+END IF
 IF(.NOT.ASSOCIATED(self%psi_bc))self%psi_bc=>oft_blagrange%global%gbe
 IF(.NOT.ASSOCIATED(self%by_bc))self%by_bc=>oft_blagrange%global%gbe
 ! Turn off density evolution if incompressible

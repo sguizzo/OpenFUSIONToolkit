@@ -53,6 +53,7 @@ REAL(r8) :: nl_tol = 1.d-9
 REAL (r8):: coords(3), psi(1), q(1)
 LOGICAL :: pm=.TRUE.
 LOGICAL :: success
+LOGICAL, allocatable, dimension(:) :: mhd_flag
 CHARACTER(LEN=25) :: filename_eq = 'equilibrium.h5' !< Name of input file for mesh, fix later for variable length
 CHARACTER(LEN=25) :: filename_pert= 'paper_pert_0115.h5' !< Name of input file for mesh, fix later for variable length
 CHARACTER(LEN=25) :: tmp_str
@@ -79,27 +80,19 @@ CALL hdf5_read(psi_eq,TRIM(filename_eq),"tokamaker/PSI",success)
 
 psi_total = psi_eq
 
-
-!---------------------------------------------------------------------------
-! Now, need to setup a tokamaker device
-!---------------------------------------------------------------------------
 CALL machine%setup(ML_blagrange)
-machine%region_info%nnonaxi = 0
-ALLOCATE(machine%region_info%reg_map(machine%fe_rep%mesh%nreg))
-machine%region_info%reg_map=0
-machine%free = .TRUE.
-
-CALL gs_setup_walls(machine)
-CALL machine%init()
-machine%ncoils = 7
+write(*,*) 83
+machine%save_visit = .FALSE.
 machine%ncoil_regs = 7
-ALLOCATE(machine%coil_nturns(machine%fe_rep%mesh%nreg,machine%ncoils))
-machine%coil_nturns = 0
-DO j=1, machine%ncoils
-  machine%coil_nturns(j + 8, j) = 1
-END DO
+ALLOCATE(machine%coil_regions(machine%ncoil_regs))
+machine%coil_regions(1)%id = 9
+machine%coil_regions(2)%id = 10
+machine%coil_regions(3)%id = 11
+machine%coil_regions(4)%id = 12
+machine%coil_regions(5)%id = 13
+machine%coil_regions(6)%id = 14
+machine%coil_regions(7)%id = 15
 
-machine%coil_vcont = 0.d0
 machine%ncond_regs = 5
 ALLOCATE(machine%cond_regions(machine%ncond_regs))
 machine%cond_regions(1)%id = 4
@@ -112,62 +105,107 @@ machine%cond_regions(4)%id = 7
 machine%cond_regions(4)%eta = 6.9d-7/mu0
 machine%cond_regions(5)%id = 8
 machine%cond_regions(5)%eta = 6.9d-7/mu0
-ALLOCATE(machine%coil_regions(machine%ncoil_regs))
-DO j=1, machine%ncoils
-  machine%coil_regions(j)%id = 8 + j
-END DO
-CALL compute_bcmat(machine)
 
+CALL gs_setup_walls(machine)
+CALL machine%init()
+CALL compute_bcmat(machine)
+! write(*,*) 82
+! !---------------------------------------------------------------------------
+! ! Now, need to setup a tokamaker device
+! !---------------------------------------------------------------------------
+! CALL machine%setup(ML_blagrange)
+! machine%region_info%nnonaxi = 0
+! ALLOCATE(machine%region_info%reg_map(machine%fe_rep%mesh%nreg))
+! machine%region_info%reg_map=0
+! machine%free = .TRUE.
+
+! IF(.NOT.ASSOCIATED(machine%ignore_rmask))THEN
+!   ALLOCATE(machine%ignore_rmask(machine%fe_rep%mesh%nreg))
+!   machine%ignore_rmask=.FALSE.
+!   machine%ignore_rmask(5)=.TRUE.
+!   machine%ignore_rmask(6)=.TRUE.
+! END IF
+
+! ! machine%ncoils = 7
+! machine%ncoil_regs = 7
+! ! ALLOCATE(machine%coil_nturns(machine%fe_rep%mesh%nreg,machine%ncoils))
+! ! machine%coil_nturns = 0
+! ! DO j=1, machine%ncoils
+! !   machine%coil_nturns(j + 8, j) = 1
+! ! END DO
+! write(*,*) 101
+! ! machine%coil_vcont = 0.d0
+! write(*,*) 108
+! CALL gs_setup_walls(machine)
+! write(*,*) 110
+! CALL machine%init()
+! machine%ncond_regs = 5
+! ALLOCATE(machine%cond_regions(machine%ncond_regs))
+! machine%cond_regions(1)%id = 4
+! machine%cond_regions(1)%eta = 6.9d-7/mu0
+! machine%cond_regions(2)%id = 5
+! machine%cond_regions(2)%eta = 1.14d-6/mu0
+! machine%cond_regions(3)%id = 6
+! machine%cond_regions(3)%eta = 1.14d-6/mu0
+! machine%cond_regions(4)%id = 7
+! machine%cond_regions(4)%eta = 6.9d-7/mu0
+! machine%cond_regions(5)%id = 8
+! machine%cond_regions(5)%eta = 6.9d-7/mu0
+! ALLOCATE(machine%coil_regions(machine%ncoil_regs))
+! DO j=1, machine%ncoils
+!   machine%coil_regions(j)%id = 8 + j
+! END DO
+! CALL compute_bcmat(machine)
 !---------------------------------------------------------------------------
 ! Now, need to equilibrium object
 !---------------------------------------------------------------------------
 
+CALL equil%new(machine)
+CALL equil%psi%restore_local(psi_total)
+
+CALL gs_update_bounds(equil)
 
 
-! CALL equil%psi%restore_local(psi_total)
+equil%itor_target=ip_target*mu0
+equil%ip_ratio_target=ip_ratio_target
+equil%p_scale = 0.28658184156588085
+equil%ffp_scale = 2.596639717247778
+tmp_str = 'tokamaker_f.prof'
+CALL gs_profile_load(tmp_str,equil%I)
+tmp_str = 'tokamaker_p.prof'
+CALL gs_profile_load(tmp_str,equil%P)
+equil%I%plasma_bounds=equil%plasma_bounds
+equil%P%plasma_bounds=equil%plasma_bounds
 
-! CALL gs_update_bounds(equil)
+equil%vcontrol_val = 0.d0
 
+ALLOCATE(equil%coil_currs(machine%ncoil_regs))
+equil%coil_currs = [-10004540.249054534, 8131096.462417697, 8130193.40495448, -2752265.1799410507, -2755148.7923723585, -1429157.477860515,  -1424955.0239338675]*mu0
+ALLOCATE(areas(machine%ncoil_regs))
+areas = [1.8,0.25, 0.25, 0.25, 0.25, 0.25, 0.25 ]
+equil%coil_currs = equil%coil_currs/areas
+equil%mode = 0
+equil%I%f_offset = 36.d0
 
-! equil%itor_target=ip_target*mu0
-! equil%ip_ratio_target=ip_ratio_target
-! equil%p_scale = 0.28658184156588085
-! equil%ffp_scale = 2.596639717247778
-! tmp_str = 'tokamaker_f.prof'
-! CALL gs_profile_load(tmp_str,equil%I)
-! tmp_str = 'tokamaker_p.prof'
-! CALL gs_profile_load(tmp_str,equil%P)
-! write(*,*) 105
-! equil%I%plasma_bounds=equil%plasma_bounds
-! equil%P%plasma_bounds=equil%plasma_bounds
-
-! write(*,*) 113
-! equil%vcontrol_val = 0.d0
-
-! ALLOCATE(equil%coil_currs(machine%ncoil_regs))
-! equil%coil_currs = [-10004540.249054534, 8131096.462417697, 8130193.40495448, -2752265.1799410507, -2755148.7923723585, -1429157.477860515,  -1424955.0239338675]*mu0
-! ALLOCATE(areas(machine%ncoil_regs))
-! areas = [1.8,0.25, 0.25, 0.25, 0.25, 0.25, 0.25 ]
-! equil%coil_currs = equil%coil_currs/areas
-! equil%mode = 0
-! equil%I%f_offset = 36.d0
-
-! write(*,*) 141
-! dt = 0.001
-! lin_tol = 1.d-11
-! nl_tol = 1.d-9
-! ALLOCATE(dens_reg(machine%mesh%nreg))
-! dens_reg = -1.d0
+dt = 0.001
+lin_tol = 1.d-11
+nl_tol = 1.d-9
+ALLOCATE(dens_reg(machine%mesh%nreg))
+dens_reg = -1.d0
 ! dens_reg(5) = 9806.d0
 ! dens_reg(6) = 9806.d0
-! ALLOCATE(visc_reg(machine%mesh%nreg))
-! visc_reg = -1.d0
+ALLOCATE(visc_reg(machine%mesh%nreg))
+visc_reg = -1.d0
 ! visc_reg(5) = 1.d-3
 ! visc_reg(6) = 1.d-3
 
-! equil%device => machine
-! write(*,*) 153
-! CALL b_sim%setup(mg_mesh, equil, dt, lin_tol, nl_tol, dens_reg, visc_reg)
+ALLOCATE(mhd_flag(machine%mesh%nreg))
+mhd_flag = .FALSE.
+! mhd_flag(5) = .TRUE.
+! mhd_flag(6) = .TRUE.
+
+equil%device => machine
+CALL b_sim%setup(mg_mesh, equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg)
 ! write(*,*) 155
 ! CALL b_sim%step(t, dt, nl_its, l_its, nretry)
 
