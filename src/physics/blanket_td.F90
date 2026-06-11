@@ -30,6 +30,7 @@ USE oft_gs_td, ONLY: oft_tmaker_td_mfop, tMaker_td_mfnk_update, build_vac_op, ap
 USE oft_mesh_local_util, ONLY: mesh_local_findedge
 USE xmhd_2d, ONLY: oft_xmhd_2d_sim, build_approx_jacobian
 USE oft_stitching, ONLY: oft_seam, seam_list
+USE IEEE_ARITHMETIC
 IMPLICIT NONE
 #include "local.h"
 #if !defined(TDIFF_RST_LEN)
@@ -138,7 +139,6 @@ IF (PRESENT(incomp)) THEN
 ELSE
     mhd_sim%incomp = .TRUE.
 END IF
-
 mhd_sim%cyl_flag = .TRUE.
 mhd_sim%dt = dt
 
@@ -165,58 +165,48 @@ ALLOCATE(mhd_sim%by_bc(mhd_sim%fe_rep%fields(7)%fe%ne))
 
 mhd_sim%psi_bc = .TRUE. 
 mhd_sim%by_bc = .TRUE.  !-> deal with by later
-mhd_sim%velx_bc = .TRUE. 
-mhd_sim%vely_bc = .TRUE. 
-mhd_sim%velz_bc = .TRUE. 
+mhd_sim%velx_bc = .FALSE. 
+mhd_sim%vely_bc = .FALSE. 
+mhd_sim%velz_bc = .FALSE. 
 
 mhd_sim%n_bc = .TRUE.
 mhd_sim%T_bc = .TRUE.
 
-! mhd_sim%psi_bc = .TRUE. 
-! mhd_sim%by_bc = .TRUE.  !-> deal with by later
-! mhd_sim%velx_bc = .FALSE. 
-! mhd_sim%vely_bc = .FALSE. 
-! mhd_sim%velz_bc = .FALSE. 
 
-! mhd_sim%n_bc = .TRUE.
-! mhd_sim%T_bc = .TRUE.
+ALLOCATE(cell_dofs(lag_rep%nce))
+ALLOCATE(cell_dofs_p(mhd_sim%fe_rep%fields(5)%fe%ne))
+DO i = 1, mesh%nc
+    call mhd_sim%fe_rep%fields(5)%fe%ncdofs(i,cell_dofs_p) ! Get global index of local DOFs
+    call lag_rep%ncdofs(i,cell_dofs) ! Get global index of local DOFs
+    DO j=1, SIZE(cell_dofs)
+        IF (mhd_flag(mesh%reg(i))) THEN
+            mhd_sim%psi_bc(cell_dofs(j)) = .FALSE. !add contributions everywhere in MHD regions, including boundaries
+            mhd_sim%T_bc(cell_dofs_p(j)) = .FALSE. !add contributions everywhere in MHD regions, including boundaries
+            IF (.NOT. mhd_sim%incomp) mhd_sim%n_bc(cell_dofs(j)) = .FALSE. !add contributions everywhere in MHD regions, including boundaries, if incompressible
+        ELSE
+            mhd_sim%velx_bc(cell_dofs(j)) = .TRUE. !pin velocity to zero everywhere in non-MHD regions, including boundaries
+            mhd_sim%vely_bc(cell_dofs(j)) = .TRUE. 
+            mhd_sim%velz_bc(cell_dofs(j)) = .TRUE.
+        END IF 
+    END DO
+END DO
 
-
-! ALLOCATE(cell_dofs(lag_rep%nce))
-! ALLOCATE(cell_dofs_p(mhd_sim%fe_rep%fields(5)%fe%ne))
-! DO i = 1, mesh%nc
-!     call mhd_sim%fe_rep%fields(5)%fe%ncdofs(i,cell_dofs_p) ! Get global index of local DOFs
-!     call lag_rep%ncdofs(i,cell_dofs) ! Get global index of local DOFs
-!     DO j=1, SIZE(cell_dofs)
-!         IF (mhd_flag(mesh%reg(i))) THEN
-!             mhd_sim%psi_bc(cell_dofs(j)) = .FALSE. !add contributions everywhere in MHD regions, including boundaries
-!             mhd_sim%T_bc(cell_dofs_p(j)) = .FALSE. !add contributions everywhere in MHD regions, including boundaries
-!             IF (.NOT. mhd_sim%incomp) mhd_sim%n_bc(cell_dofs(j)) = .FALSE. !add contributions everywhere in MHD regions, including boundaries, if incompressible
-!         ELSE
-!             mhd_sim%velx_bc(cell_dofs(j)) = .TRUE. !pin velocity to zero everywhere in non-MHD regions, including boundaries
-!             mhd_sim%vely_bc(cell_dofs(j)) = .TRUE. 
-!             mhd_sim%velz_bc(cell_dofs(j)) = .TRUE.
-!         END IF 
-!     END DO
-! END DO
-
-! IF (mhd_sim%incomp) THEN
-!     ALLOCATE(p_dir_set(mesh%nreg))
-!     p_dir_set = .FALSE.
-!     DO i=1, mesh%nc
-!         IF (mhd_flag(mesh%reg(i)) .AND. .NOT. p_dir_set(mesh%reg(i))) THEN
-!             call mhd_sim%fe_rep%fields(5)%fe%ncdofs(i,cell_dofs_p) ! Get global index of local DOFs
-!             mhd_sim%T_bc(cell_dofs_p(1)) = .TRUE.
-!             p_dir_set(mesh%reg(i)) = .TRUE.
-!             write(*,*) "Pinning node ", cell_dofs_p(1), " in region ", mesh%reg(i)
-!         END IF
-!     END DO
-!     DEALLOCATE(p_dir_set)
-! END IF
-! DEALLOCATE(cell_dofs, cell_dofs_p)
+IF (mhd_sim%incomp) THEN
+    ALLOCATE(p_dir_set(mesh%nreg))
+    p_dir_set = .FALSE.
+    DO i=1, mesh%nc
+        IF (mhd_flag(mesh%reg(i)) .AND. .NOT. p_dir_set(mesh%reg(i))) THEN
+            call mhd_sim%fe_rep%fields(5)%fe%ncdofs(i,cell_dofs_p) ! Get global index of local DOFs
+            mhd_sim%T_bc(cell_dofs_p(1)) = .TRUE.
+            p_dir_set(mesh%reg(i)) = .TRUE.
+            write(*,*) "Pinning node ", cell_dofs_p(1), " in region ", mesh%reg(i)
+        END IF
+    END DO
+    DEALLOCATE(p_dir_set)
+END IF
+DEALLOCATE(cell_dofs, cell_dofs_p)
 
 self%mug => mhd_sim
-
 
 !------------------------------------------------------------------------------
 ! Create Solver fields, augmented with coils
@@ -257,12 +247,13 @@ END IF
 !------------------------------------------------------------------------------
 ! Set initial field values
 !------------------------------------------------------------------------------
-CALL self%u%set(1.d0, 1)
+CALL self%u%set(0.d0, 1)
 CALL self%u%set(0.d0, 2)
 CALL self%u%set(0.d0, 3)
 CALL self%u%set(0.d0, 4)
-CALL self%u%set(1000.d0, 5)
+CALL self%u%set(0.d0, 5)
 CALL self%u%set(self%tkmr%gs_equil%I%f_offset, 7)
+CALL self%u%set(0.d0, 7)
 
 NULLIFY(tmp_arr, vals_out)
 CALL self%tkmr%gs_device%fe_rep%vec_create(tmp_vec)
@@ -353,11 +344,12 @@ self%pre%A=>self%nlfun%jac_op
 ! Setup matrix free solver
 !------------------------------------------------------------------------------
 ALLOCATE(self%mfmat) 
-self%mfmat%f=>self%nlfun
-CALL self%rhs%new(self%mfmat%u0)
-CALL self%rhs%new(self%mfmat%f0)
-CALL self%rhs%new(self%mfmat%tmp)
-CALL self%rhs%new(self%mfmat%utyp)
+CALL self%mfmat%setup(self%tmp,self%nlfun)
+! self%mfmat%f=>self%nlfun
+! CALL self%rhs%new(self%mfmat%u0)
+! CALL self%rhs%new(self%mfmat%f0)
+! CALL self%rhs%new(self%mfmat%tmp)
+! CALL self%rhs%new(self%mfmat%utyp)
 
 
 ALLOCATE(self%mf_solver)
@@ -382,17 +374,6 @@ self%nksolver%backtrack=.FALSE.
 !self%nksolver%J_update=>gs_mfnk_update
 self%nksolver%up_freq=1
 
-!TEST MUG JACOBIAN
-CALL mhd_sim%u%set(5.d0)
-CALL mhd_sim%u0%set(5.d0)
-CALL build_approx_jacobian(mhd_sim, mhd_sim%u)
-self%pre%A => mhd_sim%jacobian
-! self%pre%A => self%tkmr%vac_op
-CALL self%pre%apply(self%u, self%tmp)
-CALL mhd_sim%jacobian%apply(mhd_sim%u, mhd_sim%u0)
-CALL mhd_sim%u0%get_local(tmp_arr)
-write(*,*) MAXVAL(tmp_arr)
-write(*,*) MINVAL(tmp_arr)
 
 end subroutine setup_blanket_td
 
@@ -425,31 +406,14 @@ ELSE
 END IF
 
 !Update preconditioner
-self%pre%A => self%tkmr%vac_op
-self%mf_solver%pre => self%pre
 
 CALL self%pre%update(.TRUE.)
 CALL self%mf_solver%pre%update(.TRUE.)
-! !diagnose preconditioner:
-! select type(pre=> self%pre%A)
-! type is (oft_native_matrix)
-!     P => pre
-! class default
-!     call oft_abort("mug jacobian must be oft_native_matrix", &
-!                    "build_blankettd_jacobian", __FILE__)
-! end select
-! write(*,*) 'nnz:', P%nnz
-! write(*,*) 'nrg:', P%nrg
-! write(*,*) 'ncg:', P%ncg
-! DO i = 1, P%ni
-!     DO j = 1, P%nj
-!         write(*,*) "Block (", i, ",", j, ") nnz:", P%map(i,j)%nnz
-!     END DO
-! END DO
 
 !Build RHS and apply boundary conditions
 CALL self%tmp%add(0.d0,1.d0,self%u)
 CALL apply_rhs_blanket(self%nlfun,self%u,self%rhs)
+
 
 DO j = 1,4
     CALL self%nksolver%apply(self%u,self%rhs)
@@ -513,13 +477,16 @@ IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
 END IF
 
 CALL apply_rhs(self%parent_sim%tkmr, tmp_in, tmp_out)
+
 CALL self%parent_sim%tkmr%gs_device%zerob_bc%apply(tmp_out)
 
 ! Extract component 1 from tmp_out
 CALL tmp_out%get_local(tmp_arr2, 1)
+tmp_arr1 = 0.d0
 tmp_arr1 = tmp_arr1 + tmp_arr2
 CALL b%restore_local(tmp_arr1, 6)
 CALL tmp_out%restore_local(tmp_arr2, 1)  ! Restore to tmp_out
+
 NULLIFY(tmp_arr2)
 
 ! Extract component 2 from tmp_out (if coils exist)
@@ -576,10 +543,10 @@ IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
 END IF
 
 CALL self%parent_sim%tkmr%apply_real(tmp_in, tmp_out) 
-CALL self%parent_sim%tkmr%gs_device%zerob_bc%apply(tmp_out)
 
 ! Extract component 1 from tmp_out
 CALL tmp_out%get_local(tmp_arr2, 1)
+tmp_arr1 = 0.d0
 tmp_arr1 = tmp_arr1 + tmp_arr2
 CALL b%restore_local(tmp_arr1, 6)
 CALL tmp_out%restore_local(tmp_arr2, 1)  ! Restore to tmp_out
@@ -617,165 +584,167 @@ class(oft_vector), pointer :: tmp
 
 CALL mat%zero
 
-CALL fem_dirichlet_diag(lag_rep,mat,self%mug%n_bc,1)
-CALL fem_dirichlet_diag(lag_rep,mat,self%mug%velx_bc,2)
-CALL fem_dirichlet_diag(lag_rep,mat,self%mug%vely_bc,3)
-CALL fem_dirichlet_diag(lag_rep,mat,self%mug%velz_bc,4)
-CALL fem_dirichlet_diag(self%mug%fe_rep%fields(5)%fe,mat,self%mug%T_bc,5)
-CALL fem_dirichlet_diag(lag_rep,mat,self%mug%psi_bc,6)
-CALL fem_dirichlet_diag(lag_rep,mat,self%mug%by_bc,7)
+! CALL fem_dirichlet_diag(lag_rep,mat,self%mug%n_bc,1)
+! CALL fem_dirichlet_diag(lag_rep,mat,self%mug%velx_bc,2)
+! CALL fem_dirichlet_diag(lag_rep,mat,self%mug%vely_bc,3)
+! CALL fem_dirichlet_diag(lag_rep,mat,self%mug%velz_bc,4)
+! CALL fem_dirichlet_diag(self%mug%fe_rep%fields(5)%fe,mat,self%mug%T_bc,5)
+! CALL fem_dirichlet_diag(lag_rep,mat,self%mug%psi_bc,6)
+! CALL fem_dirichlet_diag(lag_rep,mat,self%mug%by_bc,7)
 
-! Set block (8,8) as identity matrix for coil currents
-IF (self%tkmr%gs_device%ncoils > 0) THEN
-    diag_val = 1.d0
-    DO i = 1, self%tkmr%gs_device%ncoils
-        CALL mat%add_values([i], [i], diag_val, 1, 1, 8, 8)
-    END DO
+! ! Set block (8,8) as identity matrix for coil currents
+! IF (self%tkmr%gs_device%ncoils > 0) THEN
+!     diag_val = 1.d0
+!     DO i = 1, self%tkmr%gs_device%ncoils
+!         CALL mat%add_values([i], [i], diag_val, 1, 1, 8, 8)
+!     END DO
+! END IF
+
+select type(vac_op => self%tkmr%vac_op)
+type is (oft_native_matrix)
+    V => vac_op
+class default
+    call oft_abort("vac_op must be an oft_native_matrix", &
+                   "build_blankettd_jacobian", __FILE__)
+end select
+
+select type(mug_jac => self%mug%jacobian)
+type is (oft_native_matrix)
+    M => mug_jac
+class default
+    call oft_abort("mug jacobian must be oft_native_matrix", &
+                   "build_blankettd_jacobian", __FILE__)
+end select
+
+
+write(*,*) "Building individual jacobians"
+!Populate MUG and TokaMaker matrices
+CALL build_approx_jacobian(self%mug, a)
+IF (PRESENT(update_vac)) THEN
+    IF (update_vac) CALL build_vac_op(self%tkmr,self%tkmr%vac_op)
+ELSE
+    CALL build_vac_op(self%tkmr,self%tkmr%vac_op)
 END IF
 
-! select type(vac_op => self%tkmr%vac_op)
-! type is (oft_native_matrix)
-!     V => vac_op
-! class default
-!     call oft_abort("vac_op must be an oft_native_matrix", &
-!                    "build_blankettd_jacobian", __FILE__)
-! end select
+! Count and collect BC row indices
+nbc_rows = 0
+DO i = 1, SIZE(self%mug%psi_bc)
+    IF (self%mug%psi_bc(i)) nbc_rows = nbc_rows + 1
+END DO
 
-! select type(mug_jac => self%mug%jacobian)
-! type is (oft_native_matrix)
-!     M => mug_jac
-! class default
-!     call oft_abort("mug jacobian must be oft_native_matrix", &
-!                    "build_blankettd_jacobian", __FILE__)
-! end select
-
-
-! write(*,*) "Building individual jacobians"
-! !Populate MUG and TokaMaker matrices
-! CALL build_approx_jacobian(self%mug, a)
-! IF (PRESENT(update_vac)) THEN
-!     IF (update_vac) CALL build_vac_op(self%tkmr,self%tkmr%vac_op)
-! ELSE
-!     CALL build_vac_op(self%tkmr,self%tkmr%vac_op)
-! END IF
-
-! ! Count and collect BC row indices
-! nbc_rows = 0
-! DO i = 1, SIZE(self%mug%psi_bc)
-!     IF (self%mug%psi_bc(i)) nbc_rows = nbc_rows + 1
-! END DO
-
-! IF (nbc_rows > 0) THEN
-!     ALLOCATE(bc_rows(nbc_rows))
-!     bc_rows = 0
-!     k = 0
-!     DO i = 1, SIZE(self%mug%psi_bc)
-!         IF (self%mug%psi_bc(i)) THEN
-!             k = k + 1
-!             bc_rows(k) = i
-!         END IF
-!     END DO
-!     ! Zero rows in block (6,6) only (psi equation rows)
-!     CALL M%zero_rows(nbc_rows, bc_rows, 6)
-!     DEALLOCATE(bc_rows)
-! END IF
+IF (nbc_rows > 0) THEN
+    ALLOCATE(bc_rows(nbc_rows))
+    bc_rows = 0
+    k = 0
+    DO i = 1, SIZE(self%mug%psi_bc)
+        IF (self%mug%psi_bc(i)) THEN
+            k = k + 1
+            bc_rows(k) = i
+        END IF
+    END DO
+    ! Zero rows in block (6,6) only (psi equation rows)
+    CALL M%zero_rows(nbc_rows, bc_rows, 6)
+    DEALLOCATE(bc_rows)
+END IF
 
 
-! write(*,*) "Combining jacobians"
+write(*,*) "Combining jacobians"
 
-! DO row_block = 1, M%ni
-!     DO col_block = 1, M%nj
-!         DO i = 1, M%i_map(row_block)%n
-!             jp=M%map(row_block,col_block)%ext(1,i)
-!             jn=M%map(row_block,col_block)%ext(2,i)
-!             colcount = jn-jp+1
-!             ALLOCATE(cols(colcount), vals(colcount))
-!             cols = M%lc(jp:jn)
-!             vals = M%M(jp:jn)
-!             ! IF (row_block ==6 .AND. col_block == 6) THEN
-!             !     IF (MAXVAL(vals) > 0.d0) write(*,*) i
-!             ! END IF
-!             cols = cols - M%j_map(col_block)%offset
-!             CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
-!                 1, colcount, row_block, col_block)
-!             DEALLOCATE(cols, vals)
-!         END DO
-!     END DO 
-! END DO
+DO row_block = 1, M%ni
+    DO col_block = 1, M%nj
+        DO i = 1, M%i_map(row_block)%n
+            jp=M%map(row_block,col_block)%ext(1,i)
+            jn=M%map(row_block,col_block)%ext(2,i)
+            colcount = jn-jp+1
+            ALLOCATE(cols(colcount), vals(colcount))
+            cols = M%lc(jp:jn)
+            vals = M%M(jp:jn)
+            ! IF (MAXVAL(ABS(vals)) /=1.d0 .AND. row_block==col_block) THEN
+            !     write(*,*) "WEIRD ", row_block, col_block, " row ", i
+            !     write(*,*) MAXVAL(ABS(vals))
+            ! END IF
+            ! IF (row_block ==6 .AND. col_block == 6) THEN
+            !     IF (MAXVAL(vals) > 0.d0) write(*,*) i
+            ! END IF
+            cols = cols - M%j_map(col_block)%offset
+            CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
+                1, colcount, row_block, col_block)
+            DEALLOCATE(cols, vals)
+        END DO
+    END DO 
+END DO
 
-! !ADD TOKAMAKER JACOBIAN to 6,6 block
-! ! Add only block (1,1) from vac_op (no coil blocks for now)
+!ADD TOKAMAKER JACOBIAN to 6,6 block
+! Add only block (1,1) from vac_op (no coil blocks for now)
 
-! row_block = 1
-! col_block = 1
-! DO i = 1, V%i_map(row_block)%n
-!     jp=V%map(row_block,col_block)%ext(1,i)
-!     jn=V%map(row_block,col_block)%ext(2,i)
-!     colcount = jn-jp+1
-!     ALLOCATE(cols(colcount), vals(colcount))
-!     cols = V%lc(jp:jn)
-!     vals = V%M(jp:jn)
-!     cols = cols - V%j_map(col_block)%offset
-!     CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
-!         1, colcount, 6, 6)
-!     DEALLOCATE(cols, vals)
-! END DO
+row_block = 1
+col_block = 1
+DO i = 1, V%i_map(row_block)%n
+    jp=V%map(row_block,col_block)%ext(1,i)
+    jn=V%map(row_block,col_block)%ext(2,i)
+    colcount = jn-jp+1
+    ! write(*,*) colcount
+    ALLOCATE(cols(colcount), vals(colcount))
+    cols = V%lc(jp:jn)
+    vals = V%M(jp:jn)
+    ! IF(ANY(vals /= 0.d0)) THEN
+    !     write(*,*) SIZE(vals)
+    ! END IF
+    cols = cols - V%j_map(col_block)%offset
+    CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
+        1, colcount, 6, 6)
+    DEALLOCATE(cols, vals)
+END DO
 
-! row_block = 1
-! col_block = 2
-! DO i = 1, V%i_map(row_block)%n
-!     jp=V%map(row_block,col_block)%ext(1,i)
-!     jn=V%map(row_block,col_block)%ext(2,i)
-!     colcount = jn-jp+1
-!     ALLOCATE(cols(colcount), vals(colcount))
-!     cols = V%lc(jp:jn)
-!     vals = V%M(jp:jn)
-!     cols = cols - V%j_map(col_block)%offset
-!     CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
-!         1, colcount, 6, 8)
-!     DEALLOCATE(cols, vals)
-! END DO
+row_block = 1
+col_block = 2
+DO i = 1, V%i_map(row_block)%n
+    jp=V%map(row_block,col_block)%ext(1,i)
+    jn=V%map(row_block,col_block)%ext(2,i)
+    colcount = jn-jp+1
+    ALLOCATE(cols(colcount), vals(colcount))
+    cols = V%lc(jp:jn)
+    vals = V%M(jp:jn)
+    cols = cols - V%j_map(col_block)%offset
+    CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
+        1, colcount, 6, 8)
+    DEALLOCATE(cols, vals)
+END DO
 
-! row_block = 2
-! col_block = 1
-! DO i = 1, V%i_map(row_block)%n
-!     jp=V%map(row_block,col_block)%ext(1,i)
-!     jn=V%map(row_block,col_block)%ext(2,i)
-!     colcount = jn-jp+1
-!     ALLOCATE(cols(colcount), vals(colcount))
-!     cols = V%lc(jp:jn)
-!     vals = V%M(jp:jn)
-!     cols = cols - V%j_map(col_block)%offset
-!     CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
-!         1, colcount, 8, 6)
-!     DEALLOCATE(cols, vals)
-! END DO
+row_block = 2
+col_block = 1
+DO i = 1, V%i_map(row_block)%n
+    jp=V%map(row_block,col_block)%ext(1,i)
+    jn=V%map(row_block,col_block)%ext(2,i)
+    colcount = jn-jp+1
+    ALLOCATE(cols(colcount), vals(colcount))
+    cols = V%lc(jp:jn)
+    vals = V%M(jp:jn)
+    cols = cols - V%j_map(col_block)%offset
+    CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
+        1, colcount, 8, 6)
+    DEALLOCATE(cols, vals)
+END DO
 
-! row_block = 2
-! col_block = 2
-! DO i = 1, V%i_map(row_block)%n
-!     jp=V%map(row_block,col_block)%ext(1,i)
-!     jn=V%map(row_block,col_block)%ext(2,i)
-!     colcount = jn-jp+1
-!     ALLOCATE(cols(colcount), vals(colcount))
-!     cols = V%lc(jp:jn)
-!     vals = V%M(jp:jn)
-!     cols = cols - V%j_map(col_block)%offset
-!     CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
-!         1, colcount, 8, 8)
-!     DEALLOCATE(cols, vals)
-! END DO
+row_block = 2
+col_block = 2
+DO i = 1, V%i_map(row_block)%n
+    jp=V%map(row_block,col_block)%ext(1,i)
+    jn=V%map(row_block,col_block)%ext(2,i)
+    colcount = jn-jp+1
+    ALLOCATE(cols(colcount), vals(colcount))
+    cols = V%lc(jp:jn)
+    vals = V%M(jp:jn)
+    cols = cols - V%j_map(col_block)%offset
+    CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
+        1, colcount, 8, 8)
+    DEALLOCATE(cols, vals)
+END DO
 
 CALL self%aug_vec%new(tmp)
 
 CALL mat%assemble(tmp)
 ! NULLIFY(tmp_vec)
-! CALL tmp%get_local(tmp_vec)
-! DO i = 1, SIZE(tmp_vec)
-!     IF(tmp_vec(i) /= 1.d0) THEN
-!         write(*,*) i
-!     END IF
-! END DO
 
 DEALLOCATE(tmp)
 end subroutine build_blankettd_jacobian

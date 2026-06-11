@@ -41,6 +41,7 @@ USE oft_native_la, ONLY: oft_native_vector, native_vector_cast, &
 USE oft_solver_base, ONLY: oft_solver, oft_solver_bc, oft_solver_ptr, &
   oft_csolver, oft_csolver_bc, oft_eigsolver, solver_setup, csolver_setup, &
   eigsolver_setup, solver_delete, csolver_delete
+USE IEEE_ARITHMETIC
 IMPLICIT NONE
 #include "local.h"
 private

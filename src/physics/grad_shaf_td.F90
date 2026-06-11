@@ -352,6 +352,8 @@ DO j=1,4
         CALL self%psi_sol%restore_local(currs_tmp,2)
     END IF
     !---MFNK iteration
+    write(*,*) 'rhs mag:', self%rhs%dot(self%rhs)
+    write(*,*) 'lhs mag:', self%psi_sol%dot(self%psi_sol)
     CALL self%nksolver%apply(self%psi_sol,self%rhs)
     IF(self%nksolver%cits<0)THEN
         CALL self%psi_sol%add(0.d0,1.d0,self%psi_tmp)

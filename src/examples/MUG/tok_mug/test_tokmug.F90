@@ -14,6 +14,7 @@ USE oft_scalar_inits, ONLY: poss_scalar_bfield
 USE mhd_utils, ONLY: elec_charge, proton_mass, mu0
 USE oft_io, ONLY: hdf5_field_get_sizes, hdf5_read, hdf5_field_exist
 USE oft_gs, ONLY: gs_equil, gs_update_bounds, gs_test_bounds, compute_bcmat, gs_setup_walls, gs_get_qprof, gs_factory
+USE oft_gs_td, ONLY: oft_tmaker_td
 USE oft_gs_util, ONLY: gs_profile_load
 USE oft_lag_basis, ONLY: oft_lag_setup,oft_scalar_bfem, oft_blag_eval, oft_blag_geval, oft_2D_lagrange_cast
 USE fem_base, ONLY: oft_ml_fem_type
@@ -34,6 +35,7 @@ CLASS(oft_matrix), POINTER :: mop_2 => NULL()
 CLASS(oft_vector), POINTER :: u,v, u_2, v_2
 TYPE(gs_equil), TARGET :: equil
 TYPE(gs_factory), TARGET :: machine
+TYPE(oft_tmaker_td) :: tokamaker
 REAL(r8), POINTER, DIMENSION(:) :: tmp_arr
 !---Runtime options
 INTEGER(i4) :: order = 2
@@ -47,7 +49,7 @@ REAL(r8) :: dt = 0.04336664911469267
 REAL(r8) :: t = 0.d0
 REAL (r8):: ip_ratio_target = 0.205
 REAL (r8):: ip_target = 7.87E6
-REAL(r8), allocatable, dimension(:) :: psi_eq, psi_pert, psi_total, eta_reg,curr_reg, areas, dens_reg, visc_reg
+REAL(r8), allocatable, dimension(:) :: psi_eq, psi_pert, psi_total, eta_reg,curr_reg, areas, dens_reg, visc_reg, voltages
 REAL(r8) :: lin_tol = 1.d-11
 REAL(r8) :: nl_tol = 1.d-9
 REAL (r8):: coords(3), psi(1), q(1)
@@ -207,8 +209,13 @@ mhd_flag = .FALSE.
 equil%device => machine
 CALL b_sim%setup(mg_mesh, equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg)
 ! write(*,*) 155
-! CALL b_sim%step(t, dt, nl_its, l_its, nretry)
+CALL b_sim%step(t, dt, nl_its, l_its, nretry)
 
+! ALLOCATE(voltages(machine%ncoil_regs))
+! voltages = 0.d0
+! write(*,*) machine%Rcoils
+! CALL tokamaker%setup(equil, dt, lin_tol, nl_tol, .FALSE.)
+! CALL tokamaker%step(equil%coil_currs, voltages, t, dt, nl_its, l_its, nretry)
 
 
 

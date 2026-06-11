@@ -1763,6 +1763,7 @@ self%fe_rep%fields(4)%fe=>oft_blagrange
 self%fe_rep%field_tags(4)='velz'
 IF(self%incomp)THEN
   self%fe_rep%fields(5)%fe=>oft_blagrange_p
+  self%fe_rep%fields(5)%fe%type = 2
   self%fe_rep%field_tags(5)='p'
 ELSE
   self%fe_rep%fields(5)%fe=>oft_blagrange
