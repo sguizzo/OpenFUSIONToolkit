@@ -142,7 +142,7 @@ END IF
 mhd_sim%cyl_flag = .TRUE.
 mhd_sim%dt = dt
 
-CALL mhd_sim%setup(mg_mesh, lag_rep%order, fe_rep_in = lag_rep)
+CALL mhd_sim%setup(mg_mesh, lag_rep%order, fe_rep_in =lag_rep)
 
 !------------------------------------------------------------------------------
 ! Set boundary conditions in MUG solve
@@ -247,13 +247,13 @@ END IF
 !------------------------------------------------------------------------------
 ! Set initial field values
 !------------------------------------------------------------------------------
-CALL self%u%set(0.d0, 1)
+CALL self%u%set(1.d0, 1)
 CALL self%u%set(0.d0, 2)
 CALL self%u%set(0.d0, 3)
 CALL self%u%set(0.d0, 4)
 CALL self%u%set(0.d0, 5)
 CALL self%u%set(self%tkmr%gs_equil%I%f_offset, 7)
-CALL self%u%set(0.d0, 7)
+! CALL self%u%set(0.d0, 7)
 
 NULLIFY(tmp_arr, vals_out)
 CALL self%tkmr%gs_device%fe_rep%vec_create(tmp_vec)
@@ -371,7 +371,7 @@ self%nksolver%its=20
 self%nksolver%atol=self%nl_tol
 self%nksolver%rtol=1.d-20 ! Disable relative tolerance
 self%nksolver%backtrack=.FALSE.
-!self%nksolver%J_update=>gs_mfnk_update
+self%nksolver%J_update=>blanket_mfnk_update
 self%nksolver%up_freq=1
 
 
@@ -411,9 +411,23 @@ CALL self%pre%update(.TRUE.)
 CALL self%mf_solver%pre%update(.TRUE.)
 
 !Build RHS and apply boundary conditions
+NULLIFY(tmp_arr)
+NULLIFY(tmp_arr_2)
 CALL self%tmp%add(0.d0,1.d0,self%u)
 CALL apply_rhs_blanket(self%nlfun,self%u,self%rhs)
+CALL self%rhs%get_local(tmp_arr,7)
+write(*,*) MAXVAL(abs(tmp_arr))
+write(*,*) "RHS norm: ", SQRT(SUM(tmp_arr**2))
+! CALL self%rhs%restore_local(tmp_arr,6)
 
+CALL self%nlfun%apply_real(self%u,self%tmp)
+CALL self%tmp%get_local(tmp_arr_2,7)
+write(*,*) MAXVAL(abs(tmp_arr_2))
+write(*,*) "LHS norm: ", SQRT(SUM(tmp_arr_2**2))
+write(*,*) SQRT(SUM((tmp_arr-tmp_arr_2)**2))
+
+CALL self%rhs%restore_local(tmp_arr,7)
+CALL self%tmp%restore_local(tmp_arr_2,7)
 
 DO j = 1,4
     CALL self%nksolver%apply(self%u,self%rhs)
@@ -451,6 +465,9 @@ NULLIFY(tmp_arr1)
 NULLIFY(tmp_arr2)
 CALL b%get_local(tmp_arr1, 6) 
 tmp_arr1 = tmp_arr1/self%dt !Divide by dt so form of psi equation matches tokamaker implementation
+where (self%parent_sim%mug%psi_bc)
+    tmp_arr1 = 0.0
+end where
 
 IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
     CALL self%parent_sim%tkmr%gs_device%aug_vec%new(tmp_in)
@@ -482,7 +499,7 @@ CALL self%parent_sim%tkmr%gs_device%zerob_bc%apply(tmp_out)
 
 ! Extract component 1 from tmp_out
 CALL tmp_out%get_local(tmp_arr2, 1)
-tmp_arr1 = 0.d0
+! tmp_arr1 = 0.d0
 tmp_arr1 = tmp_arr1 + tmp_arr2
 CALL b%restore_local(tmp_arr1, 6)
 CALL tmp_out%restore_local(tmp_arr2, 1)  ! Restore to tmp_out
@@ -518,7 +535,9 @@ NULLIFY(tmp_arr1)
 NULLIFY(tmp_arr2)
 CALL b%get_local(tmp_arr1, 6)
 tmp_arr1 = tmp_arr1/self%dt
-
+where (self%parent_sim%mug%psi_bc)
+    tmp_arr1 = 0.0
+end where
 ! Extract component 6 from a
 CALL a%get_local(tmp_arr2, 6)
 
@@ -546,7 +565,7 @@ CALL self%parent_sim%tkmr%apply_real(tmp_in, tmp_out)
 
 ! Extract component 1 from tmp_out
 CALL tmp_out%get_local(tmp_arr2, 1)
-tmp_arr1 = 0.d0
+! tmp_arr1 = 0.d0
 tmp_arr1 = tmp_arr1 + tmp_arr2
 CALL b%restore_local(tmp_arr1, 6)
 CALL tmp_out%restore_local(tmp_arr2, 1)  ! Restore to tmp_out
@@ -791,6 +810,14 @@ IF(ASSOCIATED(self%jac_op))THEN
 END IF
 DEBUG_STACK_POP
 end subroutine
+
+SUBROUTINE blanket_mfnk_update(a)
+CLASS(oft_vector), TARGET, INTENT(inout) :: a
+! CALL active_tMaker_td%mfop%update_lims(a)
+CALL current_sim%mfmat%update(a)
+! CALL build_jop(active_tMaker_td%mfop,adv_op,a)
+!CALL active_tMaker_td%adv_solver%update(.TRUE.)
+END SUBROUTINE blanket_mfnk_update
 
 !IMPLEMENTTTTT
 ! !---------------------------------------------------------------------------

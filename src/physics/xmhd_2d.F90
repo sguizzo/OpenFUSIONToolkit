@@ -1712,10 +1712,10 @@ INTEGER(i4), POINTER, DIMENSION(:) :: cell_dofs
 mg_mesh=>mg_mesh_in
 mesh=>mg_mesh_in%smesh
 
-IF(self%incomp) THEN
-  mg_mesh_p=>mg_mesh_p_in
-  mesh_p=>mg_mesh_p_in%smesh
-END IF
+! IF(self%incomp) THEN
+!   mg_mesh_p=>mg_mesh_p_in
+!   mesh_p=>mg_mesh_p_in%smesh
+! END IF
 
 IF(ASSOCIATED(self%fe_rep))CALL oft_abort("Setup can only be called once","setup",__FILE__)
 IF(ASSOCIATED(oft_blagrange))CALL oft_abort("FE space already built","setup",__FILE__)

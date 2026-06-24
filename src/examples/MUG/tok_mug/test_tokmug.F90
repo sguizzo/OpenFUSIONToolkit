@@ -194,16 +194,16 @@ lin_tol = 1.d-11
 nl_tol = 1.d-9
 ALLOCATE(dens_reg(machine%mesh%nreg))
 dens_reg = -1.d0
-! dens_reg(5) = 9806.d0
+dens_reg(5) = 9806.d0
 ! dens_reg(6) = 9806.d0
 ALLOCATE(visc_reg(machine%mesh%nreg))
 visc_reg = -1.d0
-! visc_reg(5) = 1.d-3
+visc_reg(5) = 1.d-3
 ! visc_reg(6) = 1.d-3
 
 ALLOCATE(mhd_flag(machine%mesh%nreg))
 mhd_flag = .FALSE.
-! mhd_flag(5) = .TRUE.
+mhd_flag(5) = .TRUE.
 ! mhd_flag(6) = .TRUE.
 
 equil%device => machine
