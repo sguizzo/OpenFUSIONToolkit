@@ -1,0 +1,5 @@
+install(FILES oft_taylor.in DESTINATION examples/MUG/harris_sheet COMPONENT examples)
+configure_file( oft_taylor.in ${CMAKE_CURRENT_BINARY_DIR} COPYONLY)
+install(FILES oft_in.xml DESTINATION examples/MUG/harris_sheet COMPONENT examples)
+configure_file( oft_in.xml ${CMAKE_CURRENT_BINARY_DIR} COPYONLY)
+oft_add_exe( taylor.F90 )

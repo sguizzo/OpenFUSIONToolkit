@@ -142,7 +142,7 @@ END IF
 mhd_sim%cyl_flag = .TRUE.
 mhd_sim%dt = dt
 
-CALL mhd_sim%setup(mg_mesh, lag_rep%order, lag_rep)
+CALL mhd_sim%setup(mg_mesh, lag_rep%order, fe_rep_in = lag_rep)
 
 !------------------------------------------------------------------------------
 ! Set boundary conditions in MUG solve

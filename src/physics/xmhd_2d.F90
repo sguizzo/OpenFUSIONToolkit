@@ -16,6 +16,7 @@ USE oft_io, ONLY: hdf5_read, hdf5_write, oft_file_exist, &
 USE oft_quadrature
 USE oft_mesh_type, ONLY: oft_bmesh, cell_is_curved
 USE multigrid, ONLY: multigrid_mesh
+USE multigrid_build, ONLY: multigrid_construct_surf
 !
 USE oft_la_base, ONLY: oft_vector, oft_matrix, oft_local_mat, oft_vector_ptr, &
   vector_extrapolate, oft_graph, oft_graph_ptr
@@ -107,8 +108,8 @@ TYPE, public :: oft_xmhd_2d_sim
   TYPE(oft_mf_matrix), POINTER :: mf_mat => NULL() !< Matrix free operator
   TYPE(xmhd_2d_nlfun), POINTER :: nlfun => NULL() !< Nonlinear function
   TYPE(xmhd_2d_mfun), POINTER :: mfun => NULL() !< mass matrix function
-  TYPE(xml_node), POINTER :: xml_root => NULL() !< XML root element
-  TYPE(xml_node), POINTER :: xml_pre_def => NULL() !< XML element for preconditioner definition
+  TYPE(xml_node):: xml_root !< XML root element
+  TYPE(xml_node):: xml_pre_def !< XML element for preconditioner definition
   contains
   !> Setup
   PROCEDURE :: setup => setup
@@ -127,10 +128,12 @@ TYPE(oft_xmhd_2d_sim), POINTER :: current_sim => NULL() !Active 2D MHD simulatio
 !
 CLASS(multigrid_mesh), POINTER :: mg_mesh => NULL() !< Multigrid mesh object
 CLASS(oft_bmesh), POINTER, PUBLIC :: mesh => NULL() !< Current mesh level
+CLASS(multigrid_mesh), POINTER :: mg_mesh_p!< Multigrid mesh object
+CLASS(oft_bmesh), POINTER, PUBLIC :: mesh_p => NULL() !< Current mesh level
 TYPE(oft_ml_fem_type), TARGET, PUBLIC :: ML_oft_blagrange !< Multilevel finite element representation
-CLASS(oft_scalar_bfem), POINTER :: oft_blagrange => NULL() !< Lagrange finite element representation
+CLASS(oft_scalar_bfem), POINTER, PUBLIC :: oft_blagrange => NULL() !< Lagrange finite element representation
 TYPE(oft_ml_fem_type), TARGET, PUBLIC :: ML_oft_blagrange_p !< Multilevel finite element representationn for p (if incompressible)
-CLASS(oft_scalar_bfem), POINTER :: oft_blagrange_p => NULL() !< Lagrange finite element representation for p (if incompressible)
+CLASS(oft_scalar_bfem), POINTER, PUBLIC :: oft_blagrange_p => NULL() !< Lagrange finite element representation for p (if incompressible)
 PUBLIC xmhd_2d_plot, build_approx_jacobian
 CONTAINS
 
@@ -189,14 +192,12 @@ CALL self%rst_save(u, self%t, self%dt, 'xmhd2d_'//rst_char//'.rst', 'U')
 itcount=self%ittarget
 dthist=self%dt
 dtin=self%dt
-
 !---------------------------------------------------------------------------
 ! Setup linear solver
 !---------------------------------------------------------------------------
 self%jac_dt=self%dt
 IF(self%timestep_cn)self%jac_dt=self%dt/2.d0
 CALL build_approx_jacobian(self,u)
-
 IF(self%mfnk)THEN
   ALLOCATE(self%mf_mat)
   CALL up%set(1.d0)
@@ -212,7 +213,7 @@ solver%itplot=1
 solver%nrits=40
 solver%pm=oft_env%pm
 NULLIFY(solver%pre)
-IF(ASSOCIATED(self%xml_pre_def))THEN
+IF(self%xml_pre_def%associated())THEN
   CALL create_solver_xml(solver%pre,self%xml_pre_def)
 ELSE
   CALL create_diag_pre(solver%pre)
@@ -408,7 +409,7 @@ solver%itplot=1
 solver%nrits=20
 solver%pm=oft_env%pm
 NULLIFY(solver%pre)
-IF(ASSOCIATED(self%xml_pre_def))THEN
+IF(self%xml_pre_def%associated()) THEN
   CALL create_solver_xml(solver%pre,self%xml_pre_def)
 ELSE
   CALL create_diag_pre(solver%pre)
@@ -739,7 +740,6 @@ CALL a%get_local(vtmp, 4)
 CALL a%get_local(T_weights,5)
 CALL a%get_local(psi_weights,6)
 CALL a%get_local(by_weights,7)
-
 
 B_0 = self%parent_sim%B_0
 cyl_flag = self%parent_sim%cyl_flag
@@ -1121,7 +1121,6 @@ cyl_flag = self%cyl_flag
 linear = self%linear
 incomp = self%incomp
 dt_fac = self%jac_dt
-
 !--Setup thread locks
 ALLOCATE(tlocks(self%fe_rep%nfields))
 DO i=1,self%fe_rep%nfields
@@ -1700,10 +1699,11 @@ END SUBROUTINE update_jacobian
 !---------------------------------------------------------------------------
 !> Setup composite FE representation and ML environment
 !---------------------------------------------------------------------------
-subroutine setup(self,mg_mesh_in, order, fe_rep_in)
+subroutine setup(self,mg_mesh_in, order, mg_mesh_p_in, fe_rep_in)
 class(oft_xmhd_2d_sim), intent(inout), target :: self
 CLASS(multigrid_mesh), TARGET, intent(in) :: mg_mesh_in
 integer(i4), intent(in) :: order
+CLASS(multigrid_mesh), TARGET, OPTIONAL, intent(in) :: mg_mesh_p_in
 CLASS(oft_scalar_bfem), TARGET,optional, intent(in) :: fe_rep_in
 integer(i4) :: i,j, ierr,io_unit, cond_ind, coil_ind, type, order_p
 LOGICAL, ALLOCATABLE :: vert_flag(:),edge_flag(:), boundary_flag(:)
@@ -1712,22 +1712,23 @@ INTEGER(i4), POINTER, DIMENSION(:) :: cell_dofs
 mg_mesh=>mg_mesh_in
 mesh=>mg_mesh_in%smesh
 
+IF(self%incomp) THEN
+  mg_mesh_p=>mg_mesh_p_in
+  mesh_p=>mg_mesh_p_in%smesh
+END IF
+
 IF(ASSOCIATED(self%fe_rep))CALL oft_abort("Setup can only be called once","setup",__FILE__)
 IF(ASSOCIATED(oft_blagrange))CALL oft_abort("FE space already built","setup",__FILE__)
 
 !---Look for XML defintion elements
-#ifdef HAVE_XML
+
 IF(ASSOCIATED(oft_env%xml))THEN
   CALL xml_get_element(oft_env%xml,"xmhd2d",self%xml_root,ierr)
   IF(ierr==0)THEN
     !---Look for pre node
     CALL xml_get_element(self%xml_root,"pre",self%xml_pre_def,ierr)
-    IF(ierr/=0)NULLIFY(self%xml_pre_def)
-  ELSE
-    NULLIFY(self%xml_root)
   END IF
 END IF
-#endif
 
 !---Setup FE representation
 IF (PRESENT(fe_rep_in)) THEN
@@ -1885,7 +1886,7 @@ INTEGER(i4) :: rst_cur, rst_tmp, ierr, io_stat, io_unit
 CHARACTER(LEN=OFT_PATH_SLEN) :: file_tmp
 LOGICAL :: rst_exist
 real(r8) :: t
-TYPE(xdmf_plot_file) :: xdmf_plot
+TYPE(xdmf_plot_file) :: xdmf_plot, xdmf_plot_p
 character(LEN=XMHD_RST_LEN) :: rst_char
 namelist/xmhd_plot_options/rst_start,rst_end
 !---------------------------------------------------------------------------
@@ -1917,8 +1918,10 @@ ALLOCATE(plot_vec(3,v_lag%n))
 NULLIFY(plot_vals,plot_u0)
 CALL grad_psi%setup(oft_blagrange)
 
-CALL xdmf_plot%setup("xmhd_2d")
+CALL xdmf_plot%setup("xmhd_2d", "all/")
+CALL xdmf_plot_p%setup("xmhd_2d_p", "pressure/")
 CALL mesh%setup_io(xdmf_plot,oft_blagrange%order)
+CALL mesh_p%setup_io(xdmf_plot_p,oft_blagrange%order-1)
 
 !---------------------------------------------------------------------------
 ! If linear, extract equilibrium fields
@@ -1961,6 +1964,7 @@ DO
   END IF
   !Plot data
   CALL xdmf_plot%add_timestep(t)
+  CALL xdmf_plot_p%add_timestep(t)
 
   !Plot density
   CALL u%get_local(plot_vals,1)
@@ -1975,9 +1979,15 @@ DO
   plot_vec(2,:)=plot_vals
   CALL mesh%save_vertex_vector(plot_vec,xdmf_plot,'V')
   !Plot temperature
+  NULLIFY(plot_vals)
   CALL u%get_local(plot_vals,5)
-  CALL mesh%save_vertex_scalar(plot_vals,xdmf_plot,'T')
+  IF (self%incomp) THEN
+     CALL mesh_p%save_vertex_scalar(plot_vals,xdmf_plot_p,'p')
+  ELSE
+     CALL mesh%save_vertex_scalar(plot_vals,xdmf_plot,'T')
+  END IF
   !Plot psi
+  NULLIFY(plot_vals)
   CALL u%get_local(plot_vals,6)
   CALL mesh%save_vertex_scalar(plot_vals,xdmf_plot,'psi')
   !Plot B
