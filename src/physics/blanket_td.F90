@@ -107,7 +107,7 @@ LOGICAL, ALLOCATABLE :: p_dir_set(:)
 INTEGER(i4), POINTER, DIMENSION(:) :: cell_dofs, cell_dofs_p
 type(seam_list), pointer, dimension(:) :: stitch_tmp
 type(map_list), pointer, dimension(:) :: map_tmp
-CLASS(oft_vector), pointer :: tmp_vec
+CLASS(oft_vector), pointer :: tmp_vec, psi_coil
 
 mesh => equil%device%mesh
 lag_rep=>equil%device%fe_rep
@@ -122,6 +122,8 @@ CALL self%tkmr%setup(equil)
 CALL build_vac_op(self%tkmr,self%tkmr%vac_op)
 
 ALLOCATE(mhd_sim)
+ALLOCATE(mhd_sim%ignore_rmask(mesh%nreg))
+mhd_sim%ignore_rmask = .NOT. mhd_flag
 ALLOCATE(mhd_sim%eta(mesh%nreg, 2))
 ALLOCATE(mhd_sim%m_i(mesh%nreg))
 ALLOCATE(mhd_sim%nu(mesh%nreg))
@@ -163,11 +165,11 @@ ALLOCATE(mhd_sim%T_bc(mhd_sim%fe_rep%fields(5)%fe%ne))
 ALLOCATE(mhd_sim%psi_bc(mhd_sim%fe_rep%fields(6)%fe%ne))
 ALLOCATE(mhd_sim%by_bc(mhd_sim%fe_rep%fields(7)%fe%ne))
 
-mhd_sim%psi_bc = .TRUE. 
+mhd_sim%psi_bc = .FALSE. 
 mhd_sim%by_bc = .TRUE.  !-> deal with by later
-mhd_sim%velx_bc = .FALSE. 
-mhd_sim%vely_bc = .FALSE. 
-mhd_sim%velz_bc = .FALSE. 
+mhd_sim%velx_bc = .TRUE. 
+mhd_sim%vely_bc = .TRUE. 
+mhd_sim%velz_bc = .TRUE. 
 
 mhd_sim%n_bc = .TRUE.
 mhd_sim%T_bc = .TRUE.
@@ -181,7 +183,7 @@ DO i = 1, mesh%nc
     DO j=1, SIZE(cell_dofs)
         IF (mhd_flag(mesh%reg(i))) THEN
             mhd_sim%psi_bc(cell_dofs(j)) = .FALSE. !add contributions everywhere in MHD regions, including boundaries
-            mhd_sim%T_bc(cell_dofs_p(j)) = .FALSE. !add contributions everywhere in MHD regions, including boundaries
+            mhd_sim%T_bc(cell_dofs_p(j)) = .TRUE. !add contributions everywhere in MHD regions, including boundaries
             IF (.NOT. mhd_sim%incomp) mhd_sim%n_bc(cell_dofs(j)) = .FALSE. !add contributions everywhere in MHD regions, including boundaries, if incompressible
         ELSE
             mhd_sim%velx_bc(cell_dofs(j)) = .TRUE. !pin velocity to zero everywhere in non-MHD regions, including boundaries
@@ -257,11 +259,14 @@ CALL self%u%set(self%tkmr%gs_equil%I%f_offset, 7)
 
 NULLIFY(tmp_arr, vals_out)
 CALL self%tkmr%gs_device%fe_rep%vec_create(tmp_vec)
+CALL self%tkmr%gs_device%fe_rep%vec_create(psi_coil)
+CALL psi_coil%set(0.d0)
 CALL tmp_vec%add(0.d0,1.d0,self%tkmr%gs_equil%psi)
 IF (self%tkmr%gs_device%ncoils > 0) THEN
     CALL self%u%get_local(vals_out,8)
     DO i=1,self%tkmr%gs_device%ncoils
         CALL tmp_vec%add(1.d0,-self%tkmr%gs_equil%coil_currs(i),self%tkmr%gs_device%psi_coil(i)%f)
+        CALL psi_coil%add(1.d0,self%tkmr%gs_equil%coil_currs(i),self%tkmr%gs_device%psi_coil(i)%f)
         vals_out(i)=self%tkmr%gs_equil%coil_currs(i)
     END DO
     CALL self%u%restore_local(vals_out,8)
@@ -269,6 +274,10 @@ IF (self%tkmr%gs_device%ncoils > 0) THEN
 END IF
 CALL tmp_vec%get_local(tmp_arr)
 CALL self%u%restore_local(tmp_arr,6)
+CALL psi_coil%get_local(tmp_arr)
+CALL self%mug%offset%restore_local(tmp_arr,6)
+
+
 
 !------------------------------------------------------------------------------
 ! Setup nl_fun object
@@ -332,7 +341,9 @@ DO i=1,nkgraphs
 END DO
 DEALLOCATE(graphs, known_graphs)
 CALL tmp_vec%delete
+CALL psi_coil%delete
 DEALLOCATE(tmp_vec)
+DEALLOCATE(psi_coil)
 DEALLOCATE(fe_graphs)
 
 
@@ -357,7 +368,7 @@ self%mfmat%b0=1.d-5
 self%mf_solver%A=>self%mfmat
 self%mf_solver%its=1000
 self%mf_solver%nrits=20
-self%mf_solver%atol=self%lin_tol
+self%mf_solver%atol=lin_tol
 self%mf_solver%itplot=1
 oft_env%pm = self%pm
 self%mf_solver%pm=oft_env%pm
@@ -368,7 +379,7 @@ self%mf_solver%pre=>self%pre
 self%nksolver%A=>self%nlfun
 self%nksolver%J_inv=>self%mf_solver
 self%nksolver%its=20
-self%nksolver%atol=self%nl_tol
+self%nksolver%atol=nl_tol
 self%nksolver%rtol=1.d-20 ! Disable relative tolerance
 self%nksolver%backtrack=.FALSE.
 self%nksolver%J_update=>blanket_mfnk_update
@@ -415,19 +426,13 @@ NULLIFY(tmp_arr)
 NULLIFY(tmp_arr_2)
 CALL self%tmp%add(0.d0,1.d0,self%u)
 CALL apply_rhs_blanket(self%nlfun,self%u,self%rhs)
-CALL self%rhs%get_local(tmp_arr,7)
-write(*,*) MAXVAL(abs(tmp_arr))
-write(*,*) "RHS norm: ", SQRT(SUM(tmp_arr**2))
-! CALL self%rhs%restore_local(tmp_arr,6)
+CALL self%rhs%get_local(tmp_arr,6)
 
 CALL self%nlfun%apply_real(self%u,self%tmp)
-CALL self%tmp%get_local(tmp_arr_2,7)
-write(*,*) MAXVAL(abs(tmp_arr_2))
-write(*,*) "LHS norm: ", SQRT(SUM(tmp_arr_2**2))
-write(*,*) SQRT(SUM((tmp_arr-tmp_arr_2)**2))
+CALL self%tmp%get_local(tmp_arr_2,6)
 
-CALL self%rhs%restore_local(tmp_arr,7)
-CALL self%tmp%restore_local(tmp_arr_2,7)
+CALL self%rhs%restore_local(tmp_arr,6)
+CALL self%tmp%restore_local(tmp_arr_2,6)
 
 DO j = 1,4
     CALL self%nksolver%apply(self%u,self%rhs)
@@ -464,10 +469,9 @@ CALL self%parent_sim%mug%nlfun%apply_real(a,b)
 NULLIFY(tmp_arr1)
 NULLIFY(tmp_arr2)
 CALL b%get_local(tmp_arr1, 6) 
-tmp_arr1 = tmp_arr1/self%dt !Divide by dt so form of psi equation matches tokamaker implementation
-where (self%parent_sim%mug%psi_bc)
-    tmp_arr1 = 0.0
-end where
+! where (self%parent_sim%mug%psi_bc)
+!     tmp_arr1 = 0.0
+! end where
 
 IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
     CALL self%parent_sim%tkmr%gs_device%aug_vec%new(tmp_in)
@@ -494,12 +498,15 @@ IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
 END IF
 
 CALL apply_rhs(self%parent_sim%tkmr, tmp_in, tmp_out)
-
+CALL tmp_out%get_local(tmp_arr2, 1)
+CALL tmp_out%restore_local(tmp_arr2, 1)
 CALL self%parent_sim%tkmr%gs_device%zerob_bc%apply(tmp_out)
 
 ! Extract component 1 from tmp_out
 CALL tmp_out%get_local(tmp_arr2, 1)
 ! tmp_arr1 = 0.d0
+! write(*,*) 'mug cont to RHS: ' , tmp_arr1(21202)
+! write(*,*) 'tok cont to RHS: ' , tmp_arr2(21202)
 tmp_arr1 = tmp_arr1 + tmp_arr2
 CALL b%restore_local(tmp_arr1, 6)
 CALL tmp_out%restore_local(tmp_arr2, 1)  ! Restore to tmp_out
@@ -534,10 +541,10 @@ CALL self%parent_sim%mug%nlfun%apply_real(a,b)
 NULLIFY(tmp_arr1)
 NULLIFY(tmp_arr2)
 CALL b%get_local(tmp_arr1, 6)
-tmp_arr1 = tmp_arr1/self%dt
-where (self%parent_sim%mug%psi_bc)
-    tmp_arr1 = 0.0
-end where
+! tmp_arr1 = tmp_arr1
+! where (self%parent_sim%mug%psi_bc)
+!     tmp_arr1 = 0.0
+! end where
 ! Extract component 6 from a
 CALL a%get_local(tmp_arr2, 6)
 
@@ -562,10 +569,11 @@ IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
 END IF
 
 CALL self%parent_sim%tkmr%apply_real(tmp_in, tmp_out) 
-
 ! Extract component 1 from tmp_out
 CALL tmp_out%get_local(tmp_arr2, 1)
 ! tmp_arr1 = 0.d0
+! write(*,*) 'mug cont to LHS: ' , tmp_arr1(21202)
+! write(*,*) 'tok cont to LHS: ' , tmp_arr2(21202)
 tmp_arr1 = tmp_arr1 + tmp_arr2
 CALL b%restore_local(tmp_arr1, 6)
 CALL tmp_out%restore_local(tmp_arr2, 1)  ! Restore to tmp_out
@@ -646,25 +654,25 @@ ELSE
 END IF
 
 ! Count and collect BC row indices
-nbc_rows = 0
-DO i = 1, SIZE(self%mug%psi_bc)
-    IF (self%mug%psi_bc(i)) nbc_rows = nbc_rows + 1
-END DO
+! nbc_rows = 0
+! DO i = 1, SIZE(self%mug%psi_bc)
+!     IF (self%mug%psi_bc(i)) nbc_rows = nbc_rows + 1
+! END DO
 
-IF (nbc_rows > 0) THEN
-    ALLOCATE(bc_rows(nbc_rows))
-    bc_rows = 0
-    k = 0
-    DO i = 1, SIZE(self%mug%psi_bc)
-        IF (self%mug%psi_bc(i)) THEN
-            k = k + 1
-            bc_rows(k) = i
-        END IF
-    END DO
-    ! Zero rows in block (6,6) only (psi equation rows)
-    CALL M%zero_rows(nbc_rows, bc_rows, 6)
-    DEALLOCATE(bc_rows)
-END IF
+! IF (nbc_rows > 0) THEN
+!     ALLOCATE(bc_rows(nbc_rows))
+!     bc_rows = 0
+!     k = 0
+!     DO i = 1, SIZE(self%mug%psi_bc)
+!         IF (self%mug%psi_bc(i)) THEN
+!             k = k + 1
+!             bc_rows(k) = i
+!         END IF
+!     END DO
+!     ! Zero rows in block (6,6) only (psi equation rows)
+!     CALL M%zero_rows(nbc_rows, bc_rows, 6)
+!     DEALLOCATE(bc_rows)
+! END IF
 
 
 write(*,*) "Combining jacobians"

@@ -89,6 +89,7 @@ TYPE, public :: oft_xmhd_2d_sim
   REAL(r8) :: den_scale = 1.d19 !< scale factor used to normalize density
   REAL(r8), ALLOCATABLE :: m_i(:) !< ion mass, by region
   REAL(r8), ALLOCATABLE :: eta(:, :) !< electrical resistivity, in units of mu0, by region. First dimension is in plane, second dimension is out of plane (for anisotropic resistivity)
+  LOGICAL, ALLOCATABLE :: ignore_rmask(:) !< If true for a region, cells in that region are skipped in cell integration loops (allocated by region, default all false)
   REAL(r8) :: lin_tol = 1.d-8 !< absolute tolerance for linear solver
   REAL(r8) :: nl_tol = 1.d-5 !< absolute tolerance for nonlinear solver
   REAL (r8) :: B_0(3) = 0.d0 !< background, static magnetic field
@@ -103,6 +104,7 @@ TYPE, public :: oft_xmhd_2d_sim
   TYPE(oft_fem_comp_type), POINTER :: fe_rep => NULL() !< Finite element representation for solution field
   TYPE(xdmf_plot_file) :: xdmf_plot
   CLASS(oft_vector), POINTER :: u => NULL() !< current solution vector
+  CLASS(oft_vector), POINTER :: offset => NULL() !< constant offset (matches solution vector) added to reconstructed local fields
   CLASS(oft_vector), POINTER :: u0 => NULL() !< equilibrium solution vector (used for linearization if linear = True)
   CLASS(oft_matrix), POINTER :: jacobian => NULL() !< approximate jacobian matrix
   TYPE(oft_mf_matrix), POINTER :: mf_mat => NULL() !< Matrix free operator
@@ -519,6 +521,31 @@ IF(self%timestep_cn)THEN
 END IF
 END SUBROUTINE run_lin_simulation
 !---------------------------------------------------------------------------
+!> Extract per-field local DOF arrays of the constant solution offset
+!!
+!! Returns the offset contribution for each solution field, laid out
+!! identically to the weight arrays pulled from the solution vector so that
+!! it can be added to the local reconstruction of each field.
+!---------------------------------------------------------------------------
+SUBROUTINE get_offset_weights(offset,n_off,vel_off,T_off,psi_off,by_off)
+CLASS(oft_vector), INTENT(inout) :: offset !< Constant offset vector (matches solution vector)
+REAL(r8), POINTER, DIMENSION(:), INTENT(out) :: n_off,T_off,psi_off,by_off !< Scalar field offsets
+REAL(r8), POINTER, DIMENSION(:,:), INTENT(out) :: vel_off !< Velocity field offset [3,:]
+REAL(r8), POINTER, DIMENSION(:) :: vtmp
+NULLIFY(n_off,T_off,psi_off,by_off,vtmp)
+ALLOCATE(vel_off(3,oft_blagrange%ne))
+CALL offset%get_local(n_off,1)
+vtmp => vel_off(1, :)
+CALL offset%get_local(vtmp,2)
+vtmp => vel_off(2, :)
+CALL offset%get_local(vtmp,3)
+vtmp => vel_off(3, :)
+CALL offset%get_local(vtmp,4)
+CALL offset%get_local(T_off,5)
+CALL offset%get_local(psi_off,6)
+CALL offset%get_local(by_off,7)
+END SUBROUTINE get_offset_weights
+!---------------------------------------------------------------------------
 !> Compute the mass matrix for RHS
 !---------------------------------------------------------------------------
 SUBROUTINE mfun_apply(self,a,b)
@@ -532,6 +559,8 @@ REAL(r8) :: diag_vals(5), B_0(3), gamma, eta(2)
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights,psi_weights,by_weights, T_res, &
                               n_res, psi_res, by_res, vtmp, velx_res, vely_res, velz_res
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
+REAL(r8), POINTER, DIMENSION(:) :: n_off,T_off,psi_off,by_off
+REAL(r8), POINTER, DIMENSION(:,:) :: vel_off
 quad=>oft_blagrange%quad
 NULLIFY(n_weights, vel_weights, T_weights, psi_weights, by_weights, &
 n_res, velx_res, vely_res, velz_res, T_res, psi_res, by_res)
@@ -548,6 +577,8 @@ CALL a%get_local(vtmp, 4)
 CALL a%get_local(T_weights,5)
 CALL a%get_local(psi_weights,6)
 CALL a%get_local(by_weights,7)
+!---Get constant offset contribution (added to local field reconstruction)
+CALL get_offset_weights(self%parent_sim%offset,n_off,vel_off,T_off,psi_off,by_off)
 
 B_0 = self%parent_sim%B_0
 cyl_flag = self%parent_sim%cyl_flag
@@ -584,14 +615,15 @@ ALLOCATE(T_weights_loc(oft_blagrange%nce),n_weights_loc(oft_blagrange%nce),&
 ALLOCATE(cell_dofs(oft_blagrange%nce),res_loc(oft_blagrange%nce,7))
 !$omp do ordered
 DO i=1,mesh%nc
+  IF(self%parent_sim%ignore_rmask(mesh%reg(i)))CYCLE ! Skip cells in ignored regions
   curved=cell_is_curved(mesh,i) ! Straight cell test
   call oft_blagrange%ncdofs(i,cell_dofs) ! Get global index of local DOFs
   res_loc = 0.d0 ! Zero local (cell) contribution to function
-  n_weights_loc = n_weights(cell_dofs)
-  vel_weights_loc = vel_weights(:, cell_dofs)
-  T_weights_loc = T_weights(cell_dofs)
-  psi_weights_loc = psi_weights(cell_dofs)
-  by_weights_loc = by_weights(cell_dofs)
+  n_weights_loc = n_weights(cell_dofs) + n_off(cell_dofs)
+  vel_weights_loc = vel_weights(:, cell_dofs) + vel_off(:, cell_dofs)
+  T_weights_loc = T_weights(cell_dofs) + T_off(cell_dofs)
+  psi_weights_loc = psi_weights(cell_dofs) + psi_off(cell_dofs)
+  by_weights_loc = by_weights(cell_dofs) + by_off(cell_dofs)
 
   !Set constant values
   gamma = self%parent_sim%gamma(mesh%reg(i))
@@ -705,6 +737,7 @@ self%diag_vals=oft_mpi_sum(diag_vals,5)
 !---Cleanup remaining storage
 DEALLOCATE(n_res,velx_res,vely_res, velz_res, T_res, psi_res, by_res, &
         n_weights,vel_weights, T_weights, psi_weights, by_weights)
+DEALLOCATE(n_off,vel_off,T_off,psi_off,by_off)
 end subroutine mfun_apply
 !---------------------------------------------------------------------------
 !> Compute the NL error function, where we are solving F(x) = 0
@@ -724,6 +757,8 @@ REAL(r8) :: chi, eta(2), nu, D_diff, gamma, diag_vals(5), B_0(3), diag_vec(3)
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights,psi_weights,by_weights, T_res, &
                               n_res, psi_res, by_res, vtmp, velx_res, vely_res, velz_res
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
+REAL(r8), POINTER, DIMENSION(:) :: n_off,T_off,psi_off,by_off
+REAL(r8), POINTER, DIMENSION(:,:) :: vel_off
 quad=>oft_blagrange%quad
 NULLIFY(n_weights, vel_weights, T_weights, psi_weights, by_weights, &
 n_res, velx_res, vely_res, velz_res, T_res, psi_res, by_res)
@@ -740,6 +775,8 @@ CALL a%get_local(vtmp, 4)
 CALL a%get_local(T_weights,5)
 CALL a%get_local(psi_weights,6)
 CALL a%get_local(by_weights,7)
+!---Get constant offset contribution (added to local field reconstruction)
+CALL get_offset_weights(self%parent_sim%offset,n_off,vel_off,T_off,psi_off,by_off)
 
 B_0 = self%parent_sim%B_0
 cyl_flag = self%parent_sim%cyl_flag
@@ -783,18 +820,19 @@ IF (incomp) ALLOCATE(basis_vals_p(oft_blagrange_p%nce), basis_grads_p(3,oft_blag
 !$omp do ordered
 DO i=1,mesh%nc
   curved=cell_is_curved(mesh,i) ! Straight cell test
+  IF(self%parent_sim%ignore_rmask(mesh%reg(i)))CYCLE ! Skip cells in ignored regions
   call oft_blagrange%ncdofs(i,cell_dofs) ! Get global index of local DOFs
   IF (incomp) call oft_blagrange_p%ncdofs(i,cell_dofs_p) ! Get global index of local DOFs for pressure
   res_loc = 0.d0 ! Zero local (cell) contribution to function
   IF (incomp) THEN
-    T_weights_loc = T_weights(cell_dofs_p)
+    T_weights_loc = T_weights(cell_dofs_p) + T_off(cell_dofs_p)
   ELSE
-    T_weights_loc = T_weights(cell_dofs)
+    T_weights_loc = T_weights(cell_dofs) + T_off(cell_dofs)
   END IF
-  vel_weights_loc = vel_weights(:, cell_dofs)
-  n_weights_loc = n_weights(cell_dofs)
-  psi_weights_loc = psi_weights(cell_dofs)
-  by_weights_loc = by_weights(cell_dofs)
+  vel_weights_loc = vel_weights(:, cell_dofs) + vel_off(:, cell_dofs)
+  n_weights_loc = n_weights(cell_dofs) + n_off(cell_dofs)
+  psi_weights_loc = psi_weights(cell_dofs) + psi_off(cell_dofs)
+  by_weights_loc = by_weights(cell_dofs) + by_off(cell_dofs)
 
   !Set material properties
   chi = self%parent_sim%chi(mesh%reg(i))
@@ -1081,6 +1119,7 @@ self%diag_vals=oft_mpi_sum(diag_vals,5)
 !---Cleanup remaining storage
 DEALLOCATE(n_res,velx_res,vely_res, velz_res, T_res, psi_res, by_res, &
         n_weights,vel_weights, T_weights, psi_weights, by_weights)
+DEALLOCATE(n_off,vel_off,T_off,psi_off,by_off)
 END SUBROUTINE nlfun_apply
 !---------------------------------------------------------------------------
 !> Compute the approximate Jacobian matrix for the nonlinear function being solved
@@ -1095,6 +1134,8 @@ REAL(r8) :: m_i = proton_mass
 REAL(r8) :: chi, eta(2), nu, D_diff, gamma, B_0(3), diag_vals(7), dt_fac
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights, psi_weights, by_weights, vtmp
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
+REAL(r8), POINTER, DIMENSION(:) :: n_off,T_off,psi_off,by_off
+REAL(r8), POINTER, DIMENSION(:,:) :: vel_off
 integer(KIND=omp_lock_kind), allocatable, dimension(:) :: tlocks
 class(oft_vector), pointer :: tmp
 type(oft_quad_type), pointer :: quad
@@ -1114,6 +1155,8 @@ CALL a%get_local(vtmp, 4)
 CALL a%get_local(T_weights,5)
 CALL a%get_local(psi_weights,6)
 CALL a%get_local(by_weights,7)
+!---Get constant offset contribution (added to local field reconstruction)
+CALL get_offset_weights(self%offset,n_off,vel_off,T_off,psi_off,by_off)
 !---
 
 B_0 = self%B_0
@@ -1163,19 +1206,20 @@ IF (incomp) iloc(5)%v => cell_dofs_p
 CALL self%fe_rep%mat_setup_local(jac_loc, self%jacobian_block_mask)
 !$omp do ordered
 DO i=1,mesh%nc
+  IF(self%ignore_rmask(mesh%reg(i)))CYCLE ! Skip cells in ignored regions
   curved=cell_is_curved(mesh,i) ! Straight cell test
   call oft_blagrange%ncdofs(i,cell_dofs) ! Get global index of local DOFs
   IF (incomp) call oft_blagrange_p%ncdofs(i,cell_dofs_p) ! Get global index of local DOFs for pressure
   CALL self%fe_rep%mat_zero_local(jac_loc) ! Zero local (cell) contribution to matrix
   IF (incomp) THEN
-    T_weights_loc = T_weights(cell_dofs_p)
+    T_weights_loc = T_weights(cell_dofs_p) + T_off(cell_dofs_p)
   ELSE
-    T_weights_loc = T_weights(cell_dofs)
+    T_weights_loc = T_weights(cell_dofs) + T_off(cell_dofs)
   END IF
-  vel_weights_loc = vel_weights(:, cell_dofs)
-  n_weights_loc = n_weights(cell_dofs)
-  psi_weights_loc = psi_weights(cell_dofs)
-  by_weights_loc = by_weights(cell_dofs)
+  vel_weights_loc = vel_weights(:, cell_dofs) + vel_off(:, cell_dofs)
+  n_weights_loc = n_weights(cell_dofs) + n_off(cell_dofs)
+  psi_weights_loc = psi_weights(cell_dofs) + psi_off(cell_dofs)
+  by_weights_loc = by_weights(cell_dofs) + by_off(cell_dofs)
 
   !Set material properties
   chi = self%chi(mesh%reg(i))
@@ -1678,6 +1722,7 @@ call self%jacobian%assemble(tmp)
 call tmp%delete
 DEALLOCATE(tmp,n_weights,vel_weights, T_weights, &
           by_weights, psi_weights)
+DEALLOCATE(n_off,vel_off,T_off,psi_off,by_off)
 end subroutine build_approx_jacobian
 
 !---------------------------------------------------------------------------
@@ -1778,6 +1823,9 @@ self%fe_rep%field_tags(7)='by'
 !---Create solution vector
 CALL self%fe_rep%vec_create(self%u)
 CALL self%fe_rep%vec_create(self%u0)
+!---Create constant field offset (initialized to zero)
+CALL self%fe_rep%vec_create(self%offset)
+CALL self%offset%set(0.d0)
 
 !---Create Jacobian matrix
 ALLOCATE(self%jacobian_block_mask(self%fe_rep%nfields,self%fe_rep%nfields))
@@ -1808,6 +1856,10 @@ END IF
 IF (.NOT. ALLOCATED(self%gamma)) THEN
   ALLOCATE(self%gamma(mesh%nreg))
   self%gamma = -1.d0
+END IF
+IF (.NOT. ALLOCATED(self%ignore_rmask)) THEN
+  ALLOCATE(self%ignore_rmask(mesh%nreg))
+  self%ignore_rmask = .FALSE.
 END IF
 ! Set boundary conditions not alreadys set
 CALL self%setup_bc()

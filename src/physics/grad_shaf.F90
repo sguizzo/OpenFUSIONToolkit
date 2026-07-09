@@ -5401,6 +5401,7 @@ allocate(rop(self%fe_rep%nce),row_tmp(self%fe_rep%nce,1))
 allocate(j_lag(self%fe_rep%nce),col_tmp(1,self%fe_rep%nce))
 !!$omp do schedule(static,1)
 DO j=1,smesh%nc
+  IF(self%ignore_rmask(self%fe_rep%mesh%reg(j))) CYCLE
   nturns=self%coil_nturns(smesh%reg(j),iCoil)
   eta_wt=0.d0
   IF(eta_reg(smesh%reg(j))>0.d0)eta_wt=1.d0/(dt_in*eta_reg(smesh%reg(j)))

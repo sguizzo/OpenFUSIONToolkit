@@ -80,20 +80,33 @@ npoints = dim_sizes(1)
 ALLOCATE(psi_eq(npoints))
 CALL hdf5_read(psi_eq,TRIM(filename_eq),"tokamaker/PSI",success)
 
-psi_total = psi_eq
+CALL hdf5_field_get_sizes(TRIM(filename_pert),"tokamaker/PSI",ndims,dim_sizes)
+npoints = dim_sizes(1)
+ALLOCATE(psi_pert(npoints))
+CALL hdf5_read(psi_pert,TRIM(filename_pert),"tokamaker/PSI",success)
+
+psi_total = psi_eq !+ 0.1 * psi_pert
+
 
 CALL machine%setup(ML_blagrange)
-write(*,*) 83
 machine%save_visit = .FALSE.
 machine%ncoil_regs = 7
+machine%ncoils = 7
 ALLOCATE(machine%coil_regions(machine%ncoil_regs))
 machine%coil_regions(1)%id = 9
+machine%coil_regions(1)%area = 1.8
 machine%coil_regions(2)%id = 10
+machine%coil_regions(2)%area = 0.25
 machine%coil_regions(3)%id = 11
+machine%coil_regions(3)%area = 0.25
 machine%coil_regions(4)%id = 12
+machine%coil_regions(4)%area = 0.25
 machine%coil_regions(5)%id = 13
+machine%coil_regions(5)%area = 0.25
 machine%coil_regions(6)%id = 14
+machine%coil_regions(6)%area = 0.25
 machine%coil_regions(7)%id = 15
+machine%coil_regions(7)%area = 0.25
 
 machine%ncond_regs = 5
 ALLOCATE(machine%cond_regions(machine%ncond_regs))
@@ -108,9 +121,20 @@ machine%cond_regions(4)%eta = 6.9d-7/mu0
 machine%cond_regions(5)%id = 8
 machine%cond_regions(5)%eta = 6.9d-7/mu0
 
+
 CALL gs_setup_walls(machine)
+
+ALLOCATE(machine%coil_nturns(machine%fe_rep%mesh%nreg,machine%ncoils))
+machine%coil_nturns = 0
+DO j=1, machine%ncoils
+  machine%coil_nturns(j + 8, j) = 1
+END DO
+
+machine%free = .TRUE.
 CALL machine%init()
 CALL compute_bcmat(machine)
+ALLOCATE(machine%coil_vcont(machine%ncoils))
+machine%coil_vcont = 0.d0
 ! write(*,*) 82
 ! !---------------------------------------------------------------------------
 ! ! Now, need to setup a tokamaker device
@@ -185,7 +209,7 @@ ALLOCATE(equil%coil_currs(machine%ncoil_regs))
 equil%coil_currs = [-10004540.249054534, 8131096.462417697, 8130193.40495448, -2752265.1799410507, -2755148.7923723585, -1429157.477860515,  -1424955.0239338675]*mu0
 ALLOCATE(areas(machine%ncoil_regs))
 areas = [1.8,0.25, 0.25, 0.25, 0.25, 0.25, 0.25 ]
-equil%coil_currs = equil%coil_currs/areas
+! equil%coil_currs = equil%coil_currs/areas
 equil%mode = 0
 equil%I%f_offset = 36.d0
 
@@ -208,12 +232,10 @@ mhd_flag(5) = .TRUE.
 
 equil%device => machine
 CALL b_sim%setup(mg_mesh, equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg)
-! write(*,*) 155
 CALL b_sim%step(t, dt, nl_its, l_its, nretry)
 
 ! ALLOCATE(voltages(machine%ncoil_regs))
 ! voltages = 0.d0
-! write(*,*) machine%Rcoils
 ! CALL tokamaker%setup(equil, dt, lin_tol, nl_tol, .FALSE.)
 ! CALL tokamaker%step(equil%coil_currs, voltages, t, dt, nl_its, l_its, nretry)
 
