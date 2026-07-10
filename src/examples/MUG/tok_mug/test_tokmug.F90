@@ -53,7 +53,7 @@ REAL(r8), allocatable, dimension(:) :: psi_eq, psi_pert, psi_total, eta_reg,curr
 REAL(r8) :: lin_tol = 1.d-11
 REAL(r8) :: nl_tol = 1.d-9
 REAL (r8):: coords(3), psi(1), q(1)
-LOGICAL :: pm=.TRUE.
+LOGICAL :: pm=.FALSE.
 LOGICAL :: success
 LOGICAL, allocatable, dimension(:) :: mhd_flag
 CHARACTER(LEN=25) :: filename_eq = 'equilibrium.h5' !< Name of input file for mesh, fix later for variable length
@@ -85,7 +85,7 @@ npoints = dim_sizes(1)
 ALLOCATE(psi_pert(npoints))
 CALL hdf5_read(psi_pert,TRIM(filename_pert),"tokamaker/PSI",success)
 
-psi_total = psi_eq !+ 0.1 * psi_pert
+psi_total = psi_eq + 0.1 * psi_pert
 
 
 CALL machine%setup(ML_blagrange)
@@ -213,27 +213,34 @@ areas = [1.8,0.25, 0.25, 0.25, 0.25, 0.25, 0.25 ]
 equil%mode = 0
 equil%I%f_offset = 36.d0
 
-dt = 0.001
+dt = 0.01
 lin_tol = 1.d-11
 nl_tol = 1.d-9
 ALLOCATE(dens_reg(machine%mesh%nreg))
 dens_reg = -1.d0
 dens_reg(5) = 9806.d0
-! dens_reg(6) = 9806.d0
+dens_reg(6) = 9806.d0
 ALLOCATE(visc_reg(machine%mesh%nreg))
 visc_reg = -1.d0
 visc_reg(5) = 1.d-3
-! visc_reg(6) = 1.d-3
+visc_reg(6) = 1.d-3
 
 ALLOCATE(mhd_flag(machine%mesh%nreg))
 mhd_flag = .FALSE.
 mhd_flag(5) = .TRUE.
-! mhd_flag(6) = .TRUE.
+mhd_flag(6) = .TRUE.
 
 equil%device => machine
+b_sim%save_rst = .TRUE.     ! optional; default off
+b_sim%rst_freq = 1
 CALL b_sim%setup(mg_mesh, equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg)
-CALL b_sim%step(t, dt, nl_its, l_its, nretry)
 
+DO i=1,1
+  write(*,*) "Step: ", i
+  CALL b_sim%step(t, dt, nl_its, l_its, nretry)
+  t = t + dt
+END DO
+! CALL b_sim%plot()
 ! ALLOCATE(voltages(machine%ncoil_regs))
 ! voltages = 0.d0
 ! CALL tokamaker%setup(equil, dt, lin_tol, nl_tol, .FALSE.)

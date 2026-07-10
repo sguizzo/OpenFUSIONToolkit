@@ -104,7 +104,7 @@ TYPE, public :: oft_xmhd_2d_sim
   TYPE(oft_fem_comp_type), POINTER :: fe_rep => NULL() !< Finite element representation for solution field
   TYPE(xdmf_plot_file) :: xdmf_plot
   CLASS(oft_vector), POINTER :: u => NULL() !< current solution vector
-  CLASS(oft_vector), POINTER :: offset => NULL() !< constant offset (matches solution vector) added to reconstructed local fields
+  CLASS(oft_vector), POINTER :: psi_vac => NULL() !< vacuum poloidal flux offset added to the psi field (matches psi/oft_blagrange space)
   CLASS(oft_vector), POINTER :: u0 => NULL() !< equilibrium solution vector (used for linearization if linear = True)
   CLASS(oft_matrix), POINTER :: jacobian => NULL() !< approximate jacobian matrix
   TYPE(oft_mf_matrix), POINTER :: mf_mat => NULL() !< Matrix free operator
@@ -521,31 +521,6 @@ IF(self%timestep_cn)THEN
 END IF
 END SUBROUTINE run_lin_simulation
 !---------------------------------------------------------------------------
-!> Extract per-field local DOF arrays of the constant solution offset
-!!
-!! Returns the offset contribution for each solution field, laid out
-!! identically to the weight arrays pulled from the solution vector so that
-!! it can be added to the local reconstruction of each field.
-!---------------------------------------------------------------------------
-SUBROUTINE get_offset_weights(offset,n_off,vel_off,T_off,psi_off,by_off)
-CLASS(oft_vector), INTENT(inout) :: offset !< Constant offset vector (matches solution vector)
-REAL(r8), POINTER, DIMENSION(:), INTENT(out) :: n_off,T_off,psi_off,by_off !< Scalar field offsets
-REAL(r8), POINTER, DIMENSION(:,:), INTENT(out) :: vel_off !< Velocity field offset [3,:]
-REAL(r8), POINTER, DIMENSION(:) :: vtmp
-NULLIFY(n_off,T_off,psi_off,by_off,vtmp)
-ALLOCATE(vel_off(3,oft_blagrange%ne))
-CALL offset%get_local(n_off,1)
-vtmp => vel_off(1, :)
-CALL offset%get_local(vtmp,2)
-vtmp => vel_off(2, :)
-CALL offset%get_local(vtmp,3)
-vtmp => vel_off(3, :)
-CALL offset%get_local(vtmp,4)
-CALL offset%get_local(T_off,5)
-CALL offset%get_local(psi_off,6)
-CALL offset%get_local(by_off,7)
-END SUBROUTINE get_offset_weights
-!---------------------------------------------------------------------------
 !> Compute the mass matrix for RHS
 !---------------------------------------------------------------------------
 SUBROUTINE mfun_apply(self,a,b)
@@ -559,8 +534,7 @@ REAL(r8) :: diag_vals(5), B_0(3), gamma, eta(2)
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights,psi_weights,by_weights, T_res, &
                               n_res, psi_res, by_res, vtmp, velx_res, vely_res, velz_res
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
-REAL(r8), POINTER, DIMENSION(:) :: n_off,T_off,psi_off,by_off
-REAL(r8), POINTER, DIMENSION(:,:) :: vel_off
+REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights
 quad=>oft_blagrange%quad
 NULLIFY(n_weights, vel_weights, T_weights, psi_weights, by_weights, &
 n_res, velx_res, vely_res, velz_res, T_res, psi_res, by_res)
@@ -577,8 +551,9 @@ CALL a%get_local(vtmp, 4)
 CALL a%get_local(T_weights,5)
 CALL a%get_local(psi_weights,6)
 CALL a%get_local(by_weights,7)
-!---Get constant offset contribution (added to local field reconstruction)
-CALL get_offset_weights(self%parent_sim%offset,n_off,vel_off,T_off,psi_off,by_off)
+!---Get vacuum poloidal flux offset (added to the psi field reconstruction)
+NULLIFY(psi_vac_weights)
+CALL self%parent_sim%psi_vac%get_local(psi_vac_weights)
 
 B_0 = self%parent_sim%B_0
 cyl_flag = self%parent_sim%cyl_flag
@@ -619,11 +594,11 @@ DO i=1,mesh%nc
   curved=cell_is_curved(mesh,i) ! Straight cell test
   call oft_blagrange%ncdofs(i,cell_dofs) ! Get global index of local DOFs
   res_loc = 0.d0 ! Zero local (cell) contribution to function
-  n_weights_loc = n_weights(cell_dofs) + n_off(cell_dofs)
-  vel_weights_loc = vel_weights(:, cell_dofs) + vel_off(:, cell_dofs)
-  T_weights_loc = T_weights(cell_dofs) + T_off(cell_dofs)
-  psi_weights_loc = psi_weights(cell_dofs) + psi_off(cell_dofs)
-  by_weights_loc = by_weights(cell_dofs) + by_off(cell_dofs)
+  n_weights_loc = n_weights(cell_dofs)
+  vel_weights_loc = vel_weights(:, cell_dofs)
+  T_weights_loc = T_weights(cell_dofs)
+  psi_weights_loc = psi_weights(cell_dofs) + psi_vac_weights(cell_dofs)
+  by_weights_loc = by_weights(cell_dofs)
 
   !Set constant values
   gamma = self%parent_sim%gamma(mesh%reg(i))
@@ -737,7 +712,7 @@ self%diag_vals=oft_mpi_sum(diag_vals,5)
 !---Cleanup remaining storage
 DEALLOCATE(n_res,velx_res,vely_res, velz_res, T_res, psi_res, by_res, &
         n_weights,vel_weights, T_weights, psi_weights, by_weights)
-DEALLOCATE(n_off,vel_off,T_off,psi_off,by_off)
+DEALLOCATE(psi_vac_weights)
 end subroutine mfun_apply
 !---------------------------------------------------------------------------
 !> Compute the NL error function, where we are solving F(x) = 0
@@ -757,8 +732,7 @@ REAL(r8) :: chi, eta(2), nu, D_diff, gamma, diag_vals(5), B_0(3), diag_vec(3)
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights,psi_weights,by_weights, T_res, &
                               n_res, psi_res, by_res, vtmp, velx_res, vely_res, velz_res
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
-REAL(r8), POINTER, DIMENSION(:) :: n_off,T_off,psi_off,by_off
-REAL(r8), POINTER, DIMENSION(:,:) :: vel_off
+REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights
 quad=>oft_blagrange%quad
 NULLIFY(n_weights, vel_weights, T_weights, psi_weights, by_weights, &
 n_res, velx_res, vely_res, velz_res, T_res, psi_res, by_res)
@@ -775,8 +749,9 @@ CALL a%get_local(vtmp, 4)
 CALL a%get_local(T_weights,5)
 CALL a%get_local(psi_weights,6)
 CALL a%get_local(by_weights,7)
-!---Get constant offset contribution (added to local field reconstruction)
-CALL get_offset_weights(self%parent_sim%offset,n_off,vel_off,T_off,psi_off,by_off)
+!---Get vacuum poloidal flux offset (added to the psi field reconstruction)
+NULLIFY(psi_vac_weights)
+CALL self%parent_sim%psi_vac%get_local(psi_vac_weights)
 
 B_0 = self%parent_sim%B_0
 cyl_flag = self%parent_sim%cyl_flag
@@ -798,13 +773,13 @@ BLOCK
 LOGICAL :: curved
 INTEGER(i4) :: k,m,jr
 INTEGER(i4), ALLOCATABLE, DIMENSION(:) :: cell_dofs, cell_dofs_p
-REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dby(3)
+REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dpsi_0(3),dby(3)
 REAL(r8) :: dvel(3,3),div_vel,jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),coords(3)
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals,basis_vals_p,T_weights_loc,n_weights_loc,psi_weights_loc,by_weights_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grads_p, res_loc
 !$omp parallel private(k,m,jr,curved,coords,cell_dofs,cell_dofs_p,basis_vals,basis_grads, basis_vals_p, basis_grads_p, T_weights_loc, &
 !$omp n_weights_loc,psi_weights_loc, by_weights_loc,vel_weights_loc,res_loc,jac_mat, &
-!$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dby,dvel,div_vel,btmp, tmp1, &
+!$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dpsi_0,dby,dvel,div_vel,btmp, tmp1, &
 !$omp chi, m_i, eta, nu, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 ALLOCATE(n_weights_loc(oft_blagrange%nce),&
@@ -825,14 +800,14 @@ DO i=1,mesh%nc
   IF (incomp) call oft_blagrange_p%ncdofs(i,cell_dofs_p) ! Get global index of local DOFs for pressure
   res_loc = 0.d0 ! Zero local (cell) contribution to function
   IF (incomp) THEN
-    T_weights_loc = T_weights(cell_dofs_p) + T_off(cell_dofs_p)
+    T_weights_loc = T_weights(cell_dofs_p)
   ELSE
-    T_weights_loc = T_weights(cell_dofs) + T_off(cell_dofs)
+    T_weights_loc = T_weights(cell_dofs)
   END IF
-  vel_weights_loc = vel_weights(:, cell_dofs) + vel_off(:, cell_dofs)
-  n_weights_loc = n_weights(cell_dofs) + n_off(cell_dofs)
-  psi_weights_loc = psi_weights(cell_dofs) + psi_off(cell_dofs)
-  by_weights_loc = by_weights(cell_dofs) + by_off(cell_dofs)
+  vel_weights_loc = vel_weights(:, cell_dofs)
+  n_weights_loc = n_weights(cell_dofs)
+  psi_weights_loc = psi_weights(cell_dofs) + psi_vac_weights(cell_dofs)
+  by_weights_loc = by_weights(cell_dofs)
 
   !Set material properties
   chi = self%parent_sim%chi(mesh%reg(i))
@@ -861,7 +836,7 @@ DO i=1,mesh%nc
     coords = mesh%log2phys(i,quad%pts(:,m))
     !---Reconstruct values of solution fields
     n = 0.d0; dn = 0.d0; vel = 0.d0; dvel = 0.d0
-    T = 0.d0; dT = 0.d0; psi = 0.d0; dpsi=0.d0
+    T = 0.d0; dT = 0.d0; psi = 0.d0; dpsi=0.d0; dpsi_0=0.d0
     by = 0.d0; dby = 0.d0
     basis_grads(3, :) = basis_grads(2,:)
     basis_grads(2,:) = 0.d0
@@ -882,6 +857,8 @@ DO i=1,mesh%nc
       dvel(:, 3) = dvel(:, 3) + vel_weights_loc(:, jr)*basis_grads(3, jr)
       dn = dn + n_weights_loc(jr)*basis_grads(:,jr)
       dpsi = dpsi + psi_weights_loc(jr)*basis_grads(:,jr)
+      ! dpsi_0 excludes the vacuum flux psi_vac (gradient of the solved psi only)
+      dpsi_0 = dpsi_0 + psi_weights(cell_dofs(jr))*basis_grads(:,jr)
       dby = dby + by_weights_loc(jr)*basis_grads(:,jr)
     END DO
     IF (incomp) THEN
@@ -1025,13 +1002,13 @@ DO i=1,mesh%nc
         + basis_vals(jr)*psi*int_factor/(eta(2)*(coords(1)+gs_epsilon)) &
         + basis_vals(jr)*self%dt*DOT_PRODUCT(vel, dpsi)*int_factor/(eta(2)*(coords(1)+gs_epsilon)) &
         + basis_vals(jr)*self%dt*tmp1(2)*int_factor/(eta(2)*(coords(1)+gs_epsilon)) &
-        + self%dt*DOT_PRODUCT(basis_grads(:,jr), dpsi)*int_factor/(coords(1)+gs_epsilon)
+        + self%dt*DOT_PRODUCT(basis_grads(:,jr), dpsi_0)*int_factor/(coords(1)+gs_epsilon)
       ELSE
         res_loc(jr, 6) = res_loc(jr, 6) &
         + basis_vals(jr)*psi*int_factor/eta(2) &
         + basis_vals(jr)*self%dt*DOT_PRODUCT(vel, dpsi)*int_factor/eta(2) &
         + basis_vals(jr)*self%dt*tmp1(2)*int_factor/eta(2) &
-        + self%dt*DOT_PRODUCT(basis_grads(:,jr), dpsi)*int_factor
+        + self%dt*DOT_PRODUCT(basis_grads(:,jr), dpsi_0)*int_factor
       END IF
       ! --By
       tmp1 = cross_product(dpsi,dvel(2, :))
@@ -1119,7 +1096,7 @@ self%diag_vals=oft_mpi_sum(diag_vals,5)
 !---Cleanup remaining storage
 DEALLOCATE(n_res,velx_res,vely_res, velz_res, T_res, psi_res, by_res, &
         n_weights,vel_weights, T_weights, psi_weights, by_weights)
-DEALLOCATE(n_off,vel_off,T_off,psi_off,by_off)
+DEALLOCATE(psi_vac_weights)
 END SUBROUTINE nlfun_apply
 !---------------------------------------------------------------------------
 !> Compute the approximate Jacobian matrix for the nonlinear function being solved
@@ -1134,8 +1111,7 @@ REAL(r8) :: m_i = proton_mass
 REAL(r8) :: chi, eta(2), nu, D_diff, gamma, B_0(3), diag_vals(7), dt_fac
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights, psi_weights, by_weights, vtmp
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
-REAL(r8), POINTER, DIMENSION(:) :: n_off,T_off,psi_off,by_off
-REAL(r8), POINTER, DIMENSION(:,:) :: vel_off
+REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights
 integer(KIND=omp_lock_kind), allocatable, dimension(:) :: tlocks
 class(oft_vector), pointer :: tmp
 type(oft_quad_type), pointer :: quad
@@ -1155,8 +1131,9 @@ CALL a%get_local(vtmp, 4)
 CALL a%get_local(T_weights,5)
 CALL a%get_local(psi_weights,6)
 CALL a%get_local(by_weights,7)
-!---Get constant offset contribution (added to local field reconstruction)
-CALL get_offset_weights(self%offset,n_off,vel_off,T_off,psi_off,by_off)
+!---Get vacuum poloidal flux offset (added to the psi field reconstruction)
+NULLIFY(psi_vac_weights)
+CALL self%psi_vac%get_local(psi_vac_weights)
 !---
 
 B_0 = self%B_0
@@ -1212,14 +1189,14 @@ DO i=1,mesh%nc
   IF (incomp) call oft_blagrange_p%ncdofs(i,cell_dofs_p) ! Get global index of local DOFs for pressure
   CALL self%fe_rep%mat_zero_local(jac_loc) ! Zero local (cell) contribution to matrix
   IF (incomp) THEN
-    T_weights_loc = T_weights(cell_dofs_p) + T_off(cell_dofs_p)
+    T_weights_loc = T_weights(cell_dofs_p)
   ELSE
-    T_weights_loc = T_weights(cell_dofs) + T_off(cell_dofs)
+    T_weights_loc = T_weights(cell_dofs)
   END IF
-  vel_weights_loc = vel_weights(:, cell_dofs) + vel_off(:, cell_dofs)
-  n_weights_loc = n_weights(cell_dofs) + n_off(cell_dofs)
-  psi_weights_loc = psi_weights(cell_dofs) + psi_off(cell_dofs)
-  by_weights_loc = by_weights(cell_dofs) + by_off(cell_dofs)
+  vel_weights_loc = vel_weights(:, cell_dofs)
+  n_weights_loc = n_weights(cell_dofs)
+  psi_weights_loc = psi_weights(cell_dofs) + psi_vac_weights(cell_dofs)
+  by_weights_loc = by_weights(cell_dofs)
 
   !Set material properties
   chi = self%chi(mesh%reg(i))
@@ -1722,7 +1699,7 @@ call self%jacobian%assemble(tmp)
 call tmp%delete
 DEALLOCATE(tmp,n_weights,vel_weights, T_weights, &
           by_weights, psi_weights)
-DEALLOCATE(n_off,vel_off,T_off,psi_off,by_off)
+DEALLOCATE(psi_vac_weights)
 end subroutine build_approx_jacobian
 
 !---------------------------------------------------------------------------
@@ -1766,7 +1743,6 @@ IF(ASSOCIATED(self%fe_rep))CALL oft_abort("Setup can only be called once","setup
 IF(ASSOCIATED(oft_blagrange))CALL oft_abort("FE space already built","setup",__FILE__)
 
 !---Look for XML defintion elements
-
 IF(ASSOCIATED(oft_env%xml))THEN
   CALL xml_get_element(oft_env%xml,"xmhd2d",self%xml_root,ierr)
   IF(ierr==0)THEN
@@ -1791,7 +1767,6 @@ IF (self%incomp) THEN
   CALL oft_lag_setup(mg_mesh,order_p, ML_blag_obj=ML_oft_blagrange_p,minlev=-1)
   IF(.NOT.oft_2D_lagrange_cast(oft_blagrange_p,ML_oft_blagrange_p%current_level))CALL oft_abort("Invalid lagrange FE object","setup",__FILE__)
 END IF
-
 
 !---Build composite FE definition for solution field
 IF(oft_debug_print(1))WRITE(*,'(2X,A)')'Creating FE type'
@@ -1819,14 +1794,12 @@ self%fe_rep%fields(6)%fe=>oft_blagrange
 self%fe_rep%field_tags(6)='psi'
 self%fe_rep%fields(7)%fe=>oft_blagrange
 self%fe_rep%field_tags(7)='by'
-
 !---Create solution vector
 CALL self%fe_rep%vec_create(self%u)
 CALL self%fe_rep%vec_create(self%u0)
-!---Create constant field offset (initialized to zero)
-CALL self%fe_rep%vec_create(self%offset)
-CALL self%offset%set(0.d0)
-
+!---Create vacuum poloidal flux offset for the psi field (initialized to zero)
+CALL oft_blagrange%vec_create(self%psi_vac)
+CALL self%psi_vac%set(0.d0)
 !---Create Jacobian matrix
 ALLOCATE(self%jacobian_block_mask(self%fe_rep%nfields,self%fe_rep%nfields))
 self%jacobian_block_mask=1
@@ -1876,7 +1849,18 @@ end subroutine setup
 !---------------------------------------------------------------------------
 subroutine setup_bc(self)
 class(oft_xmhd_2d_sim), intent(inout) :: self
-IF(.NOT.ASSOCIATED(self%n_bc))self%n_bc=>oft_blagrange%global%gbe
+! NOTE: the field BC masks below all default to the SAME shared boundary-flag
+! array (oft_blagrange%global%gbe). For the incompressible case density is fixed
+! everywhere (n_bc=.TRUE. below); n_bc must therefore get its OWN storage, or that
+! assignment would clobber the shared gbe array and pin every other field too.
+IF(.NOT.ASSOCIATED(self%n_bc))THEN
+  IF(self%incomp)THEN
+    ALLOCATE(self%n_bc(oft_blagrange%ne))
+    self%n_bc=.FALSE.
+  ELSE
+    self%n_bc=>oft_blagrange%global%gbe
+  END IF
+END IF
 IF(.NOT.ASSOCIATED(self%velx_bc))self%velx_bc=>oft_blagrange%global%gbe
 IF(.NOT.ASSOCIATED(self%vely_bc))self%vely_bc=>oft_blagrange%global%gbe
 IF(.NOT.ASSOCIATED(self%velz_bc))self%velz_bc=>oft_blagrange%global%gbe
