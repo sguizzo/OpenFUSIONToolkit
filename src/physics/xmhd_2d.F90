@@ -1267,11 +1267,10 @@ DO i=1,mesh%nc
       btmp = cross_product(dpsi/(coords(1)+gs_epsilon), [0.d0,1.d0,0.d0]) + by*[0.d0,1.d0,0.d0]/(coords(1)+gs_epsilon) + B_0
     END IF
     diag_vals = diag_vals + [n, vel(1), vel(2), vel(3), T, psi, by]*int_factor
-    IF (cyl_flag) THEN
-      btmp = cross_product(dpsi/coords(1), [0.d0,1.d0,0.d0]) + by*[0.d0,1.d0,0.d0] + B_0
-    ELSE
-      btmp = cross_product(dpsi, [0.d0,1.d0,0.d0]) + by*[0.d0,1.d0,0.d0] + B_0
-    END IF
+    !---btmp is already set above consistently with the residual (nlfun_apply): in
+    ! the cyl case both the poloidal and toroidal parts carry 1/R. A duplicate
+    ! recomputation used to live here that dropped the 1/R on the toroidal (by)
+    ! term, corrupting the velocity-By Lorentz Jacobian by a factor of R; removed.
     !---Compute local matrix contributions
     IF (incomp) THEN
       DO jr=1,oft_blagrange_p%nce

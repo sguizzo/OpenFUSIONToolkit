@@ -25,7 +25,7 @@ USE oft_lag_basis, ONLY: oft_lag_setup,oft_scalar_bfem, oft_blag_eval, oft_blag_
 USE oft_blag_operators, ONLY: oft_blag_vproject,oft_blag_project, oft_blag_getmop, oft_lag_bginterp
 USE oft_scalar_inits, ONLY: poss_scalar_bfield
 USE mhd_utils, ONLY: mu0, elec_charge, proton_mass
-USE oft_gs, ONLY: gs_epsilon, build_dels, gs_equil, gs_factory, gs_update_bounds, gs_test_bounds, set_bcmat
+USE oft_gs, ONLY: gs_epsilon, build_dels, gs_equil, gs_factory, gs_update_bounds, gs_test_bounds, set_bcmat, flux_func
 USE oft_gs_td, ONLY: oft_tmaker_td_mfop, tMaker_td_mfnk_update, build_vac_op, apply_rhs
 USE oft_mesh_local_util, ONLY: mesh_local_findedge
 USE xmhd_2d, ONLY: oft_xmhd_2d_sim, build_approx_jacobian
@@ -61,6 +61,12 @@ INTEGER(i4) :: rst_freq = 1 !< Restart-file output frequency (in steps)
 INTEGER(i4) :: rst_count = 0 !< Completed-step counter (used as the restart-file index)
 LOGICAL, ALLOCATABLE, DIMENSION(:) :: plasma_flag !< True for By-field DOFs in or on the border of region 1 (the plasma)
 INTEGER(i4) :: F0_node = 0 !< Index of the first plasma_flag=.TRUE. DOF (0 if none)
+!---Previous-step F*F' profile snapshot, used by the RHS (dt=0) pass of add_f_diff
+! so that when the user updates tkmr%f_scale / gs_equil%I between steps the RHS
+! is evaluated with the OLD profile (consistent with self%u) and the LHS with the
+! new one. Refreshed by snapshot_f_profile at setup and at the end of each step.
+REAL(r8) :: f_scale_prev = 1.d0 !< tkmr%f_scale as of the previous completed step
+CLASS(flux_func), POINTER :: I_prev => NULL() !< copy of gs_equil%I from previous step
 
 contains
     !> Apply the matrix
@@ -127,6 +133,17 @@ equil%device%ignore_rmask = mhd_flag
 self%tkmr%dt=dt
 CALL self%tkmr%setup(equil)
 CALL build_vac_op(self%tkmr,self%tkmr%vac_op)
+
+!---This coupling only supports prescribed-current (I) coils. V coils (Rcoils>0)
+! are circuit-evolved and are not handled by the coil-current treatment in
+! step_blanket_td / build_psi_vac / add_f_diff, so abort if any are present.
+IF(self%tkmr%gs_device%ncoils > 0)THEN
+    DO i=1,self%tkmr%gs_device%ncoils
+        IF(self%tkmr%gs_device%Rcoils(i) > 0.d0) &
+            CALL oft_abort("V coils (Rcoils>0) are not supported; all coils must be prescribed I coils", &
+                           "setup_blanket_td", __FILE__)
+    END DO
+END IF
 
 ALLOCATE(mhd_sim)
 ALLOCATE(mhd_sim%ignore_rmask(mesh%nreg))
@@ -412,7 +429,7 @@ CALL self%mfmat%setup(self%tmp,self%nlfun)
 
 
 ALLOCATE(self%mf_solver)
-self%mfmat%b0=1.d-5
+self%mfmat%b0=1.d-4
 self%mf_solver%A=>self%mfmat
 self%mf_solver%its=1000
 self%mf_solver%nrits=20
@@ -433,17 +450,20 @@ self%nksolver%backtrack=.FALSE.
 self%nksolver%J_update=>blanket_mfnk_update
 self%nksolver%up_freq=1
 
+!---Seed the previous-step F*F' snapshot so step 1's RHS uses the initial profile
+CALL snapshot_f_profile(self)
 
 end subroutine setup_blanket_td
 
 
 
-subroutine step_blanket_td(self,time,dt,nl_its,lin_its,nretry)
+subroutine step_blanket_td(self,coil_currents,time,dt,nl_its,lin_its,nretry)
 CLASS(oft_blanket_td_sim), target, intent(inout) :: self !< NL operator object
+REAL(r8), INTENT(in) :: coil_currents(:) !< Prescribed I-coil currents for this step (size ncoils)
 REAL(8), INTENT(inout) :: time,dt
 INTEGER(4), INTENT(out) :: nl_its,lin_its,nretry
 INTEGER(4) :: i,j,k,ierr
-REAL(r8), pointer :: tmp_arr(:), tmp_arr_2(:)
+REAL(r8), pointer :: tmp_arr(:), tmp_arr_2(:), currs_tmp(:)
 REAL(r8) :: res
 CLASS(oft_vector), pointer :: tmp_vec
 CLASS(oft_native_matrix), POINTER :: P => NULL()
@@ -474,15 +494,26 @@ NULLIFY(tmp_arr)
 NULLIFY(tmp_arr_2)
 CALL self%tmp%add(0.d0,1.d0,self%u)
 CALL apply_rhs_blanket(self%nlfun,self%u,self%rhs)
-CALL self%rhs%get_local(tmp_arr,6)
 
-CALL self%nlfun%apply_real(self%u,self%tmp)
-CALL self%tmp%get_local(tmp_arr_2,6)
-
-CALL self%rhs%restore_local(tmp_arr,6)
-CALL self%tmp%restore_local(tmp_arr_2,6)
-
+NULLIFY(currs_tmp)
 DO j = 1,4
+    !---Prescribe the I-coil currents (all coils, Rcoils<=0): set field 8 of both the
+    ! RHS target and the guess vector to coil_currents, mirroring step_gs_td. The
+    ! coil equation is an identity, so this drives field 8 -> coil_currents and leaves
+    ! it there. Placed inside the loop so it is re-applied after each retry resets
+    ! self%u (and after the retry's apply_rhs_blanket, which uses the OLD field 8).
+    IF(self%tkmr%gs_device%ncoils > 0)THEN
+        CALL self%rhs%get_local(currs_tmp,8)
+        DO i=1,self%tkmr%gs_device%ncoils
+            currs_tmp(i)=coil_currents(i)
+        END DO
+        CALL self%rhs%restore_local(currs_tmp,8)
+        CALL self%u%get_local(currs_tmp,8)
+        DO i=1,self%tkmr%gs_device%ncoils
+            currs_tmp(i)=coil_currents(i)
+        END DO
+        CALL self%u%restore_local(currs_tmp,8)
+    END IF
     CALL self%nksolver%apply(self%u,self%rhs)
     IF(self%nksolver%cits<0)THEN
         CALL self%u%add(0.d0,1.d0,self%tmp)
@@ -502,11 +533,34 @@ dt=self%nlfun%dt
 nl_its=self%nksolver%nlits
 lin_its=self%nksolver%lits
 
+!---Write the converged solution back into the equilibrium (mirrors step_gs_td):
+! coil currents from field 8, and gs_equil%psi = solved psi (field 6) + coil vacuum
+! flux, so downstream equilibrium queries see the advanced state.
+IF(self%tkmr%gs_device%ncoils > 0)THEN
+    CALL self%u%get_local(currs_tmp,8)
+    DO i=1,self%tkmr%gs_device%ncoils
+        self%tkmr%gs_equil%coil_currs(i)=currs_tmp(i)
+    END DO
+END IF
+IF(ASSOCIATED(currs_tmp))DEALLOCATE(currs_tmp)
+IF(ASSOCIATED(tmp_arr))DEALLOCATE(tmp_arr)
+CALL self%u%get_local(tmp_arr,6)
+CALL self%tkmr%gs_equil%psi%restore_local(tmp_arr)
+DEALLOCATE(tmp_arr)
+DO i=1,self%tkmr%gs_device%ncoils
+    CALL self%tkmr%gs_equil%psi%add(1.d0,self%tkmr%gs_equil%coil_currs(i),self%tkmr%gs_device%psi_coil(i)%f)
+END DO
+
 !---Optionally write a restart file for later plotting
 self%rst_count = self%rst_count + 1
 IF(self%save_rst .AND. MOD(self%rst_count, self%rst_freq)==0)THEN
     CALL blanket_rst_save(self, time)
 END IF
+
+!---Freeze the profile that self%u was just solved against. If the user updates
+! tkmr%f_scale / gs_equil%I before the next step, the RHS will use this snapshot
+! (Phi(old)) while the LHS uses the new profile.
+CALL snapshot_f_profile(self)
 
 end subroutine step_blanket_td
 
@@ -712,6 +766,19 @@ class(oft_vector), pointer :: tmp_in, tmp_out !< Temporary vectors
 REAL(r8), POINTER, DIMENSION(:) :: tmp_arr1, tmp_arr2
 
 self%parent_sim%mug%nlfun%dt = 0.d0
+!---Rebuild psi_vac from the OLD coil currents carried in field 8 of a (= self%u,
+! not yet overwritten by the step's I-coil BC), so the RHS/old-time flux is
+! consistent with the solution being advanced. Read by mug%nlfun and add_f_diff.
+IF(self%parent_sim%tkmr%gs_device%ncoils > 0)THEN
+  BLOCK
+  REAL(r8), POINTER, DIMENSION(:) :: coil_arr
+  NULLIFY(coil_arr)
+  CALL a%get_local(coil_arr, 8)
+  CALL build_psi_vac(self%parent_sim, coil_arr)
+  CALL a%restore_local(coil_arr, 8)
+  DEALLOCATE(coil_arr)
+  END BLOCK
+END IF
 CALL b%set(0.d0)
 CALL self%parent_sim%mug%nlfun%apply_real(a,b)
 !---Add By(=F) diffusion in the non-MHD regions (dt=0 -> mass/RHS term only)
@@ -786,6 +853,19 @@ class(oft_vector), pointer :: tmp_in, tmp_out !< Temporary vectors
 REAL(r8), POINTER, DIMENSION(:) :: tmp_arr1, tmp_arr2
 
 self%parent_sim%mug%nlfun%dt = self%dt
+!---Rebuild psi_vac from the coil currents carried in field 8 of a (the current
+! iterate; the step's I-coil BC has set these to the new prescribed currents), so
+! the LHS/new-time flux uses the new coil currents. Read by mug%nlfun and add_f_diff.
+IF(self%parent_sim%tkmr%gs_device%ncoils > 0)THEN
+  BLOCK
+  REAL(r8), POINTER, DIMENSION(:) :: coil_arr
+  NULLIFY(coil_arr)
+  CALL a%get_local(coil_arr, 8)
+  CALL build_psi_vac(self%parent_sim, coil_arr)
+  CALL a%restore_local(coil_arr, 8)
+  DEALLOCATE(coil_arr)
+  END BLOCK
+END IF
 CALL b%set(0.d0)
 CALL self%parent_sim%mug%nlfun%apply_real(a,b)
 !---Add By(=F) diffusion in the non-MHD regions (mass + dt*diffusion)
@@ -914,14 +994,19 @@ DO i=1,mesh%nc
 END DO
 DEALLOCATE(basis_vals,basis_grads,by_weights_loc,cell_dofs,res_loc)
 END BLOCK
-!---Plasma flux-function constraint (nlfun only, dt>0): overwrite the By residual
-! at plasma DOFs with (By - By(F0_node)) so that By is driven to a constant equal
-! to its value at the F0 node, then set the F0-node residual to the physical F0
-! residual (plasma toroidal-flux + limiter-contour voltage integrals).
-IF(dt > 0.d0 .AND. self%parent_sim%F0_node > 0)THEN
+!---Plasma flux-function constraint (both LHS and RHS passes): overwrite the By
+! residual at plasma DOFs with (By - By(F0_node)) so that By is driven to a
+! constant equal to its value at the F0 node, then set the F0-node residual to the
+! physical F0 residual (plasma toroidal-flux + limiter-contour voltage integrals).
+! Must run for dt=0 too so the RHS supplies the matching old-time toroidal-flux
+! integral Phi(old); the limiter voltage term is multiplied by dt and so vanishes
+! on the RHS pass automatically.
+IF(self%parent_sim%F0_node > 0)THEN
 BLOCK
 TYPE(gs_equil), POINTER :: eq
 TYPE(gs_factory), POINTER :: dev
+CLASS(flux_func), POINTER :: ffp !< F*F' profile to use (current on LHS, prev-step on RHS)
+REAL(r8) :: f_scale_use !< f_scale to use (current on LHS, prev-step on RHS)
 TYPE(oft_quad_type) :: quad_1d
 REAL(r8), ALLOCATABLE :: by_res_plasma(:), psi_weights_loc(:), basis_vals_2(:), &
                          basis_vals(:), basis_grads(:,:), by_weights_loc(:), ff(:)
@@ -934,6 +1019,15 @@ REAL(r8) :: pts(2,2), dl(2), dn(3), dby(3), eta_p_loc
 eq => self%parent_sim%tkmr%gs_equil
 dev => self%parent_sim%tkmr%gs_device
 F0 = self%parent_sim%F0_node
+!---LHS (dt>0) uses the freshly-updated profile; RHS (dt=0) uses the previous-step
+! snapshot so the old-time flux Phi(old) is consistent with self%u.
+IF(dt > 0.d0)THEN
+  f_scale_use = self%parent_sim%tkmr%f_scale
+  ffp => eq%I
+ELSE
+  f_scale_use = self%parent_sim%f_scale_prev
+  ffp => self%parent_sim%I_prev
+END IF
 !---Constrain By to a constant (= By at F0) over the plasma DOFs
 ALLOCATE(by_res_plasma(lag_rep%ne))
 by_res_plasma = by_weights - by_weights(F0)
@@ -963,7 +1057,7 @@ DO i=1,mesh%nc
     END DO
     IF(gs_test_bounds(eq,coords(1:2)) .AND. psi > eq%plasma_bounds(1))THEN
       ! inside the plasma: F = sqrt(f_scale*F*F'(psi) + F0^2)
-      F0_res = F0_res + SQRT(self%parent_sim%tkmr%f_scale*eq%I%f(psi) + by_weights(F0)**2) &
+      F0_res = F0_res + SQRT(f_scale_use*ffp%f(psi) + by_weights(F0)**2) &
                *jac_det*quad%wts(m)/(coords(1)+gs_epsilon)
     ELSE
       ! in-region but outside the plasma: vacuum F = F0
@@ -1013,10 +1107,10 @@ DO i=1,nlim
   dl = pts(:,1) - pts(:,2)
   IF(dev%lim_con(i) == mesh%lc(mesh%cell_ed(2,ed),cell)) dl = -dl
   dn = [-dl(2), dl(1), 0.d0] ! outward-ish normal*|edge|
-  DO k=1,quad_1d%np
+  DO k=1,quad%np
     ff = 0.d0
-    ff(mesh%cell_ed(1,ed)) = quad_1d%pts(1,k)
-    ff(mesh%cell_ed(2,ed)) = 1.d0 - quad_1d%pts(1,k)
+    ff(mesh%cell_ed(1,ed)) = quad%pts(1,k)
+    ff(mesh%cell_ed(2,ed)) = 1.d0 - quad%pts(1,k)
     coords = mesh%log2phys(cell, ff)
     CALL mesh%jacobian(cell, ff, jac_mat, jac_det)
     DO jr=1,lag_rep%nce
@@ -1028,7 +1122,7 @@ DO i=1,nlim
       dby = dby + by_weights_loc(jr)*basis_grads(:,jr)
     END DO
     F0_res = F0_res - SIGN(1.d0,signed_area)*eta_p_loc*dt*DOT_PRODUCT(dby,dn) &
-             *quad_1d%wts(k)/(coords(1)+gs_epsilon)
+             *quad%wts(k)/(coords(1)+gs_epsilon)
   END DO
 END DO
 DEALLOCATE(elist, cell_b_dofs, basis_vals, basis_grads, by_weights_loc, ff)
@@ -1040,6 +1134,148 @@ END IF
 CALL b%restore_local(by_res, 7)
 CALL a%restore_local(by_weights, 7)
 end subroutine add_f_diff
+
+!------------------------------------------------------------------------------
+!> Snapshot the current F*F' profile (gs_equil%I) and f_scale into the sim's
+!! f_scale_prev / I_prev, so the next step's RHS (dt=0) pass of add_f_diff uses
+!! these previous-step values while the LHS uses whatever the user set for the new
+!! step. Call once at setup and at the end of every completed step.
+!------------------------------------------------------------------------------
+subroutine snapshot_f_profile(self)
+class(oft_blanket_td_sim), intent(inout) :: self
+IF(ASSOCIATED(self%I_prev))THEN
+  CALL self%I_prev%delete()
+  DEALLOCATE(self%I_prev)
+END IF
+!---copy() does ALLOCATE(new, MOLD=self), i.e. a deep copy into the null pointer
+CALL self%tkmr%gs_equil%I%copy(self%I_prev)
+self%f_scale_prev = self%tkmr%f_scale
+end subroutine snapshot_f_profile
+
+!------------------------------------------------------------------------------
+!> Rebuild the coil vacuum flux mug%psi_vac = sum_i coil_currents(i)*psi_coil(i)
+!! from a given set of coil currents. All coils are prescribed (I coils), so this
+!! is just a linear combination of the constant per-coil flux basis vectors. The
+!! RHS (apply_rhs_blanket) and LHS (nlfun_apply) call this with the coil currents
+!! carried in field 8 of their input vector, which is the old solution on the RHS
+!! and the (BC-prescribed) new currents during the LHS solve.
+!------------------------------------------------------------------------------
+subroutine build_psi_vac(self, coil_currents)
+class(oft_blanket_td_sim), intent(inout) :: self
+real(r8), intent(in) :: coil_currents(:) !< Coil currents (size ncoils)
+real(r8), pointer, dimension(:) :: pv, cw
+integer(i4) :: i
+IF(self%tkmr%gs_device%ncoils <= 0) RETURN
+NULLIFY(pv, cw)
+CALL self%mug%psi_vac%get_local(pv)
+pv = 0.d0
+DO i=1,self%tkmr%gs_device%ncoils
+  CALL self%tkmr%gs_device%psi_coil(i)%f%get_local(cw)
+  pv = pv + coil_currents(i)*cw
+END DO
+CALL self%mug%psi_vac%restore_local(pv)
+DEALLOCATE(pv)
+IF(ASSOCIATED(cw))DEALLOCATE(cw)
+end subroutine build_psi_vac
+
+!------------------------------------------------------------------------------
+!> Add the approximate-Jacobian terms for the F0 implementation to the composite
+!! Jacobian `mat`, mirroring the add_f_diff residual. Assumes the plasma_flag rows
+!! of block (7,7) have already been zeroed (in the MUG Jacobian, before the copy):
+!!  1) F mass + resistive-diffusion Jacobian in the non-MHD (non-plasma) regions,
+!!     matching the xmhd_2d By-By block without the flow terms.
+!!  2) An approximate F0/F0 diagonal = integral over the plasma region of dA/R
+!!     (no profile effects).
+!!  3) The plasma-DOF constraint rows F(ind) - F0: +1 on the diagonal (via
+!!     fem_dirichlet_diag, F0 excluded) and -1 in the F0 column.
+!------------------------------------------------------------------------------
+subroutine add_f_jac(self, mat)
+class(oft_blanket_td_sim), intent(inout) :: self
+class(oft_matrix), pointer, intent(inout) :: mat
+type(oft_quad_type), pointer :: quad
+integer(i4) :: i, m, jr, jc, F0, j
+integer(i4), allocatable :: cell_dofs(:)
+real(r8) :: eta1, eta_fallback, dt, coords(3), jac_mat(3,4), jac_det, int_factor, F0_diag
+real(r8), allocatable :: basis_vals(:), basis_grads(:,:), jac_loc(:,:)
+logical :: curved
+logical, allocatable :: plasma_no_F0(:)
+real(r8) :: nval(1,1), pval(1,1)
+IF(self%F0_node <= 0) RETURN
+F0 = self%F0_node
+dt = self%nlfun%dt
+quad => lag_rep%quad
+!---Large-but-finite resistivity in vacuum, matching add_f_diff
+eta_fallback = 1.d-1/mu0
+!=== Item 1: F mass + resistive-diffusion Jacobian in non-MHD, non-plasma regions
+! (xmhd_2d By-By block, cylindrical, without the flow terms; d/dBy of
+!  basis(jr)*by/R + dt*eta*grad(basis(jr)).grad(by)/R)
+ALLOCATE(basis_vals(lag_rep%nce), basis_grads(3,lag_rep%nce), &
+         jac_loc(lag_rep%nce,lag_rep%nce), cell_dofs(lag_rep%nce))
+DO i=1,mesh%nc
+  IF(.NOT.self%mug%ignore_rmask(mesh%reg(i))) CYCLE ! non-MHD (MUG-ignored) regions only
+  curved = cell_is_curved(mesh,i)
+  CALL lag_rep%ncdofs(i,cell_dofs)
+  eta1 = self%mug%eta(mesh%reg(i),1)
+  IF(eta1 < 0.d0) eta1 = eta_fallback
+  jac_loc = 0.d0
+  DO m=1,quad%np
+    IF(curved.OR.(m==1)) CALL mesh%jacobian(i,quad%pts(:,m),jac_mat,jac_det)
+    DO jr=1,lag_rep%nce
+      CALL oft_blag_eval(lag_rep,i,jr,quad%pts(:,m),basis_vals(jr))
+      CALL oft_blag_geval(lag_rep,i,jr,quad%pts(:,m),basis_grads(:,jr),jac_mat)
+    END DO
+    coords = mesh%log2phys(i,quad%pts(:,m))
+    basis_grads(3,:) = basis_grads(2,:) ! cylindrical: shift Z-grad to comp 3, zero phi
+    basis_grads(2,:) = 0.d0
+    int_factor = jac_det*quad%wts(m)
+    DO jr=1,lag_rep%nce
+      DO jc=1,lag_rep%nce
+        jac_loc(jr,jc) = jac_loc(jr,jc) &
+          + basis_vals(jr)*basis_vals(jc)*int_factor/(coords(1)+gs_epsilon) &
+          + dt*eta1*DOT_PRODUCT(basis_grads(:,jr),basis_grads(:,jc))*int_factor/(coords(1)+gs_epsilon)
+      END DO
+    END DO
+  END DO
+  !---Add rows to block (7,7); skip plasma_flag rows (those are constraint rows)
+  DO jr=1,lag_rep%nce
+    IF(self%plasma_flag(cell_dofs(jr))) CYCLE
+    CALL mat%add_values([cell_dofs(jr)], cell_dofs, RESHAPE(jac_loc(jr,:),[1,lag_rep%nce]), &
+                        1, lag_rep%nce, 7, 7)
+  END DO
+END DO
+DEALLOCATE(basis_vals, basis_grads, jac_loc, cell_dofs)
+!=== Item 2: approximate F0/F0 diagonal = integral over the plasma region of dA/R
+F0_diag = 0.d0
+DO i=1,mesh%nc
+  IF(mesh%reg(i) /= 1) CYCLE ! plasma region only
+  curved = cell_is_curved(mesh,i)
+  DO m=1,quad%np
+    IF(curved.OR.(m==1)) CALL mesh%jacobian(i,quad%pts(:,m),jac_mat,jac_det)
+    coords = mesh%log2phys(i,quad%pts(:,m))
+    F0_diag = F0_diag + jac_det*quad%wts(m)/(coords(1)+gs_epsilon)
+  END DO
+END DO
+pval(1,1) = F0_diag
+CALL mat%add_values([F0],[F0], pval, 1,1, 7,7)
+!=== Item 3: plasma constraint rows  F(ind) - F0
+!---(a) +1 diagonals via fem_dirichlet_diag (F0 excluded; be/leo-safe)
+ALLOCATE(plasma_no_F0(SIZE(self%plasma_flag)))
+plasma_no_F0 = self%plasma_flag
+plasma_no_F0(F0) = .FALSE.
+CALL fem_dirichlet_diag(lag_rep, mat, plasma_no_F0, 7)
+!---(b) -1 in the F0 column, guarded like fem_dirichlet_diag so each is added once
+nval(1,1) = -1.d0
+DO i=1,lag_rep%ne
+  IF(lag_rep%be(i) .OR. (.NOT.plasma_no_F0(i))) CYCLE
+  CALL mat%add_values([i],[F0], nval, 1,1, 7,7)
+END DO
+DO i=1,lag_rep%nbe
+  IF(.NOT.lag_rep%linkage%leo(i)) CYCLE
+  j = lag_rep%lbe(i)
+  IF(plasma_no_F0(j)) CALL mat%add_values([j],[F0], nval, 1,1, 7,7)
+END DO
+DEALLOCATE(plasma_no_F0)
+end subroutine add_f_jac
 
 subroutine build_blankettd_jacobian(self, mat, a, update_vac)
 class(oft_blanket_td_sim), intent(inout) :: self
@@ -1107,26 +1343,22 @@ ELSE
     CALL build_vac_op(self%tkmr,self%tkmr%vac_op)
 END IF
 
-! Count and collect BC row indices
-! nbc_rows = 0
-! DO i = 1, SIZE(self%mug%psi_bc)
-!     IF (self%mug%psi_bc(i)) nbc_rows = nbc_rows + 1
-! END DO
-
-! IF (nbc_rows > 0) THEN
-!     ALLOCATE(bc_rows(nbc_rows))
-!     bc_rows = 0
-!     k = 0
-!     DO i = 1, SIZE(self%mug%psi_bc)
-!         IF (self%mug%psi_bc(i)) THEN
-!             k = k + 1
-!             bc_rows(k) = i
-!         END IF
-!     END DO
-!     ! Zero rows in block (6,6) only (psi equation rows)
-!     CALL M%zero_rows(nbc_rows, bc_rows, 6)
-!     DEALLOCATE(bc_rows)
-! END IF
+!---Zero the plasma_flag rows (incl. F0) of the MUG Jacobian's By block before
+! copying, so add_f_jac / fem_dirichlet_diag define these rows with the F0
+! constraint instead of MUG's By evolution (mirrors add_f_diff's overwrite).
+IF(self%F0_node > 0)THEN
+    nbc_rows = COUNT(self%plasma_flag)
+    ALLOCATE(bc_rows(nbc_rows))
+    k = 0
+    DO i = 1, SIZE(self%plasma_flag)
+        IF(self%plasma_flag(i))THEN
+            k = k + 1
+            bc_rows(k) = i
+        END IF
+    END DO
+    CALL M%zero_rows(nbc_rows, bc_rows, 7)
+    DEALLOCATE(bc_rows)
+END IF
 
 
 write(*,*) "Combining jacobians"
@@ -1222,6 +1454,10 @@ DO i = 1, V%i_map(row_block)%n
     DEALLOCATE(cols, vals)
 END DO
 
+!---Add the F0-implementation Jacobian terms (F diffusion in non-MHD regions, the
+! approximate F0/F0 diagonal, and the plasma-DOF constraint rows) into block (7,7)
+CALL add_f_jac(self, mat)
+
 CALL self%aug_vec%new(tmp)
 
 CALL mat%assemble(tmp)
@@ -1236,6 +1472,11 @@ class(oft_blanket_td_sim), intent(inout) :: self !< NL operator object
 INTEGER(4) :: i
 DEBUG_STACK_PUSH
 
+IF(ASSOCIATED(self%I_prev))THEN
+    CALL self%I_prev%delete()
+    DEALLOCATE(self%I_prev)
+END IF
+!
 IF(ASSOCIATED(self%nlfun))THEN
     CALL self%nlfun%delete()
     DEALLOCATE(self%nlfun)

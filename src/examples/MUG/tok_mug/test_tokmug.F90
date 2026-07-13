@@ -85,7 +85,7 @@ npoints = dim_sizes(1)
 ALLOCATE(psi_pert(npoints))
 CALL hdf5_read(psi_pert,TRIM(filename_pert),"tokamaker/PSI",success)
 
-psi_total = psi_eq + 0.1 * psi_pert
+psi_total = psi_eq - 0.1 * psi_pert
 
 
 CALL machine%setup(ML_blagrange)
@@ -213,7 +213,7 @@ areas = [1.8,0.25, 0.25, 0.25, 0.25, 0.25, 0.25 ]
 equil%mode = 0
 equil%I%f_offset = 36.d0
 
-dt = 0.01
+dt = 0.00867333
 lin_tol = 1.d-11
 nl_tol = 1.d-9
 ALLOCATE(dens_reg(machine%mesh%nreg))
@@ -234,13 +234,12 @@ equil%device => machine
 b_sim%save_rst = .TRUE.     ! optional; default off
 b_sim%rst_freq = 1
 CALL b_sim%setup(mg_mesh, equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg)
-
 DO i=1,1
   write(*,*) "Step: ", i
-  CALL b_sim%step(t, dt, nl_its, l_its, nretry)
+  CALL b_sim%step(equil%coil_currs, t, dt, nl_its, l_its, nretry)
   t = t + dt
 END DO
-! CALL b_sim%plot()
+CALL b_sim%plot()
 ! ALLOCATE(voltages(machine%ncoil_regs))
 ! voltages = 0.d0
 ! CALL tokamaker%setup(equil, dt, lin_tol, nl_tol, .FALSE.)
