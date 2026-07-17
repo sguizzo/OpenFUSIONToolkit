@@ -24,7 +24,7 @@ USE oft_solver_utils, ONLY: create_solver_xml, create_diag_pre
 USE oft_deriv_matrices, ONLY: oft_noop_matrix, oft_mf_matrix
 USE oft_solver_base, ONLY: oft_solver
 USE oft_native_solvers, ONLY: oft_nksolver, oft_native_gmres_solver
-USE oft_solver_utils, ONLY: create_cg_solver, create_diag_pre
+USE oft_solver_utils, ONLY: create_cg_solver, create_diag_pre, create_native_pre
 !
 USE fem_base, ONLY: oft_ml_fem_type
 USE fem_composite, ONLY: oft_fem_comp_type
@@ -100,7 +100,6 @@ TYPE, public :: oft_xmhd_2d_sim
   LOGICAL, CONTIGUOUS, POINTER, DIMENSION(:) :: T_bc => NULL() !< T BC flag
   LOGICAL, CONTIGUOUS, POINTER, DIMENSION(:) :: psi_bc => NULL() !< psi BC flag
   LOGICAL, CONTIGUOUS, POINTER, DIMENSION(:) :: by_bc => NULL() !< by BC flag
-  INTEGER(i4), CONTIGUOUS, POINTER, DIMENSION(:,:) :: jacobian_block_mask => NULL() !< Matrix block mask
   TYPE(oft_fem_comp_type), POINTER :: fe_rep => NULL() !< Finite element representation for solution field
   TYPE(xdmf_plot_file) :: xdmf_plot
   CLASS(oft_vector), POINTER :: u => NULL() !< current solution vector
@@ -217,6 +216,9 @@ solver%pm=oft_env%pm
 NULLIFY(solver%pre)
 IF(self%xml_pre_def%associated())THEN
   CALL create_solver_xml(solver%pre,self%xml_pre_def)
+ELSE IF(self%incomp)THEN
+  ! Incompressible: default to a complete LU preconditioner
+  CALL create_native_pre(solver%pre,"lu")
 ELSE
   CALL create_diag_pre(solver%pre)
 END IF
@@ -413,6 +415,9 @@ solver%pm=oft_env%pm
 NULLIFY(solver%pre)
 IF(self%xml_pre_def%associated()) THEN
   CALL create_solver_xml(solver%pre,self%xml_pre_def)
+ELSE IF(self%incomp)THEN
+  ! Incompressible: default to a complete LU preconditioner
+  CALL create_native_pre(solver%pre,"lu")
 ELSE
   CALL create_diag_pre(solver%pre)
 END IF
@@ -944,7 +949,7 @@ DO i=1,mesh%nc
       !---Momentum
       IF (cyl_flag) THEN
         res_loc(jr, 2:4) = res_loc(jr, 2:4) &
-          + basis_vals(jr)*vel*int_factor*coords(1)&
+          + basis_vals(jr)*vel*int_factor*coords(1) & 
           + self%dt*DOT_PRODUCT(btmp,basis_grads(:,jr))*btmp*int_factor*coords(1)/(mu0*m_i*n) & 
           - self%dt*DOT_PRODUCT(btmp,btmp)*basis_grads(:,jr)*int_factor*coords(1)/(2*mu0*m_i*n)
         IF (incomp) THEN
@@ -1064,7 +1069,6 @@ DO i=1,mesh%nc
   END DO
   !$omp end ordered
 END DO
-
 !---Cleanup thread-local storage
 DEALLOCATE(basis_vals,basis_grads, n_weights_loc,T_weights_loc,&
           vel_weights_loc, psi_weights_loc, by_weights_loc,cell_dofs, res_loc)
@@ -1180,7 +1184,7 @@ DO ik=1,self%fe_rep%nfields
    iloc(ik)%v=>cell_dofs
 END DO
 IF (incomp) iloc(5)%v => cell_dofs_p
-CALL self%fe_rep%mat_setup_local(jac_loc, self%jacobian_block_mask)
+CALL self%fe_rep%mat_setup_local(jac_loc)
 !$omp do ordered
 DO i=1,mesh%nc
   IF(self%ignore_rmask(mesh%reg(i)))CYCLE ! Skip cells in ignored regions
@@ -1800,9 +1804,7 @@ CALL self%fe_rep%vec_create(self%u0)
 CALL oft_blagrange%vec_create(self%psi_vac)
 CALL self%psi_vac%set(0.d0)
 !---Create Jacobian matrix
-ALLOCATE(self%jacobian_block_mask(self%fe_rep%nfields,self%fe_rep%nfields))
-self%jacobian_block_mask=1
-CALL self%fe_rep%mat_create(self%jacobian,self%jacobian_block_mask)
+CALL self%fe_rep%mat_create(self%jacobian)
 
 !-- Set material properties not already set
 IF (.NOT. ALLOCATED(self%nu)) THEN

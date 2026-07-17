@@ -59,7 +59,7 @@ LOGICAL, allocatable, dimension(:) :: mhd_flag
 CHARACTER(LEN=25) :: filename_eq = 'equilibrium.h5' !< Name of input file for mesh, fix later for variable length
 CHARACTER(LEN=25) :: filename_pert= 'paper_pert_0115.h5' !< Name of input file for mesh, fix later for variable length
 CHARACTER(LEN=25) :: tmp_str
-TYPE(oft_blanket_td_sim):: b_sim 
+TYPE(oft_mugtok_td):: b_sim 
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !------------------------------------------------------------------------------
@@ -213,7 +213,7 @@ areas = [1.8,0.25, 0.25, 0.25, 0.25, 0.25, 0.25 ]
 equil%mode = 0
 equil%I%f_offset = 36.d0
 
-dt = 0.00867333
+dt = 0.04336664911469267/5.d0
 lin_tol = 1.d-11
 nl_tol = 1.d-9
 ALLOCATE(dens_reg(machine%mesh%nreg))
@@ -222,8 +222,8 @@ dens_reg(5) = 9806.d0
 dens_reg(6) = 9806.d0
 ALLOCATE(visc_reg(machine%mesh%nreg))
 visc_reg = -1.d0
-visc_reg(5) = 1.d-3
-visc_reg(6) = 1.d-3
+visc_reg(5) = 1.d-3/dens_reg(5)
+visc_reg(6) = 1.d-3/dens_reg(6)
 
 ALLOCATE(mhd_flag(machine%mesh%nreg))
 mhd_flag = .FALSE.
@@ -233,11 +233,10 @@ mhd_flag(6) = .TRUE.
 equil%device => machine
 b_sim%save_rst = .TRUE.     ! optional; default off
 b_sim%rst_freq = 1
-CALL b_sim%setup(mg_mesh, equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg)
-DO i=1,1
+CALL b_sim%setup(equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg)
+DO i=1,10
   write(*,*) "Step: ", i
   CALL b_sim%step(equil%coil_currs, t, dt, nl_its, l_its, nretry)
-  t = t + dt
 END DO
 CALL b_sim%plot()
 ! ALLOCATE(voltages(machine%ncoil_regs))

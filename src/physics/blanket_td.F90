@@ -1,36 +1,30 @@
 MODULE oft_blanket_td
 USE oft_base
-USE oft_io, ONLY: hdf5_read, hdf5_write, oft_file_exist, &
-hdf5_field_exist, oft_bin_file, xdmf_plot_file, hdf5_create_file, hdf5_create_group
+USE oft_io, ONLY: hdf5_read, xdmf_plot_file, oft_file_exist
 USE oft_quadrature
 USE oft_mesh_type, ONLY: oft_bmesh, cell_is_curved
 USE multigrid, ONLY: multigrid_mesh
 USE oft_gauss_quadrature, ONLY: set_quad_1d
 !
-USE oft_la_base, ONLY: oft_vector, oft_matrix, oft_local_mat, oft_vector_ptr, &
-  vector_extrapolate, oft_graph, oft_graph_ptr, map_list
-USE oft_solver_utils, ONLY: create_solver_xml, create_diag_pre
+USE oft_la_base, ONLY: oft_vector, oft_matrix, oft_graph, oft_graph_ptr, map_list
 USE oft_deriv_matrices, ONLY: oft_noop_matrix, oft_mf_matrix
 USE oft_solver_base, ONLY: oft_solver
 USE oft_native_solvers, ONLY: oft_nksolver, oft_native_gmres_solver
 USE oft_solver_utils, ONLY: create_cg_solver, create_diag_pre
 USE oft_lu, ONLY: oft_lusolver
-USE oft_la_utils, ONLY: create_matrix, graph_add_dense_blocks, create_identity_graph, create_vector, create_dense_graph
-USE oft_native_la, ONLY: oft_native_matrix, native_matrix_cast
+USE oft_la_utils, ONLY: create_matrix, graph_add_dense_blocks, create_vector, create_dense_graph
+USE oft_native_la, ONLY: oft_native_matrix
 !
-USE fem_base, ONLY: oft_ml_fem_type, fem_common_linkage
 USE fem_composite, ONLY: oft_fem_comp_type, fem_graph_create
-USE fem_utils, ONLY: fem_dirichlet_diag, fem_dirichlet_vec, bfem_map_flag,  bfem_interp
-USE oft_lag_basis, ONLY: oft_lag_setup,oft_scalar_bfem, oft_blag_eval, oft_blag_geval, oft_2D_lagrange_cast
-USE oft_blag_operators, ONLY: oft_blag_vproject,oft_blag_project, oft_blag_getmop, oft_lag_bginterp
-USE oft_scalar_inits, ONLY: poss_scalar_bfield
-USE mhd_utils, ONLY: mu0, elec_charge, proton_mass
-USE oft_gs, ONLY: gs_epsilon, build_dels, gs_equil, gs_factory, gs_update_bounds, gs_test_bounds, set_bcmat, flux_func
-USE oft_gs_td, ONLY: oft_tmaker_td_mfop, tMaker_td_mfnk_update, build_vac_op, apply_rhs
+USE fem_utils, ONLY: fem_dirichlet_diag, fem_dirichlet_vec
+USE oft_lag_basis, ONLY: oft_scalar_bfem, oft_blag_eval, oft_blag_geval
+USE oft_blag_operators, ONLY: oft_blag_vproject, oft_blag_getmop, oft_lag_bginterp
+USE mhd_utils, ONLY: mu0
+USE oft_gs, ONLY: gs_epsilon, gs_equil, gs_factory, gs_update_bounds, gs_test_bounds, flux_func
+USE oft_gs_td, ONLY: oft_tmaker_td_mfop, build_vac_op, apply_rhs
 USE oft_mesh_local_util, ONLY: mesh_local_findedge
 USE xmhd_2d, ONLY: oft_xmhd_2d_sim, build_approx_jacobian
-USE oft_stitching, ONLY: oft_seam, seam_list
-USE IEEE_ARITHMETIC
+USE oft_stitching, ONLY: seam_list
 IMPLICIT NONE
 #include "local.h"
 #if !defined(TDIFF_RST_LEN)
@@ -38,77 +32,81 @@ IMPLICIT NONE
 #endif
 PRIVATE
 
-TYPE, public :: oft_blanket_td_sim
-REAL(r8) :: lin_tol = 1.d-13 !< absolute tolerance for linear solver
-REAL(r8) :: nl_tol = 1.d-11 !< Needs docs
-TYPE(oft_tmaker_td_mfop), POINTER :: tkmr => NULL() !< TokaMaker time-dependent object
-TYPE(oft_xmhd_2d_sim), POINTER :: mug => NULL() !< MUG time-dependent object
-CLASS(oft_vector), POINTER :: u => NULL() !< current solution vector
+!-----------------------------------------------------------------------------------------
+!> Combine MUG and TokaMaker time-dependent simulation object, 
+!> which allows simultaneous evolution of plasma, solid, and flowing conductor regions
+!-----------------------------------------------------------------------------------------
+TYPE, public :: oft_mugtok_td
+CLASS(oft_vector), POINTER :: u => NULL() !< Current solution vector
 CLASS(oft_vector), POINTER :: rhs => NULL() !< Temporary RHS vector
-CLASS(oft_vector), POINTER :: tmp => NULL() !< Temporary RHS vector
-CLASS(oft_vector), POINTER :: aug_vec => NULL() !<  Augmented vector template
-TYPE(oft_mf_matrix), POINTER :: mfmat => NULL() !< Matrix free operator
-TYPE(oft_blanket_td_mfop), POINTER :: nlfun => NULL() ! !< Time-advance operator 
+CLASS(oft_vector), POINTER :: tmp => NULL() !< Temporary storage vector
+CLASS(oft_vector), POINTER :: aug_vec => NULL() !<  Augmented vector template (fields + coil currents)
+TYPE(oft_tmaker_td_mfop), POINTER :: tkmr => NULL() !< TokaMaker time-dependent simulation object
+TYPE(oft_xmhd_2d_sim), POINTER :: mug => NULL() !< MUG time-dependent simulation object
+TYPE(oft_mf_matrix), POINTER :: mfmat => NULL() !< Matrix free Jacobian operator
+TYPE(oft_mugtok_td_mfop), POINTER :: nlfun => NULL() ! !< Time-advance operator 
 TYPE(oft_native_gmres_solver), POINTER :: mf_solver => NULL() !< Outer linear solver
-TYPE(oft_lusolver), POINTER :: pre => NULL() !< Preconditioner using jacobian operator
+TYPE(oft_lusolver), POINTER :: pre => NULL() !< Preconditioner using approximate jacobian
 TYPE(oft_nksolver) :: nksolver !< Newton-Krylov solver for time-advance
-CLASS(oft_matrix), POINTER :: jacobian => NULL() !< Needs docs
-INTEGER(i4), CONTIGUOUS, POINTER, DIMENSION(:,:) :: jacobian_block_mask => NULL() !< Matrix block mask
-TYPE(oft_fem_comp_type), POINTER :: fe_rep => NULL() !< Finite element representation for solution field
-LOGICAL :: pm = .TRUE.
-LOGICAL :: save_rst = .FALSE. !< If true, write restart files ('blanket_NNNNN.rst') for plotting
+TYPE(oft_fem_comp_type), POINTER :: fe_rep => NULL() !< Finite element representation for solution fields (without coil currents)
+LOGICAL :: pm = .FALSE.
+LOGICAL :: save_rst = .FALSE. !< If true, write restart files ('mugtok_NNNNN.rst') for plotting
 INTEGER(i4) :: rst_freq = 1 !< Restart-file output frequency (in steps)
 INTEGER(i4) :: rst_count = 0 !< Completed-step counter (used as the restart-file index)
-LOGICAL, ALLOCATABLE, DIMENSION(:) :: plasma_flag !< True for By-field DOFs in or on the border of region 1 (the plasma)
-INTEGER(i4) :: F0_node = 0 !< Index of the first plasma_flag=.TRUE. DOF (0 if none)
-!---Previous-step F*F' profile snapshot, used by the RHS (dt=0) pass of add_f_diff
-! so that when the user updates tkmr%f_scale / gs_equil%I between steps the RHS
-! is evaluated with the OLD profile (consistent with self%u) and the LHS with the
-! new one. Refreshed by snapshot_f_profile at setup and at the end of each step.
-REAL(r8) :: f_scale_prev = 1.d0 !< tkmr%f_scale as of the previous completed step
-CLASS(flux_func), POINTER :: I_prev => NULL() !< copy of gs_equil%I from previous step
+LOGICAL, ALLOCATABLE, DIMENSION(:) :: plasma_flag !< True for DOFs in or on the border of region 1 (the plasma)
+INTEGER(i4) :: F0_node = 0 !< Index of the first plasma_flag=.TRUE. DOF, used to evolve F0 (0 if none)
+REAL(r8) :: f_scale_prev = 1.d0 !< FF' scale (tkmr%f_scale) as of the previous timestep
+CLASS(flux_func), POINTER :: I_prev => NULL() !< FF' profile (gs_equil%I) from previous timestep
 
 contains
-    !> Apply the matrix
-    procedure :: setup => setup_blanket_td
-    !> Needs Docs
-    procedure :: delete => delete_blanket_td
-    !> Needs Docs
-    procedure :: step => step_blanket_td
-    !> Write XDMF/HDF5 plot files from saved restart files
-    procedure :: plot => blanket_td_plot
-END TYPE oft_blanket_td_sim
+    !> Setup time-dependent simulation
+    procedure :: setup => setup_mugtok_td
+    !> Delete time-dependent simulation
+    procedure :: delete => delete_mugtok_td
+    !> Take a timestep
+    procedure :: step => step_mugtok_td
+    !> Plot output files
+    procedure :: plot => mugtok_td_plot
+    procedure :: get_gradf => compute_gradf
+END TYPE oft_mugtok_td
 
-type, extends(oft_noop_matrix) ::oft_blanket_td_mfop
+!---------------------------------------------------------
+!> Combined MUG and TokaMaker time-advance operator
+!---------------------------------------------------------
+type, extends(oft_noop_matrix) ::oft_mugtok_td_mfop
     real(r8) :: dt = 1.E-3 !< Time step size [s]
-    CLASS(oft_matrix), POINTER :: jac_op => NULL() !< Time-advance operator
-    TYPE(oft_blanket_td_sim), pointer :: parent_sim => NULL() !< pointer to parent simulation object for access to parameters
+    CLASS(oft_matrix), POINTER :: jac_op => NULL() !<Approximate Jacobian operator for preconditioning
+    TYPE(oft_mugtok_td), pointer :: parent_sim => NULL() !< Pointer to parent simulation object for access to parameters
 contains
-    !> Apply operator
+    !> Apply the nonlinear function
     procedure :: apply_real => nlfun_apply
-    !> Needs Docs
+    !> Delete time-advance operator
     procedure :: delete => delete_mfop
-end type oft_blanket_td_mfop
+end type oft_mugtok_td_mfop
 
-TYPE(oft_blanket_td_sim), POINTER :: current_sim => NULL()
-CLASS(oft_bmesh), POINTER, PUBLIC :: mesh => NULL()
-CLASS(oft_scalar_bfem), POINTER :: lag_rep => NULL()
+TYPE(oft_mugtok_td), POINTER :: current_sim => NULL() !<Current mug/tokamaker simulation object
+CLASS(oft_bmesh), POINTER, PUBLIC :: mesh => NULL() !< Pointer to FE mesh object
+CLASS(oft_scalar_bfem), POINTER :: lag_rep => NULL()!< Pointer to single field FE representation 
 
 CONTAINS
 
-subroutine setup_blanket_td(self, mg_mesh, equil, dt,lin_tol,nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg, incomp)
-CLASS(oft_blanket_td_sim), INTENT(inout), TARGET :: self
-CLASS(multigrid_mesh), INTENT(in) :: mg_mesh
-TYPE(gs_equil), INTENT(inout), TARGET :: equil
-REAL(8), INTENT(in) :: dt !< Needs Docs
-REAL(8), INTENT(in) :: lin_tol !< Needs Docs
-REAL(8), INTENT(in) :: nl_tol !< Needs Docs
-INTEGER(i4) :: i,j
+!---------------------------------------------------------
+!> Setup combined MUG and TokaMaker simulation object
+!---------------------------------------------------------
+subroutine setup_mugtok_td(self, equil, dt,lin_tol,nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg, incomp, toroidal_flow)
+CLASS(oft_mugtok_td), INTENT(inout), TARGET :: self !Simulation object to be set up
+TYPE(gs_equil), INTENT(inout), TARGET :: equil !Tokamaker equilibrium object
+CLASS(multigrid_mesh), POINTER :: mg_mesh !Multigrid mesh, reused from the equilibrium's device (below)
+REAL(8), INTENT(in) :: dt !< Desired timestep [s]
+REAL(8), INTENT(in) :: lin_tol !< Linear solver tolerance
+REAL(8), INTENT(in) :: nl_tol !< Non-linear solver tolerance
 LOGICAL, INTENT(in) :: mhd_flag(:)
 REAL(8), INTENT(in) :: dens_reg(:), visc_reg(:)
-REAL, INTENT(in), optional :: eta_reg(:,:)
+REAL(8), INTENT(in), optional :: eta_reg(:,:)
 LOGICAL, INTENT(in), optional :: incomp
-TYPE(oft_tmaker_td_mfop), POINTER :: tok_sim
+LOGICAL, INTENT(in), optional :: toroidal_flow !< Allow toroidal (phi) flow to evolve in the MHD regions
+LOGICAL :: tor_flow
+INTEGER(i4) :: i,j,ierr
 TYPE(oft_xmhd_2d_sim), POINTER :: mhd_sim
 REAL(r8), POINTER, DIMENSION(:) :: tmp_arr, vals_out
 TYPE(oft_graph_ptr), ALLOCATABLE :: graphs(:,:), fe_graphs(:,:), known_graphs(:)
@@ -120,34 +118,43 @@ LOGICAL, ALLOCATABLE :: p_dir_set(:)
 INTEGER(i4), POINTER, DIMENSION(:) :: cell_dofs, cell_dofs_p
 type(seam_list), pointer, dimension(:) :: stitch_tmp
 type(map_list), pointer, dimension(:) :: map_tmp
-CLASS(oft_vector), pointer :: tmp_vec, psi_coil
-write(*,*) 111
+CLASS(oft_vector), pointer :: tmp_vec
+!---Clear any existing restart files so the run starts clean
+IF(self%save_rst)THEN
+    IF(oft_env%head_proc) CALL EXECUTE_COMMAND_LINE('rm -f mugtok_?????.rst')
+    CALL oft_mpi_barrier(ierr)
+END IF
+
+!--Take mesh and single field FE reps from TokaMaker equilibrium
 mesh => equil%device%mesh
 lag_rep=>equil%device%fe_rep
+mg_mesh => equil%device%ML_fe_rep%ml_mesh
+
 !------------------------------------------------------------------------------
-! Set up TokaMaker and MUG objects
+! Set up TokaMaker time-dependent object
 !------------------------------------------------------------------------------
 ALLOCATE(self%tkmr)
-equil%device%ignore_rmask = mhd_flag
+equil%device%ignore_rmask = mhd_flag !ignore regions where MHD will be used
 
 self%tkmr%dt=dt
 CALL self%tkmr%setup(equil)
 CALL build_vac_op(self%tkmr,self%tkmr%vac_op)
 
-!---This coupling only supports prescribed-current (I) coils. V coils (Rcoils>0)
-! are circuit-evolved and are not handled by the coil-current treatment in
-! step_blanket_td / build_psi_vac / add_f_diff, so abort if any are present.
+!--Current implementation only supports I coils, throw error if V coils present
 IF(self%tkmr%gs_device%ncoils > 0)THEN
     DO i=1,self%tkmr%gs_device%ncoils
         IF(self%tkmr%gs_device%Rcoils(i) > 0.d0) &
             CALL oft_abort("V coils (Rcoils>0) are not supported; all coils must be prescribed I coils", &
-                           "setup_blanket_td", __FILE__)
+                           "setup_mugtok_td", __FILE__)
     END DO
 END IF
 
+!------------------------------------------------------------------------------
+! Set up MUG time-dependent object
+!------------------------------------------------------------------------------
 ALLOCATE(mhd_sim)
 ALLOCATE(mhd_sim%ignore_rmask(mesh%nreg))
-mhd_sim%ignore_rmask = .NOT. mhd_flag
+mhd_sim%ignore_rmask = .NOT. mhd_flag !ignore regions where MHD will not be used
 ALLOCATE(mhd_sim%eta(mesh%nreg, 2))
 ALLOCATE(mhd_sim%m_i(mesh%nreg))
 ALLOCATE(mhd_sim%nu(mesh%nreg))
@@ -156,16 +163,24 @@ mhd_sim%nu = visc_reg
 IF(PRESENT(eta_reg)) THEN
     mhd_sim%eta = eta_reg
 ELSE
-    mhd_sim%eta(:,1) = self%tkmr%eta_reg
+    mhd_sim%eta(:,1) = self%tkmr%eta_reg !Default to TokaMaker region resistivity if none are provided
     mhd_sim%eta(:,2) = self%tkmr%eta_reg
 END IF
-
 
 IF (PRESENT(incomp)) THEN
     mhd_sim%incomp = incomp
 ELSE
     mhd_sim%incomp = .TRUE.
 END IF
+!---Compressible flow is not currently supported in the coupled MUG/TokaMaker solve
+! (the compressible energy equation and Jacobian are not validated here). Only the
+! incompressible model is available. The incomp plumbing is retained for future work.
+IF (.NOT. mhd_sim%incomp) CALL oft_abort( &
+    'Compressible flow (incomp=.FALSE.) is not currently supported; use incomp=.TRUE.', &
+    'setup_mugtok_td', __FILE__)
+
+tor_flow = .FALSE.
+IF (PRESENT(toroidal_flow)) tor_flow = toroidal_flow
 mhd_sim%cyl_flag = .TRUE.
 mhd_sim%dt = dt
 mhd_sim%den_scale = 1.d0
@@ -175,8 +190,7 @@ CALL mhd_sim%setup(mg_mesh, lag_rep%order, fe_rep_in =lag_rep)
 !------------------------------------------------------------------------------
 ! Set up plasma flag and F0 node
 !------------------------------------------------------------------------------
-! Flag By-field DOFs that lie in (or on the border of) region 1, the plasma:
-! loop cells and, for any cell in region 1, mark all of its By (order-2) DOFs.
+! Flag DOFs that lie in (or on the border of) region 1, the plasma
 ALLOCATE(self%plasma_flag(mhd_sim%fe_rep%fields(7)%fe%ne))
 self%plasma_flag = .FALSE.
 ALLOCATE(cell_dofs(lag_rep%nce))
@@ -189,7 +203,7 @@ DO i = 1, mesh%nc
     END IF
 END DO
 DEALLOCATE(cell_dofs)
-!---Index of the first plasma DOF (0 if region 1 has no DOFs)
+!---Index of the first plasma DOF, which will be used to evolve F0
 self%F0_node = FINDLOC(self%plasma_flag, .TRUE., DIM=1)
 
 !------------------------------------------------------------------------------
@@ -212,49 +226,53 @@ ALLOCATE(mhd_sim%psi_bc(mhd_sim%fe_rep%fields(6)%fe%ne))
 ALLOCATE(mhd_sim%by_bc(mhd_sim%fe_rep%fields(7)%fe%ne))
 
 mhd_sim%psi_bc = .FALSE. 
-mhd_sim%by_bc = .FALSE.  !-> deal with by later
-mhd_sim%velx_bc = .FALSE. 
-mhd_sim%vely_bc = .TRUE. 
-mhd_sim%velz_bc = .FALSE. 
+mhd_sim%by_bc = .FALSE. 
+mhd_sim%velx_bc = .FALSE.
+!---Toroidal (phi) velocity: clamped everywhere by default (no toroidal flow); if
+! toroidal_flow is requested, treat it like velx/velz (free by default, then pinned
+! outside the MHD regions by the loop below)
+IF (tor_flow) THEN
+  mhd_sim%vely_bc = .FALSE.
+ELSE
+  mhd_sim%vely_bc = .TRUE.
+END IF
+mhd_sim%velz_bc = .FALSE.
 
 mhd_sim%n_bc = .TRUE.
 mhd_sim%T_bc = .TRUE.
 
 
 ALLOCATE(cell_dofs(lag_rep%nce))
-ALLOCATE(cell_dofs_p(mhd_sim%fe_rep%fields(5)%fe%nce)) ! pressure lives on its own (order-1) space
+ALLOCATE(cell_dofs_p(mhd_sim%fe_rep%fields(5)%fe%nce)) 
 DO i = 1, mesh%nc
-    call mhd_sim%fe_rep%fields(5)%fe%ncdofs(i,cell_dofs_p) ! pressure DOFs (order-1)
-    call lag_rep%ncdofs(i,cell_dofs) ! velocity/psi/n DOFs (order-2)
-    !---Order-2 fields (psi, velocity, density): loop over the order-2 cell DOFs
-    DO j=1, SIZE(cell_dofs)
-        IF (mhd_flag(mesh%reg(i))) THEN
-            IF (.NOT. mhd_sim%incomp) mhd_sim%n_bc(cell_dofs(j)) = .FALSE. !add contributions everywhere in MHD regions, including boundaries, if incompressible
-        ELSE
-            mhd_sim%velx_bc(cell_dofs(j)) = .TRUE. !pin velocity to zero everywhere in non-MHD regions, including boundaries
-            mhd_sim%vely_bc(cell_dofs(j)) = .TRUE.
-            mhd_sim%velz_bc(cell_dofs(j)) = .TRUE.
-        END IF
-    END DO
-    !---Pressure (order-1) must be looped over its OWN cell-DOF count, not the
-    ! order-2 count, or cell_dofs_p is indexed past the filled entries (garbage
-    ! indices -> spurious unpinned pressure rows -> singular preconditioner).
+  call mhd_sim%fe_rep%fields(5)%fe%ncdofs(i,cell_dofs_p) ! pressure DOFs (order-1)
+   call lag_rep%ncdofs(i,cell_dofs) ! velocity/psi/n DOFs (order-2)
+  !---Order-2 fields (psi, velocity, density): loop over the order-2 cell DOFs
+  DO j=1, SIZE(cell_dofs)
     IF (mhd_flag(mesh%reg(i))) THEN
-        DO j=1, SIZE(cell_dofs_p)
-            mhd_sim%T_bc(cell_dofs_p(j)) = .FALSE. !free pressure everywhere in MHD regions
-        END DO
-    END IF
+      IF (.NOT. mhd_sim%incomp) mhd_sim%n_bc(cell_dofs(j)) = .FALSE. !Evolve density only in MHD regions (if not incompressible)
+      ELSE
+        mhd_sim%velx_bc(cell_dofs(j)) = .TRUE. !Pin velocity to 0 everywhere outside of MHD regions
+        mhd_sim%vely_bc(cell_dofs(j)) = .TRUE.
+        mhd_sim%velz_bc(cell_dofs(j)) = .TRUE.
+      END IF
+  END DO
+  IF (mhd_flag(mesh%reg(i))) THEN
+      DO j=1, SIZE(cell_dofs_p)
+        mhd_sim%T_bc(cell_dofs_p(j)) = .FALSE. !Evolve pressure (or temperature) only in MHD regions
+      END DO
+  END IF
 END DO
 
+!If incompressible pin value of pressure at a single DOF in each MHD region to remove null space
 IF (mhd_sim%incomp) THEN
     ALLOCATE(p_dir_set(mesh%nreg))
     p_dir_set = .FALSE.
     DO i=1, mesh%nc
         IF (mhd_flag(mesh%reg(i)) .AND. .NOT. p_dir_set(mesh%reg(i))) THEN
-            call mhd_sim%fe_rep%fields(5)%fe%ncdofs(i,cell_dofs_p) ! Get global index of local DOFs
+            call mhd_sim%fe_rep%fields(5)%fe%ncdofs(i,cell_dofs_p) 
             mhd_sim%T_bc(cell_dofs_p(1)) = .TRUE.
             p_dir_set(mesh%reg(i)) = .TRUE.
-            write(*,*) "Pinning node ", cell_dofs_p(1), " in region ", mesh%reg(i)
         END IF
     END DO
     DEALLOCATE(p_dir_set)
@@ -263,9 +281,9 @@ DEALLOCATE(cell_dofs, cell_dofs_p)
 
 self%mug => mhd_sim
 
-!------------------------------------------------------------------------------
-! Create Solver fields, augmented with coils
-!------------------------------------------------------------------------------
+!------------------------------------------------------------------------------------
+! Create solver fields, augmented with coil currents for compatibility with TokaMaker
+!------------------------------------------------------------------------------------
 self%fe_rep => self%mug%fe_rep
 
 !---Create augmented vector
@@ -307,18 +325,18 @@ CALL self%u%set(0.d0, 2)
 CALL self%u%set(0.d0, 3)
 CALL self%u%set(0.d0, 4)
 CALL self%u%set(1.d3, 5)
-CALL self%u%set(self%tkmr%gs_equil%I%f_offset, 7)
+CALL self%u%set(self%tkmr%gs_equil%I%f_offset, 7) !Set initial F to F0 value from TokaMaker equilibrium
 
+!Initialize field 6 (plasma poloidal flux) and field 8 (coil currents) from the
+! TokaMaker equilibrium, and populate MUG's vacuum flux (mug%psi_vac) from the coils.
 NULLIFY(tmp_arr, vals_out)
 CALL self%tkmr%gs_device%fe_rep%vec_create(tmp_vec)
-CALL self%tkmr%gs_device%fe_rep%vec_create(psi_coil)
-CALL psi_coil%set(0.d0)
-CALL tmp_vec%add(0.d0,1.d0,self%tkmr%gs_equil%psi)
+CALL tmp_vec%add(0.d0,1.d0,self%tkmr%gs_equil%psi) ! tmp_vec = total poloidal flux
 IF (self%tkmr%gs_device%ncoils > 0) THEN
     CALL self%u%get_local(vals_out,8)
     DO i=1,self%tkmr%gs_device%ncoils
+        !---Subtract the coil (vacuum) flux, leaving the plasma poloidal flux for field 6
         CALL tmp_vec%add(1.d0,-self%tkmr%gs_equil%coil_currs(i),self%tkmr%gs_device%psi_coil(i)%f)
-        CALL psi_coil%add(1.d0,self%tkmr%gs_equil%coil_currs(i),self%tkmr%gs_device%psi_coil(i)%f)
         vals_out(i)=self%tkmr%gs_equil%coil_currs(i)
     END DO
     CALL self%u%restore_local(vals_out,8)
@@ -326,32 +344,30 @@ IF (self%tkmr%gs_device%ncoils > 0) THEN
 END IF
 CALL tmp_vec%get_local(tmp_arr)
 CALL self%u%restore_local(tmp_arr,6)
-CALL psi_coil%get_local(tmp_arr)
-CALL self%mug%psi_vac%restore_local(tmp_arr)
 
-
+CALL build_psi_vac(self, self%tkmr%gs_equil%coil_currs)
 
 !------------------------------------------------------------------------------
-! Setup nl_fun object
+! Setup nonlinear function object
 !------------------------------------------------------------------------------
 ALLOCATE(self%nlfun)
 self%nlfun%dt=dt
 self%nlfun%parent_sim => self
 
 !------------------------------------------------------------------------------
-! Build Jacobian matrix
+! Set up structure of approximate Jacobian matrix used for preconditioning
 !------------------------------------------------------------------------------
 
-ALLOCATE(self%jacobian_block_mask(self%fe_rep%nfields,self%fe_rep%nfields))
-self%jacobian_block_mask=1
-CALL fem_graph_create(self%fe_rep, fe_graphs, known_graphs, nkgraphs, self%jacobian_block_mask)
+CALL fem_graph_create(self%fe_rep, fe_graphs, known_graphs, nkgraphs) !Setup graphs for base finite element fields
 
+!Allocate overall matrix of graphs
 IF (self%tkmr%gs_device%ncoils > 0) THEN
     ALLOCATE(graphs(self%fe_rep%nfields+1,self%fe_rep%nfields+1))
 ELSE
     ALLOCATE(graphs(self%fe_rep%nfields,self%fe_rep%nfields))
 END IF
 
+!Populate graphs with the finite element graphs
 DO i = 1, self%fe_rep%nfields
     DO j = 1, self%fe_rep%nfields
         ALLOCATE(graphs(i,j)%g)
@@ -365,7 +381,7 @@ DO i = 1, self%fe_rep%nfields
     END DO
 END DO
 
-! Add dense regions to psi block for boundary
+! Add dense regions to psi(6,6) block for free-boundary
 ALLOCATE(bc_nodes(1))
 bc_nodes(1)%n = lag_rep%nbe
 bc_nodes(1)%v => lag_rep%lbe
@@ -380,8 +396,7 @@ graphs(6,6)%g%kr=>dense_graph%kr
 graphs(6,6)%g%lc=>dense_graph%lc
 DEALLOCATE(dense_flag, bc_nodes)
 
-!---Add F0 coupling to the by (7,7) block: every plasma DOF is coupled to the
-! F0 node (a single-node dense group {F0} appended to each plasma row).
+!---Add F0 coupling to the F(7,7) block: every plasma DOF is coupled to the F0 node 
 IF(self%F0_node > 0)THEN
   ALLOCATE(f0_nodes(1))
   f0_nodes(1)%n = 1
@@ -398,12 +413,14 @@ IF(self%F0_node > 0)THEN
   DEALLOCATE(f0_nodes)
 END IF
 
+!--- Add dense blocks for coil coupling if coils are present
 IF(self%tkmr%gs_device%ncoils > 0)THEN
     CALL create_dense_graph(graphs(8,6)%g,self%tkmr%gs_device%coil_vec,tmp_vec)
     CALL create_dense_graph(graphs(6,8)%g,tmp_vec,self%tkmr%gs_device%coil_vec)
     CALL create_dense_graph(graphs(8,8)%g,self%tkmr%gs_device%coil_vec,self%tkmr%gs_device%coil_vec)
 END IF 
 
+!Create jacobian matrix
 CALL create_matrix(self%nlfun%jac_op,graphs,self%aug_vec,self%aug_vec)
 
 DO i=1,nkgraphs
@@ -411,14 +428,12 @@ DO i=1,nkgraphs
 END DO
 DEALLOCATE(graphs, known_graphs)
 CALL tmp_vec%delete
-CALL psi_coil%delete
 DEALLOCATE(tmp_vec)
-DEALLOCATE(psi_coil)
 DEALLOCATE(fe_graphs)
 
 
 ! Preconditioner should use approximate jacobian
-ALLOCATE(self%pre) !CHECKBACK
+ALLOCATE(self%pre)
 self%pre%A=>self%nlfun%jac_op 
 
 !------------------------------------------------------------------------------
@@ -447,24 +462,28 @@ self%nksolver%its=20
 self%nksolver%atol=nl_tol
 self%nksolver%rtol=1.d-20 ! Disable relative tolerance
 self%nksolver%backtrack=.FALSE.
-self%nksolver%J_update=>blanket_mfnk_update
+self%nksolver%J_update=>mugtok_mfnk_update
 self%nksolver%up_freq=1
 
-!---Seed the previous-step F*F' snapshot so step 1's RHS uses the initial profile
+!---Save initial FF' profile for F RHS
 CALL snapshot_f_profile(self)
+!---Write an initial restart file capturing the initial state, mirroring xmhd_2d
+!   which saves 'xmhd2d_00000.rst' before its time loop. rst_count is still 0 here,
+!   so this writes 'mugtok_00000.rst'; step_mugtok_td then writes 00001, 00002, ...
+IF(self%save_rst) CALL mugtok_rst_save(self, 0.d0)
+end subroutine setup_mugtok_td
 
-end subroutine setup_blanket_td
 
-
-
-subroutine step_blanket_td(self,coil_currents,time,dt,nl_its,lin_its,nretry)
-CLASS(oft_blanket_td_sim), target, intent(inout) :: self !< NL operator object
+!-----------------------------------------------------------------
+!> Take one timestep of the combined MUG and TokaMaker simulation
+!-----------------------------------------------------------------
+subroutine step_mugtok_td(self,coil_currents,time,dt,nl_its,lin_its,nretry)
+CLASS(oft_mugtok_td), target, intent(inout) :: self !< Simulation object
 REAL(r8), INTENT(in) :: coil_currents(:) !< Prescribed I-coil currents for this step (size ncoils)
-REAL(8), INTENT(inout) :: time,dt
-INTEGER(4), INTENT(out) :: nl_its,lin_its,nretry
-INTEGER(4) :: i,j,k,ierr
-REAL(r8), pointer :: tmp_arr(:), tmp_arr_2(:), currs_tmp(:)
-REAL(r8) :: res
+REAL(8), INTENT(inout) :: time,dt !< Current time and desired timestep size [s]
+INTEGER(4), INTENT(out) :: nl_its,lin_its,nretry !< Number of nonlinear and linear iterations, and number of retries
+INTEGER(4) :: i,j
+REAL(r8), pointer :: tmp_arr(:), currs_tmp(:)
 CLASS(oft_vector), pointer :: tmp_vec
 CLASS(oft_native_matrix), POINTER :: P => NULL()
 CLASS(oft_matrix), pointer :: pre
@@ -474,34 +493,27 @@ current_sim=>self
 !Update plasma time advance operator
 CALL self%tkmr%update()
 
-!Update timestep if needed
+!Update timestep if it has changed since setup, and build approximate jacobian for preconditioning
 IF(dt/=self%nlfun%dt)THEN
     dt=ABS(dt)
     self%nlfun%dt=dt
     self%mug%dt = dt
-    CALL build_blankettd_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
+    CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
 ELSE
-    CALL build_blankettd_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .FALSE.)
+    CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .FALSE.)
 END IF
 
 !Update preconditioner
-
 CALL self%pre%update(.TRUE.)
 CALL self%mf_solver%pre%update(.TRUE.)
 
-!Build RHS and apply boundary conditions
-NULLIFY(tmp_arr)
-NULLIFY(tmp_arr_2)
+!Build RHS
 CALL self%tmp%add(0.d0,1.d0,self%u)
-CALL apply_rhs_blanket(self%nlfun,self%u,self%rhs)
+CALL apply_rhs_mugtok(self%nlfun,self%u,self%rhs)
 
 NULLIFY(currs_tmp)
 DO j = 1,4
-    !---Prescribe the I-coil currents (all coils, Rcoils<=0): set field 8 of both the
-    ! RHS target and the guess vector to coil_currents, mirroring step_gs_td. The
-    ! coil equation is an identity, so this drives field 8 -> coil_currents and leaves
-    ! it there. Placed inside the loop so it is re-applied after each retry resets
-    ! self%u (and after the retry's apply_rhs_blanket, which uses the OLD field 8).
+    !---Prescribe the I-coil currents using the coil current input vector
     IF(self%tkmr%gs_device%ncoils > 0)THEN
         CALL self%rhs%get_local(currs_tmp,8)
         DO i=1,self%tkmr%gs_device%ncoils
@@ -514,28 +526,28 @@ DO j = 1,4
         END DO
         CALL self%u%restore_local(currs_tmp,8)
     END IF
+    !Run the nonlinear solver
     CALL self%nksolver%apply(self%u,self%rhs)
     IF(self%nksolver%cits<0)THEN
         CALL self%u%add(0.d0,1.d0,self%tmp)
         self%nlfun%dt=self%nlfun%dt/2.d0
-        CALL build_blankettd_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
+        CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
         CALL self%pre%update(.TRUE.)
-        ! Call apply_rhs_blanket which now properly manages its own temporary vectors
-        CALL apply_rhs_blanket(self%nlfun,self%u,self%rhs)
+        CALL apply_rhs_mugtok(self%nlfun,self%u,self%rhs)
         CYCLE
     ELSE
         EXIT
     END IF
 END DO
 
+!Advance time and return iteration counts
 time=time+self%nlfun%dt
 dt=self%nlfun%dt
 nl_its=self%nksolver%nlits
 lin_its=self%nksolver%lits
 
-!---Write the converged solution back into the equilibrium (mirrors step_gs_td):
-! coil currents from field 8, and gs_equil%psi = solved psi (field 6) + coil vacuum
-! flux, so downstream equilibrium queries see the advanced state.
+!Update equilibrium object to use the coil currents (field 8) 
+!and psi (field 6 + coil vaccum flux) from the converged solution vector 
 IF(self%tkmr%gs_device%ncoils > 0)THEN
     CALL self%u%get_local(currs_tmp,8)
     DO i=1,self%tkmr%gs_device%ncoils
@@ -543,7 +555,8 @@ IF(self%tkmr%gs_device%ncoils > 0)THEN
     END DO
 END IF
 IF(ASSOCIATED(currs_tmp))DEALLOCATE(currs_tmp)
-IF(ASSOCIATED(tmp_arr))DEALLOCATE(tmp_arr)
+
+NULLIFY(tmp_arr)
 CALL self%u%get_local(tmp_arr,6)
 CALL self%tkmr%gs_equil%psi%restore_local(tmp_arr)
 DEALLOCATE(tmp_arr)
@@ -551,106 +564,87 @@ DO i=1,self%tkmr%gs_device%ncoils
     CALL self%tkmr%gs_equil%psi%add(1.d0,self%tkmr%gs_equil%coil_currs(i),self%tkmr%gs_device%psi_coil(i)%f)
 END DO
 
-!---Optionally write a restart file for later plotting
+!---Optionally write a restart file for later plotting 
 self%rst_count = self%rst_count + 1
 IF(self%save_rst .AND. MOD(self%rst_count, self%rst_freq)==0)THEN
-    CALL blanket_rst_save(self, time)
+    CALL mugtok_rst_save(self, time)
 END IF
 
-!---Freeze the profile that self%u was just solved against. If the user updates
-! tkmr%f_scale / gs_equil%I before the next step, the RHS will use this snapshot
-! (Phi(old)) while the LHS uses the new profile.
+!---Save the profile from this iteration to be used as the RHS in future timesteps [NEED TO TALK TO CHRIS ABOUT BEST WAY TO DO THIS]
 CALL snapshot_f_profile(self)
-
-end subroutine step_blanket_td
+write(*,*) 'new f scale: ', self%tkmr%f_scale
+end subroutine step_mugtok_td
 
 !------------------------------------------------------------------------------
-!> Save the current coupled solution (MUG fields 1-7 of the augmented vector) to
-!> a restart file 'blanket_NNNNN.rst', indexed by the completed-step counter.
-!! Only the MUG composite fields are stored (the coil currents, field 8, are not
-!! spatial fields); this is what blanket_td_plot reads back for visualization.
+!> Save the current coupled solution (fields 1-7 of the augmented vector) to
+!> a restart file 'mugtok_NNNNN.rst', indexed by the completed-step counter.
 !------------------------------------------------------------------------------
-subroutine blanket_rst_save(self, t)
-class(oft_blanket_td_sim), intent(inout) :: self
+subroutine mugtok_rst_save(self, t)
+class(oft_mugtok_td), intent(inout) :: self
 real(r8), intent(in) :: t !< Current solution time
 class(oft_vector), pointer :: mug_vec
 real(r8), pointer :: tmp(:)
 character(LEN=TDIFF_RST_LEN) :: rst_char
 integer(i4) :: i
 NULLIFY(mug_vec, tmp)
-!---Copy MUG fields (1-7) out of the augmented solution vector
+!---Copy fields (1-7) out of the augmented solution vector
 CALL self%mug%fe_rep%vec_create(mug_vec)
 DO i=1,7
     NULLIFY(tmp)
     CALL self%u%get_local(tmp, i)
     CALL mug_vec%restore_local(tmp, i)
-    CALL self%u%restore_local(tmp, i) ! return checkout to the source vector
+    CALL self%u%restore_local(tmp, i)
     NULLIFY(tmp)
 END DO
 !---Write via the MUG restart machinery (handles the composite FE layout)
 WRITE(rst_char,'(I5.5)') self%rst_count
-CALL self%mug%rst_save(mug_vec, t, self%nlfun%dt, 'blanket_'//rst_char//'.rst', 'U')
+CALL self%mug%rst_save(mug_vec, t, self%nlfun%dt, 'mugtok_'//rst_char//'.rst', 'U')
 CALL mug_vec%delete
 DEALLOCATE(mug_vec)
-end subroutine blanket_rst_save
+end subroutine mugtok_rst_save
 
 !------------------------------------------------------------------------------
 !> Plot saved restart states to XDMF/HDF5, modeled on xmhd_2d_plot.
-!! Automatically finds and plots every 'blanket_NNNNN.rst' file in the working
-!! directory (written when save_rst=.TRUE.), writing density, velocity, psi and
-!! poloidal B to the root 'oft_xdmf.*' (group 'blanket_td'). For incompressible
-!! runs the (order-1) pressure is written under the 'pressure/' subdirectory
-!! (group 'blanket_td_p'), mirroring xmhd_2d_plot's separate pressure output;
-!! run build_xdmf.py in that subdirectory to assemble it. Takes no options.
+!! Scans the 'mugtok_NNNNN.rst' restart files over the index range
+!! [rst_start,rst_end] (stepping by the save frequency) and plots every one that
+!! exists, writing density, velocity, psi and B to the root 'oft_xdmf.*' (group
+!! 'mugtok_td'). For incompressible runs the (order-1) pressure is written under
+!! the 'pressure/' subdirectory (group 'mugtok_td_p').
+!! Runtime options are set in the main input file using the group
+!! `mugtok_plot_options`.
+!! **Option group:** `mugtok_plot_options`
+!! |  Option    |  Description  | Type [dim] |
+!! |------------|---------------|------------|
+!! | `rst_start=0`      | First restart-file index to read | int |
+!! | `rst_end=2000`     | Last restart-file index to read | int |
 !------------------------------------------------------------------------------
-subroutine blanket_td_plot(self)
-class(oft_blanket_td_sim), intent(inout) :: self
+subroutine mugtok_td_plot(self)
+class(oft_mugtok_td), intent(inout) :: self
 class(oft_vector), pointer :: ux,uy,uz,v_lag,u
 type(oft_lag_bginterp) :: grad_psi
 CLASS(oft_solver), POINTER :: lminv => NULL()
 class(oft_matrix), pointer :: lmop => NULL()
 real(r8), pointer :: plot_vals(:), plot_vec(:,:), pvac(:)
-INTEGER(i4) :: ierr, io_unit, io_stat, nfiles, k
-CHARACTER(LEN=OFT_PATH_SLEN) :: line, listfile
-CHARACTER(LEN=OFT_PATH_SLEN), ALLOCATABLE :: file_list(:)
+INTEGER(i4) :: ierr, io_unit, io_stat, nplotted
+INTEGER(i4) :: rst_start=0, rst_end=2000, rst_cur, rst_tmp
+CHARACTER(LEN=OFT_PATH_SLEN) :: file_tmp
+CHARACTER(LEN=TDIFF_RST_LEN) :: rst_char
+LOGICAL :: rst_exist
 real(r8) :: t
 TYPE(xdmf_plot_file) :: xdmf_plot, xdmf_plot_p
+namelist/mugtok_plot_options/rst_start,rst_end
 !---------------------------------------------------------------------------
-! Discover every blanket_NNNNN.rst file in the working directory (sorted)
+! Read plotting options: which restart files (mugtok_NNNNN.rst) to plot.
+! Modeled on xmhd_2d_plot -- scan the index range [rst_start,rst_end], stepping by
+! the save frequency, and plot each restart file until the first missing index
+! (instead of shelling out to 'ls'). setup_mugtok_td writes the initial state as
+! index 0, so the scan starts cleanly at rst_start=0.
 !---------------------------------------------------------------------------
-listfile='.blanket_rst_list.tmp'
-IF(oft_env%head_proc) &
-  CALL EXECUTE_COMMAND_LINE('ls blanket_?????.rst 2>/dev/null | sort > '//TRIM(listfile))
-CALL oft_mpi_barrier(ierr)
-nfiles=0
-OPEN(NEWUNIT=io_unit,FILE=TRIM(listfile),STATUS='old',IOSTAT=io_stat)
-IF(io_stat==0)THEN
-  DO
-    READ(io_unit,'(A)',IOSTAT=io_stat) line
-    IF(io_stat/=0) EXIT
-    IF(LEN_TRIM(line)>0) nfiles=nfiles+1
-  END DO
-  ALLOCATE(file_list(MAX(nfiles,1)))
-  REWIND(io_unit)
-  k=0
-  DO
-    READ(io_unit,'(A)',IOSTAT=io_stat) line
-    IF(io_stat/=0) EXIT
-    IF(LEN_TRIM(line)>0)THEN
-      k=k+1
-      file_list(k)=line
-    END IF
-  END DO
-  CLOSE(io_unit,STATUS='delete')
-END IF
-IF(nfiles==0)THEN
-  IF(oft_env%head_proc)WRITE(*,'(A)')'blanket_td_plot: no blanket_*.rst files found, nothing to plot'
-  IF(ALLOCATED(file_list))DEALLOCATE(file_list)
-  RETURN
-END IF
-IF(oft_env%head_proc)WRITE(*,'(A,I0,A)')'blanket_td_plot: plotting ',nfiles,' restart file(s)'
+open(NEWUNIT=io_unit,FILE=oft_env%ifile)
+read(io_unit,mugtok_plot_options,IOSTAT=ierr)
+close(io_unit)
 !---------------------------------------------------------------------------
-! Create working fields (psi-gradient -> B projection uses an L2 mass solve)
+! Set up grad-psi -> B projection
 !---------------------------------------------------------------------------
 call self%mug%fe_rep%vec_create(u)
 call lag_rep%vec_create(ux)
@@ -668,17 +662,30 @@ ALLOCATE(plot_vec(3,v_lag%n))
 NULLIFY(plot_vals)
 CALL grad_psi%setup(lag_rep)
 !---------------------------------------------------------------------------
-! Pass 1: order-2 fields (n, V, psi, B, and T if compressible) on 'mesh'
+! order-2 fields (n, V, psi, B, and T if compressible) on 'mesh'
 !---------------------------------------------------------------------------
-CALL xdmf_plot%setup("blanket_td")
+CALL xdmf_plot%setup("mugtok_td")
 CALL mesh%setup_io(xdmf_plot,lag_rep%order)
 !---Vacuum poloidal flux offset (constant in time); added to psi for the total flux
 NULLIFY(pvac)
 CALL self%mug%psi_vac%get_local(pvac)
-DO k=1,nfiles
-  CALL hdf5_read(t,TRIM(file_list(k)),'t')
-  CALL self%mug%rst_load(u,TRIM(file_list(k)),'U')
+110 FORMAT (I TDIFF_RST_LEN.TDIFF_RST_LEN)
+nplotted=0
+rst_cur=rst_start
+DO
+  IF(rst_cur > rst_end) EXIT
+  WRITE(rst_char,110)rst_cur
+  READ(rst_char,110,IOSTAT=io_stat)rst_tmp
+  IF((io_stat/=0).OR.(rst_tmp/=rst_cur)) &
+    CALL oft_abort("Step count exceeds format width","mugtok_td_plot",__FILE__)
+  file_tmp='mugtok_'//rst_char//'.rst'
+  rst_exist=oft_file_exist(TRIM(file_tmp))
+  CALL oft_mpi_barrier(ierr)
+  IF(.NOT.rst_exist) EXIT           ! reached the end of the saved restart files
+  CALL hdf5_read(t,TRIM(file_tmp),'t')
+  CALL self%mug%rst_load(u,TRIM(file_tmp),'U')
   CALL xdmf_plot%add_timestep(t)
+  nplotted=nplotted+1
   !---Density
   NULLIFY(plot_vals)
   CALL u%get_local(plot_vals,1)
@@ -688,9 +695,9 @@ DO k=1,nfiles
   CALL u%get_local(plot_vals,2)
   plot_vec(1,:)=plot_vals
   CALL u%get_local(plot_vals,3)
-  plot_vec(3,:)=plot_vals
-  CALL u%get_local(plot_vals,4)
   plot_vec(2,:)=plot_vals
+  CALL u%get_local(plot_vals,4)
+  plot_vec(3,:)=plot_vals
   CALL mesh%save_vertex_vector(plot_vec,xdmf_plot,'V')
   !---Temperature (compressible only; incompressible pressure is done in pass 2)
   IF(.NOT.self%mug%incomp)THEN
@@ -703,7 +710,7 @@ DO k=1,nfiles
   CALL u%get_local(plot_vals,6)
   plot_vals = plot_vals + pvac
   CALL mesh%save_vertex_scalar(plot_vals,xdmf_plot,'psi')
-  !---Poloidal B from grad(psi + psi_vac) (L2-projected onto the Lagrange space)
+  !---Poloidal B from grad(psi + psi_vac)
   CALL grad_psi%u%restore_local(plot_vals)
   CALL grad_psi%setup(lag_rep)
   CALL oft_blag_vproject(lag_rep,grad_psi,ux,uy,uz)
@@ -716,34 +723,63 @@ DO k=1,nfiles
   CALL uy%get_local(plot_vals)
   plot_vec(1,:)=-plot_vals
   CALL ux%get_local(plot_vals)
-  plot_vec(2,:)=plot_vals
-  CALL u%get_local(plot_vals,7)
   plot_vec(3,:)=plot_vals
+  CALL u%get_local(plot_vals,7)
+  plot_vec(2,:)=plot_vals
   IF (self%mug%cyl_flag) THEN
     CALL mesh%save_vertex_vector(plot_vec,xdmf_plot,'B*R')
   ELSE
     CALL mesh%save_vertex_vector(plot_vec,xdmf_plot,'B')
   END IF
+  !---grad(F) = grad(By) 
+  NULLIFY(plot_vals)
+  CALL u%get_local(plot_vals,7)
+  CALL grad_psi%u%restore_local(plot_vals)
+  CALL grad_psi%setup(lag_rep)
+  CALL oft_blag_vproject(lag_rep,grad_psi,ux,uy,uz)
+  CALL v_lag%set(0.d0)
+  CALL lminv%apply(v_lag,ux)
+  CALL ux%add(0.d0,1.d0,v_lag)
+  CALL v_lag%set(0.d0)
+  CALL lminv%apply(v_lag,uy)
+  CALL uy%add(0.d0,1.d0,v_lag)
+  CALL ux%get_local(plot_vals)
+  plot_vec(1,:)=plot_vals   ! dF/dR
+  CALL uy%get_local(plot_vals)
+  plot_vec(3,:)=plot_vals   ! dF/dZ
+  plot_vec(2,:)=0.d0
+  CALL mesh%save_vertex_vector(plot_vec,xdmf_plot,'gradF')
+  rst_cur=rst_cur+self%rst_freq
 END DO
+IF(nplotted==0.AND.oft_env%head_proc) &
+  WRITE(*,'(A)')'mugtok_td_plot: no mugtok_*.rst files found, nothing to plot'
 CALL self%mug%psi_vac%restore_local(pvac)
 NULLIFY(pvac)
 !---------------------------------------------------------------------------
-! Pass 2: the incompressible pressure lives on the order-1 space. Plot it in a
-! separate pass so the order-1 mesh IO (the 'mesh_p' role) does not clash with
-! the order-2 tessellation used above; written to its own file like xmhd_2d.
+! incompressible pressure
 !---------------------------------------------------------------------------
 IF(self%mug%incomp)THEN
-  ! Separate output DIRECTORY: xmdf_setup truncates oft_xdmf.*.h5, so a second
-  ! plot object in the same directory would wipe the main-field file above.
-  CALL xdmf_plot_p%setup("blanket_td_p","pressure/")
+  ! Separate output dIRECTORY because xmdf_setup truncates oft_xdmf.*.h5, so a second
+  ! plot object in the same directory would wipe the main-field file above
+  CALL xdmf_plot_p%setup("mugtok_td_p","pressure/")
   CALL mesh%setup_io(xdmf_plot_p,lag_rep%order-1)
-  DO k=1,nfiles
-    CALL hdf5_read(t,TRIM(file_list(k)),'t')
-    CALL self%mug%rst_load(u,TRIM(file_list(k)),'U')
+  rst_cur=rst_start
+  nplotted=0
+  DO
+    IF(rst_cur > rst_end) EXIT
+    WRITE(rst_char,110)rst_cur
+    file_tmp='mugtok_'//rst_char//'.rst'
+    rst_exist=oft_file_exist(TRIM(file_tmp))
+    CALL oft_mpi_barrier(ierr)
+    IF(.NOT.rst_exist) EXIT
+    CALL hdf5_read(t,TRIM(file_tmp),'t')
+    CALL self%mug%rst_load(u,TRIM(file_tmp),'U')
     CALL xdmf_plot_p%add_timestep(t)
     NULLIFY(plot_vals)
     CALL u%get_local(plot_vals,5)
     CALL mesh%save_vertex_scalar(plot_vals,xdmf_plot_p,'p')
+    nplotted=nplotted+1
+    rst_cur=rst_cur+self%rst_freq
   END DO
 END IF
 !---Cleanup
@@ -755,41 +791,99 @@ CALL v_lag%delete
 DEALLOCATE(u,ux,uy,uz,v_lag)
 IF(ASSOCIATED(plot_vals))DEALLOCATE(plot_vals)
 IF(ASSOCIATED(plot_vec))DEALLOCATE(plot_vec)
-DEALLOCATE(file_list)
-end subroutine blanket_td_plot
+end subroutine mugtok_td_plot
 
-subroutine apply_rhs_blanket(self, a, b)
-class(oft_blanket_td_mfop), intent(inout) :: self
+!------------------------------------------------------------------------------
+!> Compute the L2-projected poloidal gradient of F (field 7) at the nodes:
+!! gradf_r = dF/dR, gradf_z = dF/dZ. Uses the same projection machinery as the
+!! 'gradF' plot output (oft_blag_vproject + a Lagrange mass-matrix solve).
+!------------------------------------------------------------------------------
+subroutine compute_gradf(self, gradf_r, gradf_z)
+class(oft_mugtok_td), intent(inout) :: self
+real(r8), intent(inout) :: gradf_r(:) !< dF/dR at nodes (length lag_rep%ne)
+real(r8), intent(inout) :: gradf_z(:) !< dF/dZ at nodes (length lag_rep%ne)
+class(oft_vector), pointer :: ux, uy, uz, v_lag
+type(oft_lag_bginterp) :: grad_psi
+class(oft_matrix), pointer :: lmop => NULL()
+class(oft_solver), pointer :: lminv => NULL()
+real(r8), pointer, dimension(:) :: fvals
+!---Set up the Lagrange mass-matrix solve for the L2 gradient projection
+call lag_rep%vec_create(ux)
+call lag_rep%vec_create(uy)
+call lag_rep%vec_create(uz)
+call lag_rep%vec_create(v_lag)
+call lag_rep%vec_create(grad_psi%u)
+call oft_blag_getmop(lag_rep, lmop)
+CALL create_cg_solver(lminv)
+lminv%A => lmop
+lminv%its = -2
+CALL create_diag_pre(lminv%pre)
+!---Project grad(F): F is field 7 of the current solution
+NULLIFY(fvals)
+CALL self%u%get_local(fvals, 7)
+CALL grad_psi%u%restore_local(fvals)
+CALL grad_psi%setup(lag_rep)
+CALL oft_blag_vproject(lag_rep, grad_psi, ux, uy, uz)
+CALL v_lag%set(0.d0)
+CALL lminv%apply(v_lag, ux)
+CALL ux%add(0.d0, 1.d0, v_lag)
+CALL v_lag%set(0.d0)
+CALL lminv%apply(v_lag, uy)
+CALL uy%add(0.d0, 1.d0, v_lag)
+!---Copy out dF/dR (ux) and dF/dZ (uy)
+CALL ux%get_local(fvals)
+gradf_r = fvals
+CALL uy%get_local(fvals)
+gradf_z = fvals
+DEALLOCATE(fvals)
+!---Cleanup
+CALL ux%delete; CALL uy%delete; CALL uz%delete; CALL v_lag%delete
+CALL grad_psi%u%delete
+DEALLOCATE(ux, uy, uz, v_lag)
+NULLIFY(lminv%A) ! borrowed matrix; don't let the solver free it
+CALL lminv%delete
+DEALLOCATE(lminv)
+CALL lmop%delete
+DEALLOCATE(lmop)
+end subroutine compute_gradf
+
+
+!------------------------------------------------------
+!Compute the RHS of the coupled MUG + TokaMaker system 
+!------------------------------------------------------
+subroutine apply_rhs_mugtok(self, a, b)
+class(oft_mugtok_td_mfop), intent(inout) :: self
 class(oft_vector), target, intent(inout) :: a !< Source field
 class(oft_vector), intent(inout) :: b !< Result of metric function
 class(oft_vector), pointer :: tmp_in, tmp_out !< Temporary vectors
-REAL(r8), POINTER, DIMENSION(:) :: tmp_arr1, tmp_arr2
+REAL(r8), POINTER, DIMENSION(:) :: tmp_arr1, tmp_arr2, coil_arr
 
-self%parent_sim%mug%nlfun%dt = 0.d0
-!---Rebuild psi_vac from the OLD coil currents carried in field 8 of a (= self%u,
-! not yet overwritten by the step's I-coil BC), so the RHS/old-time flux is
-! consistent with the solution being advanced. Read by mug%nlfun and add_f_diff.
+!------------------------------------------------------
+!Compute MUG contribution
+!------------------------------------------------------
+self%parent_sim%mug%nlfun%dt = 0.d0 !Set dt = 0 for MUG RHS
+
+!---Rebuild psi_vac from input coil currents (currents from previous timestep)
 IF(self%parent_sim%tkmr%gs_device%ncoils > 0)THEN
-  BLOCK
-  REAL(r8), POINTER, DIMENSION(:) :: coil_arr
   NULLIFY(coil_arr)
   CALL a%get_local(coil_arr, 8)
   CALL build_psi_vac(self%parent_sim, coil_arr)
   CALL a%restore_local(coil_arr, 8)
   DEALLOCATE(coil_arr)
-  END BLOCK
 END IF
+
+!---Apply MUG RHS operator
 CALL b%set(0.d0)
 CALL self%parent_sim%mug%nlfun%apply_real(a,b)
-!---Add By(=F) diffusion in the non-MHD regions (dt=0 -> mass/RHS term only)
-CALL add_f_diff(self, a, b, 0.d0)
-NULLIFY(tmp_arr1)
-NULLIFY(tmp_arr2)
-CALL b%get_local(tmp_arr1, 6) 
-! where (self%parent_sim%mug%psi_bc)
-!     tmp_arr1 = 0.0
-! end where
 
+!---Add F RHS in the non-MHD regions, which are currently not computed in either code
+CALL add_f_terms(self, a, b, 0.d0) !use dt = 0 to get RHS 
+NULLIFY(tmp_arr1)
+CALL b%get_local(tmp_arr1, 6) !put psi RHS into tmp_arr1 for addition to TokaMaker
+
+!------------------------------------------------------
+!Compute TokaMaker contribution
+!------------------------------------------------------
 IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
     CALL self%parent_sim%tkmr%gs_device%aug_vec%new(tmp_in)
     CALL self%parent_sim%tkmr%gs_device%aug_vec%new(tmp_out)
@@ -801,40 +895,36 @@ CALL tmp_in%set(0.d0)
 CALL tmp_out%set(0.d0)
 
 ! Extract component 6 from a and put into component 1 of tmp_in
+NULLIFY(tmp_arr2)
 CALL a%get_local(tmp_arr2, 6)
 CALL tmp_in%restore_local(tmp_arr2, 1)
-CALL a%restore_local(tmp_arr2, 6)  ! Restore to a before reusing tmp_arr2
-NULLIFY(tmp_arr2)
+CALL a%restore_local(tmp_arr2, 6)  ! 
 
 ! Extract component 8 from a and put into component 2 of tmp_in (if coils exist)
+NULLIFY(tmp_arr2)
 IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
     CALL a%get_local(tmp_arr2, 8)
     CALL tmp_in%restore_local(tmp_arr2, 2)
-    CALL a%restore_local(tmp_arr2, 8)  ! Restore to a before proceeding
+    CALL a%restore_local(tmp_arr2, 8)
     NULLIFY(tmp_arr2)
 END IF
 
+!Compute TokaMaker RHS
 CALL apply_rhs(self%parent_sim%tkmr, tmp_in, tmp_out)
-CALL tmp_out%get_local(tmp_arr2, 1)
-CALL tmp_out%restore_local(tmp_arr2, 1)
-CALL self%parent_sim%tkmr%gs_device%zerob_bc%apply(tmp_out)
+CALL self%parent_sim%tkmr%gs_device%zerob_bc%apply(tmp_out) !Apply BCs
 
-! Extract component 1 from tmp_out
+!------------------------------------------------------
+! Combine
+!------------------------------------------------------
 CALL tmp_out%get_local(tmp_arr2, 1)
-! tmp_arr1 = 0.d0
-! write(*,*) 'mug cont to RHS: ' , tmp_arr1(21202)
-! write(*,*) 'tok cont to RHS: ' , tmp_arr2(21202)
 tmp_arr1 = tmp_arr1 + tmp_arr2
 CALL b%restore_local(tmp_arr1, 6)
-CALL tmp_out%restore_local(tmp_arr2, 1)  ! Restore to tmp_out
+NULLIFY(tmp_arr1)
 
-NULLIFY(tmp_arr2)
-
-! Extract component 2 from tmp_out (if coils exist)
+! Extract component 2 from tmp_out (if coils exist) and put in field 8
 IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
     CALL tmp_out%get_local(tmp_arr2, 2)
     CALL b%restore_local(tmp_arr2, 8)
-    CALL tmp_out%restore_local(tmp_arr2, 2)  ! Restore to tmp_out
     NULLIFY(tmp_arr2)
 END IF
 
@@ -842,42 +932,22 @@ END IF
 CALL tmp_in%delete()
 CALL tmp_out%delete()
 DEALLOCATE(tmp_in, tmp_out)
-NULLIFY(tmp_arr1)
-end subroutine apply_rhs_blanket
+end subroutine apply_rhs_mugtok
 
+!------------------------------------------------------
+!Compute the LHS of the coupled MUG + TokaMaker system 
+!------------------------------------------------------
 subroutine nlfun_apply(self, a, b)
-class(oft_blanket_td_mfop), intent(inout) :: self
+class(oft_mugtok_td_mfop), intent(inout) :: self
 class(oft_vector), target, intent(inout) :: a !< Source field
 class(oft_vector), intent(inout) :: b !< Result of metric function
 class(oft_vector), pointer :: tmp_in, tmp_out !< Temporary vectors
-REAL(r8), POINTER, DIMENSION(:) :: tmp_arr1, tmp_arr2
+REAL(r8), POINTER, DIMENSION(:) :: tmp_arr1, tmp_arr2, coil_arr
 
-self%parent_sim%mug%nlfun%dt = self%dt
-!---Rebuild psi_vac from the coil currents carried in field 8 of a (the current
-! iterate; the step's I-coil BC has set these to the new prescribed currents), so
-! the LHS/new-time flux uses the new coil currents. Read by mug%nlfun and add_f_diff.
-IF(self%parent_sim%tkmr%gs_device%ncoils > 0)THEN
-  BLOCK
-  REAL(r8), POINTER, DIMENSION(:) :: coil_arr
-  NULLIFY(coil_arr)
-  CALL a%get_local(coil_arr, 8)
-  CALL build_psi_vac(self%parent_sim, coil_arr)
-  CALL a%restore_local(coil_arr, 8)
-  DEALLOCATE(coil_arr)
-  END BLOCK
-END IF
-CALL b%set(0.d0)
-CALL self%parent_sim%mug%nlfun%apply_real(a,b)
-!---Add By(=F) diffusion in the non-MHD regions (mass + dt*diffusion)
-CALL add_f_diff(self, a, b, self%dt)
-NULLIFY(tmp_arr1)
+!------------------------------------------------------
+!Compute TokaMaker contribution
+!------------------------------------------------------
 NULLIFY(tmp_arr2)
-CALL b%get_local(tmp_arr1, 6)
-! tmp_arr1 = tmp_arr1
-! where (self%parent_sim%mug%psi_bc)
-!     tmp_arr1 = 0.0
-! end where
-! Extract component 6 from a
 CALL a%get_local(tmp_arr2, 6)
 
 IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
@@ -887,63 +957,84 @@ ELSE
     CALL lag_rep%vec_create(tmp_in)
     CALL lag_rep%vec_create(tmp_out)
 END IF
+
 CALL tmp_in%set(0.d0)
 CALL tmp_out%set(0.d0)
-CALL tmp_in%restore_local(tmp_arr2, 1)
-CALL a%restore_local(tmp_arr2, 6)  ! Restore to a before reusing tmp_arr2
+CALL tmp_in%restore_local(tmp_arr2, 1) !Put current psi into tokamaker vector
 NULLIFY(tmp_arr2)
 
 IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
     CALL a%get_local(tmp_arr2, 8)
-    CALL tmp_in%restore_local(tmp_arr2, 2)
-    CALL a%restore_local(tmp_arr2, 8)  ! Restore to a
+    CALL tmp_in%restore_local(tmp_arr2, 2) !Put coil currents into tokamaker vector
     NULLIFY(tmp_arr2)
 END IF
 
+!Apply tokamaker LHS
 CALL self%parent_sim%tkmr%apply_real(tmp_in, tmp_out) 
-! Extract component 1 from tmp_out
-CALL tmp_out%get_local(tmp_arr2, 1)
-! tmp_arr1 = 0.d0
-! write(*,*) 'mug cont to LHS: ' , tmp_arr1(21202)
-! write(*,*) 'tok cont to LHS: ' , tmp_arr2(21202)
+CALL tmp_out%get_local(tmp_arr2, 1) !Put psi LHS into temp vector for adding
+
+!------------------------------------------------------
+!Compute MUG contribution
+!------------------------------------------------------
+self%parent_sim%mug%nlfun%dt = self%dt !Use real timestep for LHS
+
+!---Rebuild psi_vac from input coil currents (currents from previous timestep)
+IF(self%parent_sim%tkmr%gs_device%ncoils > 0)THEN
+  NULLIFY(coil_arr)
+  CALL a%get_local(coil_arr, 8)
+  CALL build_psi_vac(self%parent_sim, coil_arr)
+  CALL a%restore_local(coil_arr, 8)
+  DEALLOCATE(coil_arr)
+END IF
+
+CALL b%set(0.d0)
+CALL self%parent_sim%mug%nlfun%apply_real(a,b) !Apply MUG LHS
+
+!---Add F LHS in the non-MHD regions, which are currently not computed in either code
+CALL add_f_terms(self, a, b, self%dt)
+NULLIFY(tmp_arr1)
+CALL b%get_local(tmp_arr1, 6)
+
+
+!------------------------------------------------------
+! Combine
+!------------------------------------------------------
 tmp_arr1 = tmp_arr1 + tmp_arr2
 CALL b%restore_local(tmp_arr1, 6)
-CALL tmp_out%restore_local(tmp_arr2, 1)  ! Restore to tmp_out
-NULLIFY(tmp_arr2)
+NULLIFY(tmp_arr2, tmp_arr1)
 
-! Extract component 2 from tmp_out
+! Put coil current RHS into field 8
 CALL tmp_out%get_local(tmp_arr2, 2)
 CALL b%restore_local(tmp_arr2, 8)
-CALL tmp_out%restore_local(tmp_arr2, 2)  ! Restore to tmp_out
 NULLIFY(tmp_arr2)
 
 ! Cleanup
 CALL tmp_in%delete()
 CALL tmp_out%delete()
 DEALLOCATE(tmp_in, tmp_out)
-NULLIFY(tmp_arr1)
 end subroutine nlfun_apply
 
-!------------------------------------------------------------------------------
-!> Add the By(=F) diffusion residual in the NON-MHD regions (mhd_flag=.FALSE.),
-!! which the MUG solve skips via ignore_rmask. Cylindrical only; mirrors the
-!! xmhd_2d By residual but keeps ONLY the mass and resistive-diffusion terms
-!! (no velocity/fluid terms):
-!!   res(jr,7) += basis(jr)*by/R + dt*eta*grad(basis(jr)).dby/R
-!! Called with dt=self%dt from nlfun_apply and dt=0 from apply_rhs_blanket, so
-!! the by/R mass term forms a consistent backward-Euler time derivative.
-!------------------------------------------------------------------------------
-subroutine add_f_diff(self, a, b, dt)
-class(oft_blanket_td_mfop), intent(inout) :: self
-class(oft_vector), target, intent(inout) :: a !< Source field (uses By, field 7)
-class(oft_vector), intent(inout) :: b !< Result; By diffusion is ADDED to field 7
-real(r8), intent(in) :: dt !< Timestep (0 for the RHS/mass-only pass)
+!-------------------------------------------------------------------------------------------
+!! Compute remaining contributions to F residual which are not handled in MUG or TokaMaker:
+!! 1) F diffusion residual in solid conducting regions (and vacuum, with high resistivity)
+!! 2) Residual for F0 node (plasma toroidal flux + limiter voltage integrals)
+!! 3) Residual for plasma nodes (F-F(F0_node)) to drive F to a constant in the plasma
+!-------------------------------------------------------------------------------------------
+subroutine add_f_terms(self, a, b, dt)
+class(oft_mugtok_td_mfop), intent(inout) :: self
+class(oft_vector), target, intent(inout) :: a !< Source field
+class(oft_vector), intent(inout) :: b !< Result
+real(r8), intent(in) :: dt !< Timestep (0 for the RHS)
 real(r8), pointer, dimension(:) :: by_weights, by_res
 type(oft_quad_type), pointer :: quad
 integer(i4) :: i
 real(r8) :: eta_fallback
+
+!------------------------------------------------------
+! F diffusion in solid conductors
+!------------------------------------------------------
 !---Large-but-finite resistivity (0.1 ohm-m) used where the region eta is
-! undefined/negative (vacuum), converted to eta_reg (magnetic diffusivity) units.
+! undefined/negative (vacuum)
 eta_fallback = 1.d-1/mu0
 quad => lag_rep%quad
 NULLIFY(by_weights, by_res)
@@ -955,8 +1046,11 @@ INTEGER(i4) :: m, jr
 INTEGER(i4), ALLOCATABLE :: cell_dofs(:)
 REAL(r8) :: by, dby(3), jac_mat(3,4), jac_det, int_factor, coords(3), eta1
 REAL(r8), ALLOCATABLE :: basis_vals(:), basis_grads(:,:), by_weights_loc(:), res_loc(:)
+!$omp parallel private(m,jr,curved,cell_dofs,by,dby,jac_mat,jac_det,int_factor,coords,eta1, &
+!$omp   basis_vals,basis_grads,by_weights_loc,res_loc)
 ALLOCATE(basis_vals(lag_rep%nce), basis_grads(3,lag_rep%nce))
 ALLOCATE(by_weights_loc(lag_rep%nce), cell_dofs(lag_rep%nce), res_loc(lag_rep%nce))
+!$omp do ordered
 DO i=1,mesh%nc
   !---Only the non-MHD regions (those the MUG solve ignores)
   IF(.NOT.self%parent_sim%mug%ignore_rmask(mesh%reg(i)))CYCLE
@@ -988,19 +1082,21 @@ DO i=1,mesh%nc
         + dt*eta1*DOT_PRODUCT(basis_grads(:,jr),dby)*int_factor/(coords(1)+gs_epsilon)
     END DO
   END DO
+  !---Add local values to the full residual vector (ordered+atomic, as in xmhd_2d)
+  !$omp ordered
   DO jr=1,lag_rep%nce
+    !$omp atomic
     by_res(cell_dofs(jr)) = by_res(cell_dofs(jr)) + res_loc(jr)
   END DO
+  !$omp end ordered
 END DO
 DEALLOCATE(basis_vals,basis_grads,by_weights_loc,cell_dofs,res_loc)
+!$omp end parallel
 END BLOCK
-!---Plasma flux-function constraint (both LHS and RHS passes): overwrite the By
-! residual at plasma DOFs with (By - By(F0_node)) so that By is driven to a
-! constant equal to its value at the F0 node, then set the F0-node residual to the
-! physical F0 residual (plasma toroidal-flux + limiter-contour voltage integrals).
-! Must run for dt=0 too so the RHS supplies the matching old-time toroidal-flux
-! integral Phi(old); the limiter voltage term is multiplied by dt and so vanishes
-! on the RHS pass automatically.
+
+!------------------------------------------------------
+! Constrain plasma nodes and F0 toroidal flux integral
+!------------------------------------------------------
 IF(self%parent_sim%F0_node > 0)THEN
 BLOCK
 TYPE(gs_equil), POINTER :: eq
@@ -1010,7 +1106,7 @@ REAL(r8) :: f_scale_use !< f_scale to use (current on LHS, prev-step on RHS)
 TYPE(oft_quad_type) :: quad_1d
 REAL(r8), ALLOCATABLE :: by_res_plasma(:), psi_weights_loc(:), basis_vals_2(:), &
                          basis_vals(:), basis_grads(:,:), by_weights_loc(:), ff(:)
-REAL(r8), POINTER, DIMENSION(:) :: psi_weights, pvac
+REAL(r8), POINTER, DIMENSION(:) :: psi_weights, pvac, eqpsi
 INTEGER(i4), ALLOCATABLE :: cell_dofs_2(:), cell_b_dofs(:), elist(:,:)
 INTEGER(i4) :: i, m, jr, k, je, cell, ed, nlim, F0
 LOGICAL :: curved
@@ -1019,8 +1115,8 @@ REAL(r8) :: pts(2,2), dl(2), dn(3), dby(3), eta_p_loc
 eq => self%parent_sim%tkmr%gs_equil
 dev => self%parent_sim%tkmr%gs_device
 F0 = self%parent_sim%F0_node
-!---LHS (dt>0) uses the freshly-updated profile; RHS (dt=0) uses the previous-step
-! snapshot so the old-time flux Phi(old) is consistent with self%u.
+!---LHS (dt>0) uses the current TokaMaker profile (updated in apply_mfop)
+!---RHS (dt=0) uses the previous-step snapshot
 IF(dt > 0.d0)THEN
   f_scale_use = self%parent_sim%tkmr%f_scale
   ffp => eq%I
@@ -1028,18 +1124,31 @@ ELSE
   f_scale_use = self%parent_sim%f_scale_prev
   ffp => self%parent_sim%I_prev
 END IF
-!---Constrain By to a constant (= By at F0) over the plasma DOFs
+
+!---Constrain F to a constant (= F0) over the plasma DOFs
 ALLOCATE(by_res_plasma(lag_rep%ne))
 by_res_plasma = by_weights - by_weights(F0)
 CALL fem_dirichlet_vec(lag_rep, by_res_plasma, by_res, self%parent_sim%plasma_flag)
 DEALLOCATE(by_res_plasma)
-!---Get the total poloidal flux (solved psi + vacuum psi_vac) for the bounds test
+
+!---Get the total poloidal flux (psi + psi_vac) for the bounds test
 NULLIFY(psi_weights, pvac)
 CALL a%get_local(psi_weights, 6)
 CALL self%parent_sim%mug%psi_vac%get_local(pvac)
+
+NULLIFY(eqpsi)
+CALL eq%psi%get_local(eqpsi)
+eqpsi = psi_weights + pvac
+CALL eq%psi%restore_local(eqpsi)
+DEALLOCATE(eqpsi)
+CALL gs_update_bounds(eq, track_opoint=.TRUE.)
+ffp%plasma_bounds = eq%plasma_bounds
 F0_res = 0.d0
-!---Volume contribution: toroidal flux over the plasma region (region 1)
+!---Integrate toroidal flux over the plasma region (region 1)
+!$omp parallel private(m,jr,curved,cell_dofs_2,psi_weights_loc,basis_vals_2, &
+!$omp   jac_mat,jac_det,coords,psi) reduction(+:F0_res)
 ALLOCATE(basis_vals_2(lag_rep%nce), psi_weights_loc(lag_rep%nce), cell_dofs_2(lag_rep%nce))
+!$omp do
 DO i=1,mesh%nc
   IF(mesh%reg(i) /= 1)CYCLE ! plasma region only
   curved = cell_is_curved(mesh,i)
@@ -1060,17 +1169,18 @@ DO i=1,mesh%nc
       F0_res = F0_res + SQRT(f_scale_use*ffp%f(psi) + by_weights(F0)**2) &
                *jac_det*quad%wts(m)/(coords(1)+gs_epsilon)
     ELSE
-      ! in-region but outside the plasma: vacuum F = F0
+      ! in-region but outside the plasma:  F = F0
       F0_res = F0_res + by_weights(F0)*jac_det*quad%wts(m)/(coords(1)+gs_epsilon)
     END IF
   END DO
 END DO
 DEALLOCATE(basis_vals_2, psi_weights_loc, cell_dofs_2)
-!---Boundary contribution: voltage integral around the limiter contour
+!$omp end parallel
+
+!---Voltage integral around the limiter contour
 nlim = dev%nlim_con
 signed_area = 0.d0
-ALLOCATE(elist(2,nlim), cell_b_dofs(lag_rep%nce), basis_vals(lag_rep%nce), &
-         basis_grads(3,lag_rep%nce), by_weights_loc(lag_rep%nce), ff(SIZE(quad%pts,1)))
+ALLOCATE(elist(2,nlim)) ! shared: built serially below (topology), read in the parallel loop
 !---For each contour segment, find the non-plasma cell and its local edge index
 DO i=1,nlim
   IF(i < nlim)THEN
@@ -1096,6 +1206,11 @@ DO i=1,nlim
 END DO
 !---Integrate eta_p*dt*dBy/dn/R along the contour
 CALL set_quad_1d(quad_1d, lag_rep%order+2)
+!$omp parallel private(cell,ed,eta_p_loc,cell_b_dofs,by_weights_loc,pts,dl,dn,k,ff, &
+!$omp   coords,jac_mat,jac_det,jr,basis_vals,basis_grads,dby) reduction(+:F0_res)
+ALLOCATE(cell_b_dofs(lag_rep%nce), basis_vals(lag_rep%nce), basis_grads(3,lag_rep%nce), &
+         by_weights_loc(lag_rep%nce), ff(SIZE(quad%pts,1)))
+!$omp do
 DO i=1,nlim
   cell = elist(2,i)
   ed = elist(1,i)
@@ -1107,10 +1222,10 @@ DO i=1,nlim
   dl = pts(:,1) - pts(:,2)
   IF(dev%lim_con(i) == mesh%lc(mesh%cell_ed(2,ed),cell)) dl = -dl
   dn = [-dl(2), dl(1), 0.d0] ! outward-ish normal*|edge|
-  DO k=1,quad%np
+  DO k=1,quad_1d%np
     ff = 0.d0
-    ff(mesh%cell_ed(1,ed)) = quad%pts(1,k)
-    ff(mesh%cell_ed(2,ed)) = 1.d0 - quad%pts(1,k)
+    ff(mesh%cell_ed(1,ed)) = quad_1d%pts(1,k)
+    ff(mesh%cell_ed(2,ed)) = 1.d0 - quad_1d%pts(1,k)
     coords = mesh%log2phys(cell, ff)
     CALL mesh%jacobian(cell, ff, jac_mat, jac_det)
     DO jr=1,lag_rep%nce
@@ -1122,46 +1237,42 @@ DO i=1,nlim
       dby = dby + by_weights_loc(jr)*basis_grads(:,jr)
     END DO
     F0_res = F0_res - SIGN(1.d0,signed_area)*eta_p_loc*dt*DOT_PRODUCT(dby,dn) &
-             *quad%wts(k)/(coords(1)+gs_epsilon)
+             *quad_1d%wts(k)/(coords(1)+gs_epsilon)
   END DO
 END DO
-DEALLOCATE(elist, cell_b_dofs, basis_vals, basis_grads, by_weights_loc, ff)
-!---Overwrite the F0-node residual with the physical value
+DEALLOCATE(cell_b_dofs, basis_vals, basis_grads, by_weights_loc, ff)
+!$omp end parallel
+DEALLOCATE(elist)
+!---Overwrite the F0-node residual with the computed value
 by_res(F0) = F0_res
 CALL a%restore_local(psi_weights, 6)
 END BLOCK
 END IF
 CALL b%restore_local(by_res, 7)
 CALL a%restore_local(by_weights, 7)
-end subroutine add_f_diff
+end subroutine add_f_terms
 
 !------------------------------------------------------------------------------
 !> Snapshot the current F*F' profile (gs_equil%I) and f_scale into the sim's
 !! f_scale_prev / I_prev, so the next step's RHS (dt=0) pass of add_f_diff uses
-!! these previous-step values while the LHS uses whatever the user set for the new
-!! step. Call once at setup and at the end of every completed step.
+!! these previous-step values while the LHS uses whatever is set/computed for
+!! the next step
 !------------------------------------------------------------------------------
 subroutine snapshot_f_profile(self)
-class(oft_blanket_td_sim), intent(inout) :: self
+class(oft_mugtok_td), intent(inout) :: self
 IF(ASSOCIATED(self%I_prev))THEN
   CALL self%I_prev%delete()
   DEALLOCATE(self%I_prev)
 END IF
-!---copy() does ALLOCATE(new, MOLD=self), i.e. a deep copy into the null pointer
 CALL self%tkmr%gs_equil%I%copy(self%I_prev)
 self%f_scale_prev = self%tkmr%f_scale
 end subroutine snapshot_f_profile
 
 !------------------------------------------------------------------------------
-!> Rebuild the coil vacuum flux mug%psi_vac = sum_i coil_currents(i)*psi_coil(i)
-!! from a given set of coil currents. All coils are prescribed (I coils), so this
-!! is just a linear combination of the constant per-coil flux basis vectors. The
-!! RHS (apply_rhs_blanket) and LHS (nlfun_apply) call this with the coil currents
-!! carried in field 8 of their input vector, which is the old solution on the RHS
-!! and the (BC-prescribed) new currents during the LHS solve.
+!> Compute vacuum psi from a set of coil currents, for use in MUG
 !------------------------------------------------------------------------------
 subroutine build_psi_vac(self, coil_currents)
-class(oft_blanket_td_sim), intent(inout) :: self
+class(oft_mugtok_td), intent(inout) :: self
 real(r8), intent(in) :: coil_currents(:) !< Coil currents (size ncoils)
 real(r8), pointer, dimension(:) :: pv, cw
 integer(i4) :: i
@@ -1179,18 +1290,14 @@ IF(ASSOCIATED(cw))DEALLOCATE(cw)
 end subroutine build_psi_vac
 
 !------------------------------------------------------------------------------
-!> Add the approximate-Jacobian terms for the F0 implementation to the composite
-!! Jacobian `mat`, mirroring the add_f_diff residual. Assumes the plasma_flag rows
-!! of block (7,7) have already been zeroed (in the MUG Jacobian, before the copy):
-!!  1) F mass + resistive-diffusion Jacobian in the non-MHD (non-plasma) regions,
-!!     matching the xmhd_2d By-By block without the flow terms.
+!> Add approximate Jacobian entries corresponding to add_f_terms
+!!  1) F resistive-diffusion Jacobian in solid conductor (and vacuum) regions
 !!  2) An approximate F0/F0 diagonal = integral over the plasma region of dA/R
 !!     (no profile effects).
-!!  3) The plasma-DOF constraint rows F(ind) - F0: +1 on the diagonal (via
-!!     fem_dirichlet_diag, F0 excluded) and -1 in the F0 column.
+!!  3) The plasma-DOF constraint rows F(ind) - F0
 !------------------------------------------------------------------------------
 subroutine add_f_jac(self, mat)
-class(oft_blanket_td_sim), intent(inout) :: self
+class(oft_mugtok_td), intent(inout) :: self
 class(oft_matrix), pointer, intent(inout) :: mat
 type(oft_quad_type), pointer :: quad
 integer(i4) :: i, m, jr, jc, F0, j
@@ -1204,15 +1311,17 @@ IF(self%F0_node <= 0) RETURN
 F0 = self%F0_node
 dt = self%nlfun%dt
 quad => lag_rep%quad
-!---Large-but-finite resistivity in vacuum, matching add_f_diff
-eta_fallback = 1.d-1/mu0
-!=== Item 1: F mass + resistive-diffusion Jacobian in non-MHD, non-plasma regions
-! (xmhd_2d By-By block, cylindrical, without the flow terms; d/dBy of
-!  basis(jr)*by/R + dt*eta*grad(basis(jr)).grad(by)/R)
+!------------------------------------------------------
+! F diffusion in solid conductors
+!------------------------------------------------------
+eta_fallback = 1.d-1/mu0 !Large-but-finite resistivity in vacuum, matching add_f_diff
+!$omp parallel private(m,jr,jc,curved,cell_dofs,eta1,jac_loc,basis_vals,basis_grads, &
+!$omp   jac_mat,jac_det,coords,int_factor)
 ALLOCATE(basis_vals(lag_rep%nce), basis_grads(3,lag_rep%nce), &
          jac_loc(lag_rep%nce,lag_rep%nce), cell_dofs(lag_rep%nce))
+!$omp do
 DO i=1,mesh%nc
-  IF(.NOT.self%mug%ignore_rmask(mesh%reg(i))) CYCLE ! non-MHD (MUG-ignored) regions only
+  IF(.NOT.self%mug%ignore_rmask(mesh%reg(i))) CYCLE ! non-MHD regions only
   curved = cell_is_curved(mesh,i)
   CALL lag_rep%ncdofs(i,cell_dofs)
   eta1 = self%mug%eta(mesh%reg(i),1)
@@ -1225,7 +1334,7 @@ DO i=1,mesh%nc
       CALL oft_blag_geval(lag_rep,i,jr,quad%pts(:,m),basis_grads(:,jr),jac_mat)
     END DO
     coords = mesh%log2phys(i,quad%pts(:,m))
-    basis_grads(3,:) = basis_grads(2,:) ! cylindrical: shift Z-grad to comp 3, zero phi
+    basis_grads(3,:) = basis_grads(2,:) 
     basis_grads(2,:) = 0.d0
     int_factor = jac_det*quad%wts(m)
     DO jr=1,lag_rep%nce
@@ -1236,16 +1345,21 @@ DO i=1,mesh%nc
       END DO
     END DO
   END DO
-  !---Add rows to block (7,7); skip plasma_flag rows (those are constraint rows)
+  !$omp critical
   DO jr=1,lag_rep%nce
-    IF(self%plasma_flag(cell_dofs(jr))) CYCLE
+    IF(self%plasma_flag(cell_dofs(jr))) CYCLE !Skip plasma DOFs
     CALL mat%add_values([cell_dofs(jr)], cell_dofs, RESHAPE(jac_loc(jr,:),[1,lag_rep%nce]), &
                         1, lag_rep%nce, 7, 7)
   END DO
+  !$omp end critical
 END DO
 DEALLOCATE(basis_vals, basis_grads, jac_loc, cell_dofs)
-!=== Item 2: approximate F0/F0 diagonal = integral over the plasma region of dA/R
+!$omp end parallel
+!------------------------------------------------------
+! Approximate F0/F0 diagonal
+!------------------------------------------------------
 F0_diag = 0.d0
+!$omp parallel do private(m,curved,jac_mat,jac_det,coords) reduction(+:F0_diag)
 DO i=1,mesh%nc
   IF(mesh%reg(i) /= 1) CYCLE ! plasma region only
   curved = cell_is_curved(mesh,i)
@@ -1255,16 +1369,17 @@ DO i=1,mesh%nc
     F0_diag = F0_diag + jac_det*quad%wts(m)/(coords(1)+gs_epsilon)
   END DO
 END DO
+!$omp end parallel do
 pval(1,1) = F0_diag
 CALL mat%add_values([F0],[F0], pval, 1,1, 7,7)
-!=== Item 3: plasma constraint rows  F(ind) - F0
-!---(a) +1 diagonals via fem_dirichlet_diag (F0 excluded; be/leo-safe)
+!------------------------------------------------------
+! Plasma DOF constraints (F(ind) - F0)
+!------------------------------------------------------
 ALLOCATE(plasma_no_F0(SIZE(self%plasma_flag)))
 plasma_no_F0 = self%plasma_flag
 plasma_no_F0(F0) = .FALSE.
-CALL fem_dirichlet_diag(lag_rep, mat, plasma_no_F0, 7)
-!---(b) -1 in the F0 column, guarded like fem_dirichlet_diag so each is added once
-nval(1,1) = -1.d0
+CALL fem_dirichlet_diag(lag_rep, mat, plasma_no_F0, 7) !1 on diagonal
+nval(1,1) = -1.d0 !-1 for F0 column 
 DO i=1,lag_rep%ne
   IF(lag_rep%be(i) .OR. (.NOT.plasma_no_F0(i))) CYCLE
   CALL mat%add_values([i],[F0], nval, 1,1, 7,7)
@@ -1277,47 +1392,33 @@ END DO
 DEALLOCATE(plasma_no_F0)
 end subroutine add_f_jac
 
-subroutine build_blankettd_jacobian(self, mat, a, update_vac)
-class(oft_blanket_td_sim), intent(inout) :: self
-class(oft_matrix), pointer, intent(inout) :: mat
+!------------------------------------------------------
+! Build approximate Jacobian for preconditioning
+!------------------------------------------------------
+subroutine build_mugtok_td_jacobian(self, mat, a, update_vac)
+class(oft_mugtok_td), intent(inout) :: self
+class(oft_matrix), pointer, intent(inout) :: mat !< Jacobian matrix to populate
+class(oft_vector), intent(inout) :: a !<Solution for computing Jacobian
+LOGICAL, INTENT(in), optional :: update_vac !< Whether to update the vacuum psi operator (default: true)
 class(oft_matrix), pointer:: vac_op, mug_native
-class(oft_vector), intent(inout) :: a ! Solution for computing Jacobian
-LOGICAL, INTENT(in), optional :: update_vac
 CLASS(oft_native_matrix), POINTER :: V => NULL()
 CLASS(oft_native_matrix), POINTER :: M => NULL()
-INTEGER(4) :: i, n, j, colcount, row_block, col_block, jp, jn
+INTEGER(4) :: i, colcount, row_block, col_block, jp, jn
 INTEGER(4), ALLOCATABLE :: cols(:)
 REAL(r8), ALLOCATABLE :: vals(:)
-REAL(r8), pointer :: tmp_vec(:)
 INTEGER(4), ALLOCATABLE :: bc_rows(:)
 INTEGER(4) :: nbc_rows, k
-REAL(r8) :: diag_val(1,1)
 class(oft_vector), pointer :: tmp
 
-CALL mat%zero
+CALL mat%zero !Zero input matrix
 
-! CALL fem_dirichlet_diag(lag_rep,mat,self%mug%n_bc,1)
-! CALL fem_dirichlet_diag(lag_rep,mat,self%mug%velx_bc,2)
-! CALL fem_dirichlet_diag(lag_rep,mat,self%mug%vely_bc,3)
-! CALL fem_dirichlet_diag(lag_rep,mat,self%mug%velz_bc,4)
-! CALL fem_dirichlet_diag(self%mug%fe_rep%fields(5)%fe,mat,self%mug%T_bc,5)
-! CALL fem_dirichlet_diag(lag_rep,mat,self%mug%psi_bc,6)
-! CALL fem_dirichlet_diag(lag_rep,mat,self%mug%by_bc,7)
-
-! ! Set block (8,8) as identity matrix for coil currents
-! IF (self%tkmr%gs_device%ncoils > 0) THEN
-!     diag_val = 1.d0
-!     DO i = 1, self%tkmr%gs_device%ncoils
-!         CALL mat%add_values([i], [i], diag_val, 1, 1, 8, 8)
-!     END DO
-! END IF
-
+!Cast matrices to native types for access to entries 
 select type(vac_op => self%tkmr%vac_op)
 type is (oft_native_matrix)
     V => vac_op
 class default
     call oft_abort("vac_op must be an oft_native_matrix", &
-                   "build_blankettd_jacobian", __FILE__)
+                   "build_mugtok_td_jacobian", __FILE__)
 end select
 
 select type(mug_jac => self%mug%jacobian)
@@ -1325,16 +1426,10 @@ type is (oft_native_matrix)
     M => mug_jac
 class default
     call oft_abort("mug jacobian must be oft_native_matrix", &
-                   "build_blankettd_jacobian", __FILE__)
+                   "build_mugtok_td_jacobian", __FILE__)
 end select
 
-
-write(*,*) "Building individual jacobians"
-!Populate MUG and TokaMaker matrices
-! build_approx_jacobian scales all implicit terms by mug%jac_dt; blanket never
-! calls mug%run_simulation (which normally sets it), so set it here to match the
-! timestep used in the residual, else jac_dt stays at its -1.0 default and the
-! mug Jacobian is ~1/dt too large and sign-flipped.
+!Populate MUG and TokaMaker Jacobian matrices
 self%mug%jac_dt = self%nlfun%dt
 CALL build_approx_jacobian(self%mug, a)
 IF (PRESENT(update_vac)) THEN
@@ -1343,9 +1438,8 @@ ELSE
     CALL build_vac_op(self%tkmr,self%tkmr%vac_op)
 END IF
 
-!---Zero the plasma_flag rows (incl. F0) of the MUG Jacobian's By block before
-! copying, so add_f_jac / fem_dirichlet_diag define these rows with the F0
-! constraint instead of MUG's By evolution (mirrors add_f_diff's overwrite).
+!---Zero the plasma_flag rows + F0 row of the MUG Jacobian's By block before
+! copying, so add_f_jac can define these rows instead
 IF(self%F0_node > 0)THEN
     nbc_rows = COUNT(self%plasma_flag)
     ALLOCATE(bc_rows(nbc_rows))
@@ -1360,9 +1454,7 @@ IF(self%F0_node > 0)THEN
     DEALLOCATE(bc_rows)
 END IF
 
-
-write(*,*) "Combining jacobians"
-
+!Copy MUG Jacobian for all fields 
 DO row_block = 1, M%ni
     DO col_block = 1, M%nj
         DO i = 1, M%i_map(row_block)%n
@@ -1372,13 +1464,6 @@ DO row_block = 1, M%ni
             ALLOCATE(cols(colcount), vals(colcount))
             cols = M%lc(jp:jn)
             vals = M%M(jp:jn)
-            ! IF (MAXVAL(ABS(vals)) /=1.d0 .AND. row_block==col_block) THEN
-            !     write(*,*) "WEIRD ", row_block, col_block, " row ", i
-            !     write(*,*) MAXVAL(ABS(vals))
-            ! END IF
-            ! IF (row_block ==6 .AND. col_block == 6) THEN
-            !     IF (MAXVAL(vals) > 0.d0) write(*,*) i
-            ! END IF
             cols = cols - M%j_map(col_block)%offset
             CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
                 1, colcount, row_block, col_block)
@@ -1387,9 +1472,7 @@ DO row_block = 1, M%ni
     END DO 
 END DO
 
-!ADD TOKAMAKER JACOBIAN to 6,6 block
-! Add only block (1,1) from vac_op (no coil blocks for now)
-
+!Add TokaMaker Jacobian to psi(6,6) block
 row_block = 1
 col_block = 1
 DO i = 1, V%i_map(row_block)%n
@@ -1400,15 +1483,13 @@ DO i = 1, V%i_map(row_block)%n
     ALLOCATE(cols(colcount), vals(colcount))
     cols = V%lc(jp:jn)
     vals = V%M(jp:jn)
-    ! IF(ANY(vals /= 0.d0)) THEN
-    !     write(*,*) SIZE(vals)
-    ! END IF
     cols = cols - V%j_map(col_block)%offset
     CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
         1, colcount, 6, 6)
     DEALLOCATE(cols, vals)
 END DO
 
+!Add TokaMaker Jacobian to 6,8 block (MAYBE UNNECESSARY FOR ICOILS)
 row_block = 1
 col_block = 2
 DO i = 1, V%i_map(row_block)%n
@@ -1424,6 +1505,7 @@ DO i = 1, V%i_map(row_block)%n
     DEALLOCATE(cols, vals)
 END DO
 
+!Add TokaMaker Jacobian to 8,6 block (MAYBE UNNECESSARY FOR ICOILS)
 row_block = 2
 col_block = 1
 DO i = 1, V%i_map(row_block)%n
@@ -1439,6 +1521,7 @@ DO i = 1, V%i_map(row_block)%n
     DEALLOCATE(cols, vals)
 END DO
 
+!Add TokaMaker Jacobian to 8,8 block
 row_block = 2
 col_block = 2
 DO i = 1, V%i_map(row_block)%n
@@ -1454,22 +1537,21 @@ DO i = 1, V%i_map(row_block)%n
     DEALLOCATE(cols, vals)
 END DO
 
-!---Add the F0-implementation Jacobian terms (F diffusion in non-MHD regions, the
-! approximate F0/F0 diagonal, and the plasma-DOF constraint rows) into block (7,7)
+!---Add missing F contributions corresponding to add_f_terms 
 CALL add_f_jac(self, mat)
 
 CALL self%aug_vec%new(tmp)
-
 CALL mat%assemble(tmp)
-! NULLIFY(tmp_vec)
+CALL tmp%delete()
 
-DEALLOCATE(tmp)
-end subroutine build_blankettd_jacobian
+end subroutine build_mugtok_td_jacobian
 
 
-subroutine delete_blanket_td(self)
-class(oft_blanket_td_sim), intent(inout) :: self !< NL operator object
-INTEGER(4) :: i
+!---------------------------
+! Delete simulation object 
+!---------------------------
+subroutine delete_mugtok_td(self)
+class(oft_mugtok_td), intent(inout) :: self !< NL operator object
 DEBUG_STACK_PUSH
 
 IF(ASSOCIATED(self%I_prev))THEN
@@ -1500,8 +1582,11 @@ END IF
 DEBUG_STACK_POP
 end subroutine
 
+!---------------------------
+! Delete MF operator 
+!---------------------------
 subroutine delete_mfop(self)
-class(oft_blanket_td_mfop), intent(inout) :: self !< NL operator object
+class(oft_mugtok_td_mfop), intent(inout) :: self !< NL operator object
 DEBUG_STACK_PUSH
 !
 self%dt=-1.d0
@@ -1514,31 +1599,13 @@ END IF
 DEBUG_STACK_POP
 end subroutine
 
-SUBROUTINE blanket_mfnk_update(a)
+!---------------------------
+! Update 
+!---------------------------
+SUBROUTINE mugtok_mfnk_update(a)
 CLASS(oft_vector), TARGET, INTENT(inout) :: a
-! CALL active_tMaker_td%mfop%update_lims(a)
 CALL current_sim%mfmat%update(a)
-! CALL build_jop(active_tMaker_td%mfop,adv_op,a)
-!CALL active_tMaker_td%adv_solver%update(.TRUE.)
-END SUBROUTINE blanket_mfnk_update
-
-!IMPLEMENTTTTT
-! !---------------------------------------------------------------------------
-! !> Update matrix-free Jacobian on all levels with new solution
-! !---------------------------------------------------------------------------
-! subroutine mfnk_update(uin)
-! class(oft_vector), target, intent(inout) :: uin !< Current field
-! IF(oft_debug_print(1))write(*,*)'Updating 2D MUG MF-Jacobian'
-! CALL current_sim%mf_mat%update(uin)
-! END SUBROUTINE mfnk_update
-! !---------------------------------------------------------------------------
-! !> Update Jacobian matrices on all levels with new solution
-! !---------------------------------------------------------------------------
-! subroutine update_jacobian(uin)
-! class(oft_vector), target, intent(inout) :: uin !< Current solution
-! IF(oft_debug_print(1))write(*,*)'Updating 2D MUG approximate Jacobian'
-! CALL build_approx_jacobian(current_sim,uin)
-! END SUBROUTINE update_jacobian
+END SUBROUTINE mugtok_mfnk_update
 
 
 END MODULE oft_blanket_td
