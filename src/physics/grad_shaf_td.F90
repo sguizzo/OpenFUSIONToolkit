@@ -726,6 +726,9 @@ allocate(rop(lag_rep%nce),gop(3,lag_rep%nce)) ! Reconstructed gradient operator
 !ordered
 do i=1,mesh%nc
     IF(mesh%reg(i)/=1)CYCLE
+    !---Skip the plasma region when it is evolved by MHD (its current comes from
+    !   the MHD induction equation, not the Grad-Shafranov FF'/P' source)
+    IF(self%gs_device%ignore_rmask(mesh%reg(i)))CYCLE
     !---Get local to global DOF mapping
     call lag_rep%ncdofs(i,j)
     !---Get local reconstructed operators

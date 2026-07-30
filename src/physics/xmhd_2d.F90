@@ -43,6 +43,30 @@ IMPLICIT NONE
 PRIVATE
 
 !------------------------------------------------------------------------------
+!> Interface for an optional temperature closure. When supplied (compressible
+!! runs only), the temperature and its spatial gradient are computed pointwise
+!! from the other local fields via this subroutine, instead of being
+!! reconstructed from the temperature field's own degrees of freedom. This lets
+!! T be a prescribed function (e.g. T = T(psi)) with no separate field to evolve
+!! or project. The temperature DOFs should be pinned (T_bc=.TRUE.) in this mode.
+!------------------------------------------------------------------------------
+ABSTRACT INTERFACE
+  SUBROUTINE xmhd_2d_temp_func(coords, n, dn, psi, dpsi, by, dby, T, dT, dT_dpsi)
+    IMPORT :: r8
+    REAL(r8), INTENT(in) :: coords(3) !< Physical coordinates (R, phi, Z)
+    REAL(r8), INTENT(in) :: n         !< Physical number density at the point
+    REAL(r8), INTENT(in) :: dn(3)     !< Gradient of the number density
+    REAL(r8), INTENT(in) :: psi       !< Total poloidal flux (solved + vacuum)
+    REAL(r8), INTENT(in) :: dpsi(3)   !< Gradient of the total poloidal flux
+    REAL(r8), INTENT(in) :: by        !< Toroidal field function (R*B_phi)
+    REAL(r8), INTENT(in) :: dby(3)    !< Gradient of the toroidal field function
+    REAL(r8), INTENT(out) :: T        !< Temperature at the point
+    REAL(r8), INTENT(out) :: dT(3)    !< Spatial gradient of the temperature
+    REAL(r8), INTENT(out), OPTIONAL :: dT_dpsi !< Derivative dT/dpsi (of T wrt the poloidal-flux value); needed for the resistivity Jacobian when eta=eta(T(psi))
+  END SUBROUTINE xmhd_2d_temp_func
+END INTERFACE
+
+!------------------------------------------------------------------------------
 !> Object to compute left-hand side of system for nonlinear solves
 !------------------------------------------------------------------------------
 TYPE, extends(oft_noop_matrix) :: xmhd_2d_nlfun
@@ -87,6 +111,8 @@ TYPE, public :: oft_xmhd_2d_sim
   REAL(r8), ALLOCATABLE :: D_diff(:) !< diffusivity, by region
   REAL(r8) :: k_boltz = elec_charge !< Boltzmann constant (use elec_charge for T in eV)
   REAL(r8) :: den_scale = 1.d19 !< scale factor used to normalize density
+  PROCEDURE(xmhd_2d_temp_func), POINTER, NOPASS :: T_func => NULL() !< Optional closure giving T (and dT) as a function of the local fields; when associated (compressible only), T is evaluated from this instead of from its own DOFs
+  LOGICAL :: use_spitzer = .FALSE. !< If true (compressible only), override the region eta with Spitzer resistivity eta(n,T) at each quadrature point
   REAL(r8), ALLOCATABLE :: m_i(:) !< ion mass, by region
   REAL(r8), ALLOCATABLE :: eta(:, :) !< electrical resistivity, in units of mu0, by region. First column is in plane, second column is out of plane (for anisotropic resistivity)
   LOGICAL, ALLOCATABLE :: ignore_rmask(:) !< Mask for regions to ignore when populating physics (defaults to false)
@@ -878,7 +904,7 @@ DO i=1,mesh%nc
         T = T + T_weights_loc(jr)*basis_vals_p(jr)
         dT = dT + T_weights_loc(jr)*basis_grads_p(:,jr)
       END DO
-    ELSE
+    ELSE IF (.NOT.ASSOCIATED(self%parent_sim%T_func)) THEN
       DO jr=1,oft_blagrange%nce
         T = T + T_weights_loc(jr)*basis_vals(jr)
         dT = dT + T_weights_loc(jr)*basis_grads(:,jr)
@@ -886,6 +912,17 @@ DO i=1,mesh%nc
     END IF
     n = n * self%parent_sim%den_scale
     dn = dn * self%parent_sim%den_scale
+    !---Prescribed-temperature closure (compressible only): evaluate T and dT
+    !   from the local fields instead of from the temperature DOFs. Uses the
+    !   physical (scaled) density and the total poloidal flux.
+    IF ((.NOT.incomp) .AND. ASSOCIATED(self%parent_sim%T_func)) THEN
+      CALL self%parent_sim%T_func(coords, n, dn, psi, dpsi, by, dby, T, dT)
+    END IF
+    !---Spitzer resistivity: override the region eta with a T-dependent value.
+    !   Uses the temperature above (the closure value when T_func is set).
+    IF ((.NOT.incomp) .AND. self%parent_sim%use_spitzer) THEN
+      CALL spitzer_eta(n, T, eta)
+    END IF
     div_vel = dvel(1,1) + dvel(3,3)
     btmp = cross_product(dpsi, [0.d0,1.d0,0.d0]) + by*[0.d0,1.d0,0.d0] + B_0
     IF(cyl_flag)THEN
@@ -1019,8 +1056,8 @@ DO i=1,mesh%nc
         res_loc(jr, 6) = res_loc(jr, 6) &
         + basis_vals(jr)*psi*int_factor/eta(2) &
         + basis_vals(jr)*self%dt*DOT_PRODUCT(vel, dpsi)*int_factor/eta(2) &
-        + basis_vals(jr)*self%dt*tmp1(2)*int_factor/eta(2) &
-        + self%dt*DOT_PRODUCT(basis_grads(:,jr), dpsi_0)*int_factor
+        + basis_vals(jr)*self%dt*tmp1(2)*int_factor/eta(2) !&
+        !+ self%dt*DOT_PRODUCT(basis_grads(:,jr), dpsi_0)*int_factor
       END IF
       ! --By
       tmp1 = cross_product(dpsi,dvel(2, :))
@@ -1110,6 +1147,50 @@ DEALLOCATE(n_res,velx_res,vely_res, velz_res, T_res, psi_res, by_res, &
 DEALLOCATE(psi_vac_weights)
 END SUBROUTINE nlfun_apply
 !---------------------------------------------------------------------------
+!> Spitzer resistivity as a function of density and temperature. Returns the
+!! in-plane (perpendicular) and out-of-plane (parallel) resistivity in units
+!! of mu0 (i.e. magnetic diffusivity, m^2/s), matching the stored eta convention.
+!---------------------------------------------------------------------------
+subroutine spitzer_eta(n, T, eta, deta_dT)
+real(r8), intent(in) :: n       !< Physical number density [m^-3]
+real(r8), intent(in) :: T       !< Temperature [eV]
+real(r8), intent(out) :: eta(2) !< [in-plane, out-of-plane] resistivity in units of mu0
+real(r8), intent(out), optional :: deta_dT(2) !< d(eta)/dT [in-plane, out-of-plane], units of mu0 per eV
+real(r8), parameter :: Zi = 1.d0      ! ion charge number
+real(r8), parameter :: T_floor = 1000.d0 ! temperature floor [eV] to bound eta
+real(r8) :: Tuse, n_cm3, lnLam, lnLam_raw, eta_par, eta_perp, dlnLam_dT, deta_par_dT
+Tuse = MAX(T, T_floor)
+n_cm3 = MAX(n, 1.d0)*1.d-6
+!---NRL electron-ion Coulomb logarithm (T > 10 Z^2 eV), n in cm^-3, T in eV
+lnLam_raw = 24.d0 - LOG(SQRT(n_cm3)/Tuse)
+lnLam = MAX(lnLam_raw, 1.d0)
+!---Spitzer resistivity [Ohm*m] (T in eV, Z=1): parallel and perpendicular
+eta_par = 5.2d-5*Zi*lnLam/Tuse**1.5d0
+eta_perp = 1.96d0*eta_par
+lnLam_raw = 24.d0 - LOG(SQRT(n_cm3)/T_floor)
+lnLam = MAX(lnLam_raw, 1.d0)
+! write(*,*) 'vac eta: ', 5.2d-5*Zi*lnLam/T_floor**1.5d0
+! write(*,*) eta_par
+!---Store as magnetic diffusivity (eta_physical/mu0), matching the eta convention
+eta(1) = eta_perp/mu0 ! in-plane (perpendicular)
+eta(2) = eta_par/mu0  ! out-of-plane (parallel ~ toroidal)
+!---Temperature derivative d(eta)/dT (for the resistivity Jacobian). Respect the
+!   floors: d(eta)/dT = 0 where T is pinned to T_floor, and dlnLam/dT = 0 where
+!   the Coulomb log is floored.
+IF(PRESENT(deta_dT))THEN
+  IF(T <= T_floor)THEN
+    deta_dT = 0.d0
+  ELSE
+    dlnLam_dT = 0.d0
+    IF(lnLam_raw > 1.d0) dlnLam_dT = 1.d0/Tuse
+    deta_par_dT = 5.2d-5*Zi*(dlnLam_dT/Tuse**1.5d0 - 1.5d0*lnLam/Tuse**2.5d0)
+    deta_dT(2) = deta_par_dT/mu0
+    deta_dT(1) = 1.96d0*deta_par_dT/mu0
+  END IF
+END IF
+! eta = 1.d-3 ! NOTE: eta temporarily hardcoded to a constant; deta_dT above is the true Spitzer derivative
+end subroutine spitzer_eta
+!---------------------------------------------------------------------------
 !> Compute the approximate Jacobian matrix for the nonlinear function being solved
 !---------------------------------------------------------------------------
 subroutine build_approx_jacobian(self,a)
@@ -1163,7 +1244,8 @@ LOGICAL :: curved
 INTEGER(i4) :: k, l, m, ik, jr, jc
 INTEGER(i4), POINTER, DIMENSION(:) :: cell_dofs, cell_dofs_p
 REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dby(3),dvel(3,3),div_vel
-REAL(r8) :: jac_mat(3,4),jac_det,int_factor,btmp(3),tmp2(3),tmp3(3),coords(3)
+REAL(r8) :: jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),tmp2(3),tmp3(3),coords(3)
+REAL(r8) :: dT_dpsi, deta_dT(2), r_geo, d6_eta, d7_eta
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals, basis_vals_p,n_weights_loc,T_weights_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: psi_weights_loc,by_weights_loc,res_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grads_p
@@ -1171,7 +1253,8 @@ TYPE(oft_1d_int), ALLOCATABLE, DIMENSION(:) :: iloc
 type(oft_local_mat), allocatable, dimension(:,:) :: jac_loc
 !$omp parallel private(ik, k, l, m,jr,jc,curved,coords,cell_dofs,cell_dofs_p,basis_vals,basis_vals_p,basis_grads,basis_grads_p,T_weights_loc, &
 !$omp n_weights_loc,psi_weights_loc, by_weights_loc,vel_weights_loc,res_loc,jac_mat, &
-!$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dby,dvel,div_vel,btmp,tmp2,tmp3, iloc, jac_loc, &
+!$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dby,dvel,div_vel,btmp,tmp1,tmp2,tmp3, iloc, jac_loc, &
+!$omp dT_dpsi,deta_dT,r_geo,d6_eta,d7_eta, &
 !$omp chi, m_i, eta, nu, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 IF (incomp) ALLOCATE(basis_vals_p(oft_blagrange_p%nce),basis_grads_p(3,oft_blagrange_p%nce))
@@ -1271,6 +1354,17 @@ DO i=1,mesh%nc
     END DO
     n = n * self%den_scale
     dn = dn * self%den_scale
+    !---Prescribed-temperature closure and Spitzer resistivity (compressible only),
+    !   matching nlfun_apply so the preconditioner uses the same T and eta.
+    !   Also grab dT/dpsi and d(eta)/dT so the induction/By Jacobian can include
+    !   the dependence of psi and By on psi THROUGH the resistivity eta=eta(T(psi)).
+    dT_dpsi = 0.d0; deta_dT = 0.d0
+    IF ((.NOT.incomp) .AND. ASSOCIATED(self%T_func)) THEN
+      CALL self%T_func(coords, n, dn, psi, dpsi, by, dby, T, dT, dT_dpsi=dT_dpsi)
+    END IF
+    IF ((.NOT.incomp) .AND. self%use_spitzer) THEN
+      CALL spitzer_eta(n, T, eta, deta_dT=deta_dT)
+    END IF
     div_vel = dvel(1,1) + dvel(3,3)
     btmp = cross_product(dpsi, [0.d0,1.d0,0.d0]) + by*[0.d0,1.d0,0.d0] + B_0
     IF(cyl_flag)THEN
@@ -1648,9 +1742,34 @@ DO i=1,mesh%nc
         ELSE
           jac_loc(7, 7)%m(jr,jc) = jac_loc(7, 7)%m(jr,jc) &
           + basis_vals(jr)*basis_vals(jc)*int_factor &
-          + basis_vals(jr)*dt_fac*DOT_PRODUCT(basis_grads(:,jc),vel)*int_factor & 
-          + basis_vals(jr)*dt_fac*basis_vals(jc)*div_vel*int_factor & 
+          + basis_vals(jr)*dt_fac*DOT_PRODUCT(basis_grads(:,jc),vel)*int_factor &
+          + basis_vals(jr)*dt_fac*basis_vals(jc)*div_vel*int_factor &
           + dt_fac*eta(1)*DOT_PRODUCT(basis_grads(:,jr),basis_grads(:,jc))*int_factor
+        END IF
+        !-- Resistivity sensitivity: eta = eta(T(psi)) makes the psi(6) and By(7)
+        !   residuals depend on psi through eta, i.e. d(res)/d(psi_col) gets a term
+        !   d(res)/d(eta) * d(eta)/dT * dT/dpsi * basis_vals(jc).  This goes into the
+        !   (6,6) and (7,6) blocks and is otherwise missing from the approx. Jacobian.
+        IF ((.NOT.incomp) .AND. self%use_spitzer .AND. ASSOCIATED(self%T_func))THEN
+          tmp1 = cross_product(B_0, vel)   ! B_0 x vel, appears in the psi eta-term
+          IF(cyl_flag)THEN
+            r_geo = coords(1) + gs_epsilon
+            ! d(res6)/d(eta2) = -(eta2-dependent part of res6 at row jr)/eta2
+            d6_eta = -( basis_vals(jr)*psi &
+                        + dt_fac*basis_vals(jr)*(DOT_PRODUCT(vel,dpsi) + tmp1(2)) ) &
+                     *int_factor/(eta(2)**2 * r_geo)
+            ! d(res7)/d(eta1) = (eta1-dependent part of res7 at row jr)/eta1
+            d7_eta = dt_fac*DOT_PRODUCT(basis_grads(:,jr), dby)*int_factor/r_geo
+          ELSE
+            d6_eta = -( basis_vals(jr)*psi &
+                        + dt_fac*basis_vals(jr)*(DOT_PRODUCT(vel,dpsi) + tmp1(2)) ) &
+                     *int_factor/(eta(2)**2)
+            d7_eta = dt_fac*DOT_PRODUCT(basis_grads(:,jr), dby)*int_factor
+          END IF
+          ! jac_loc(6, 6)%m(jr,jc) = jac_loc(6, 6)%m(jr,jc) &
+          !   + d6_eta*deta_dT(2)*dT_dpsi*basis_vals(jc)
+          ! jac_loc(7, 6)%m(jr,jc) = jac_loc(7, 6)%m(jr,jc) &
+          !   + d7_eta*deta_dT(1)*dT_dpsi*basis_vals(jc)
         END IF
       END DO
     END DO

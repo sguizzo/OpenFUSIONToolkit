@@ -10,14 +10,14 @@ USE oft_la_base, ONLY: oft_vector, oft_matrix, oft_graph, oft_graph_ptr, map_lis
 USE oft_deriv_matrices, ONLY: oft_noop_matrix, oft_mf_matrix
 USE oft_solver_base, ONLY: oft_solver
 USE oft_native_solvers, ONLY: oft_nksolver, oft_native_gmres_solver
-USE oft_solver_utils, ONLY: create_cg_solver, create_diag_pre
+USE oft_solver_utils, ONLY: create_cg_solver, create_diag_pre, create_bjacobi_pre, create_native_pre
 USE oft_lu, ONLY: oft_lusolver
 USE oft_la_utils, ONLY: create_matrix, graph_add_dense_blocks, create_vector, create_dense_graph
 USE oft_native_la, ONLY: oft_native_matrix
 !
 USE fem_composite, ONLY: oft_fem_comp_type, fem_graph_create
 USE fem_utils, ONLY: fem_dirichlet_diag, fem_dirichlet_vec
-USE oft_lag_basis, ONLY: oft_scalar_bfem, oft_blag_eval, oft_blag_geval
+USE oft_lag_basis, ONLY: oft_scalar_bfem, oft_blag_eval, oft_blag_geval, oft_blag_npos
 USE oft_blag_operators, ONLY: oft_blag_vproject, oft_blag_getmop, oft_lag_bginterp
 USE mhd_utils, ONLY: mu0
 USE oft_gs, ONLY: gs_epsilon, gs_equil, gs_factory, gs_update_bounds, gs_test_bounds, flux_func, build_dels
@@ -48,10 +48,10 @@ TYPE(oft_xmhd_2d_sim), POINTER :: mug => NULL() !< MUG time-dependent simulation
 TYPE(oft_mf_matrix), POINTER :: mfmat => NULL() !< Matrix free Jacobian operator
 TYPE(oft_mugtok_td_mfop), POINTER :: nlfun => NULL() ! !< Time-advance operator 
 TYPE(oft_native_gmres_solver), POINTER :: mf_solver => NULL() !< Outer linear solver
-TYPE(oft_lusolver), POINTER :: pre => NULL() !< Preconditioner using approximate jacobian
+CLASS(oft_solver), POINTER :: pre => NULL() !< Preconditioner for the approximate Jacobian (complete LU, or per-field block-Jacobi/LU in MHD-plasma mode)
 TYPE(oft_nksolver) :: nksolver !< Newton-Krylov solver for time-advance
 TYPE(oft_fem_comp_type), POINTER :: fe_rep => NULL() !< Finite element representation for solution fields (without coil currents)
-LOGICAL :: pm = .FALSE.
+LOGICAL :: pm = .TRUE.
 LOGICAL :: save_rst = .FALSE. !< If true, write restart files ('mugtok_NNNNN.rst') for plotting
 INTEGER(i4) :: rst_freq = 1 !< Restart-file output frequency (in steps)
 INTEGER(i4) :: rst_count = 0 !< Completed-step counter (used as the restart-file index)
@@ -59,10 +59,14 @@ LOGICAL, ALLOCATABLE, DIMENSION(:) :: plasma_flag !< True for DOFs in or on the 
 INTEGER(i4) :: F0_node = 0 !< Index of the first plasma_flag=.TRUE. DOF, used to evolve F0 (0 if none)
 REAL(r8) :: f_scale_prev = 1.d0 !< FF' scale (tkmr%f_scale) from previous timestep
 CLASS(flux_func), POINTER :: I_prev => NULL() !< FF' profile (gs_equil%I) from previous timestep
+LOGICAL :: mhd_plasma = .FALSE. !< True when the plasma (region 1) is evolved with MHD (set by setup_mhd)
+LOGICAL :: use_full_lu = .FALSE. !< In MHD-plasma mode, use a complete LU of the coupled Jacobian instead of per-field block-Jacobi (better linear convergence in the stiff near-ideal regime, but much higher memory). Set before calling setup_mhd.
 
 contains
-    !> Setup time-dependent simulation
+    !> Setup time-dependent simulation (Grad-Shafranov plasma + MHD conductors)
     procedure :: setup => setup_mugtok_td
+    !> Setup time-dependent simulation with the plasma (region 1) evolved as a compressible MHD region
+    procedure :: setup_mhd => setup_mugtok_mhd_td
     !> Delete time-dependent simulation
     procedure :: delete => delete_mugtok_td
     !> Take a timestep
@@ -343,12 +347,40 @@ CALL self%u%restore_local(tmp_arr,6)
 
 CALL build_psi_vac(self, self%tkmr%gs_equil%coil_currs)
 
+!---Free the scratch total-flux vector used to build the initial condition
+CALL tmp_vec%delete
+DEALLOCATE(tmp_vec)
+
 !------------------------------------------------------------------------------
-! Setup nonlinear function object
+! Build the nonlinear function, approximate Jacobian, preconditioner and solvers
 !------------------------------------------------------------------------------
+CALL mugtok_finalize_setup(self, dt, lin_tol, nl_tol)
+end subroutine setup_mugtok_td
+
+!---------------------------------------------------------------------------
+!> Build the nonlinear function object, approximate-Jacobian structure,
+!! preconditioner and solvers. Shared by both setup entry points; the F0
+!! dense-coupling block is included only when F0_node>0 (Grad-Shafranov plasma).
+!---------------------------------------------------------------------------
+subroutine mugtok_finalize_setup(self, dt, lin_tol, nl_tol)
+class(oft_mugtok_td), intent(inout), target :: self !< Simulation object
+real(r8), intent(in) :: dt !< Timestep [s]
+real(r8), intent(in) :: lin_tol !< Linear solver tolerance
+real(r8), intent(in) :: nl_tol !< Nonlinear solver tolerance
+TYPE(oft_graph_ptr), ALLOCATABLE :: graphs(:,:), fe_graphs(:,:), known_graphs(:)
+INTEGER(i4) :: nkgraphs, i, j
+TYPE(oft_graph), TARGET :: dense_graph, dense_graph7
+type(oft_1d_int), pointer, dimension(:) :: bc_nodes, f0_nodes
+integer(i4), allocatable :: dense_flag(:)
+class(oft_vector), pointer :: tmp_vec
+
 ALLOCATE(self%nlfun)
 self%nlfun%dt=dt
 self%nlfun%parent_sim => self
+
+!---Scratch vector in the TokaMaker (device) space, used as a template for the
+!   coil dense-coupling graphs
+CALL self%tkmr%gs_device%fe_rep%vec_create(tmp_vec)
 
 !------------------------------------------------------------------------------
 ! Setup structure of approximate Jacobian matrix used for preconditioning
@@ -367,10 +399,10 @@ DO i = 1, self%fe_rep%nfields
     DO j = 1, self%fe_rep%nfields
         ALLOCATE(graphs(i,j)%g)
         graphs(i,j)%g%nnz=fe_graphs(i,j)%g%nnz
-        graphs(i,j)%g%nr=fe_graphs(i,j)%g%nr           ! <-- ADD THIS
-        graphs(i,j)%g%nrg=fe_graphs(i,j)%g%nrg         ! <-- ADD THIS
-        graphs(i,j)%g%nc=fe_graphs(i,j)%g%nc           ! <-- ADD THIS
-        graphs(i,j)%g%ncg=fe_graphs(i,j)%g%ncg         ! <-- ADD THIS
+        graphs(i,j)%g%nr=fe_graphs(i,j)%g%nr
+        graphs(i,j)%g%nrg=fe_graphs(i,j)%g%nrg
+        graphs(i,j)%g%nc=fe_graphs(i,j)%g%nc
+        graphs(i,j)%g%ncg=fe_graphs(i,j)%g%ncg
         graphs(i,j)%g%kr=>fe_graphs(i,j)%g%kr
         graphs(i,j)%g%lc=>fe_graphs(i,j)%g%lc
     END DO
@@ -390,7 +422,7 @@ graphs(6,6)%g%kr=>dense_graph%kr
 graphs(6,6)%g%lc=>dense_graph%lc
 DEALLOCATE(dense_flag, bc_nodes)
 
-!---Add F0 coupling to the F(7,7) block: every plasma DOF is coupled to the F0 node 
+!---Add F0 coupling to the F(7,7) block: every plasma DOF is coupled to the F0 node
 IF(self%F0_node > 0)THEN
   ALLOCATE(f0_nodes(1))
   f0_nodes(1)%n = 1
@@ -412,7 +444,7 @@ IF(self%tkmr%gs_device%ncoils > 0)THEN
     CALL create_dense_graph(graphs(8,6)%g,self%tkmr%gs_device%coil_vec,tmp_vec)
     CALL create_dense_graph(graphs(6,8)%g,tmp_vec,self%tkmr%gs_device%coil_vec)
     CALL create_dense_graph(graphs(8,8)%g,self%tkmr%gs_device%coil_vec,self%tkmr%gs_device%coil_vec)
-END IF 
+END IF
 
 !Create jacobian matrix
 CALL create_matrix(self%nlfun%jac_op,graphs,self%aug_vec,self%aug_vec)
@@ -425,17 +457,27 @@ CALL tmp_vec%delete
 DEALLOCATE(tmp_vec)
 DEALLOCATE(fe_graphs)
 
-
-! Preconditioner should use approximate jacobian
-ALLOCATE(self%pre)
-self%pre%A=>self%nlfun%jac_op 
+!------------------------------------------------------------------------------
+! Preconditioner for the approximate Jacobian (cf. xmhd_2d):
+!  - MHD-plasma mode (default): per-field block-Jacobi with an LU factorization
+!    of each field block. The monolithic LU of the coupled compressible system is
+!    memory-hungry (dense free-boundary/coil blocks). Set use_full_lu=.TRUE. to
+!    force a complete LU instead -- needed when the block preconditioner's linear
+!    convergence is too poor in the stiff, near-ideal (low physical eta) regime.
+!  - incompressible / Grad-Shafranov plasma: always a complete LU.
+!------------------------------------------------------------------------------
+IF(self%mhd_plasma .AND. .NOT.self%use_full_lu)THEN
+    CALL create_bjacobi_pre(self%pre, -1) ! one LU block per field block
+ELSE
+    CALL create_native_pre(self%pre, "lu")
+END IF
+self%pre%A=>self%nlfun%jac_op
 
 !------------------------------------------------------------------------------
 ! Setup matrix free solver
 !------------------------------------------------------------------------------
-ALLOCATE(self%mfmat) 
+ALLOCATE(self%mfmat)
 CALL self%mfmat%setup(self%tmp,self%nlfun)
-
 
 ALLOCATE(self%mf_solver)
 self%mfmat%b0=1.d-4
@@ -464,7 +506,334 @@ CALL snapshot_f_profile(self)
 
 !---Write an initial restart file capturing the initial state
 IF(self%save_rst) CALL mugtok_rst_save(self, 0.d0)
-end subroutine setup_mugtok_td
+end subroutine mugtok_finalize_setup
+
+!---------------------------------------------------------------------------
+!> Setup a combined simulation in which the plasma (region 1) is evolved as a
+!! compressible MHD region rather than by Grad-Shafranov. Density is a flat,
+!! pinned field (1e19 m^-3) and temperature is supplied as a closure T(psi)
+!! evaluated pointwise inside MUG (see mugtok_T_of_psi / xmhd_2d T_func), so
+!! neither density nor temperature is evolved. The poloidal flux (psi) and
+!! toroidal field function (F=R*B_phi) evolve with full MHD; F is initialized
+!! from the equilibrium profile.
+!---------------------------------------------------------------------------
+subroutine setup_mugtok_mhd_td(self, equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg, toroidal_flow, mass_scale, use_spitzer)
+CLASS(oft_mugtok_td), INTENT(inout), TARGET :: self !< Simulation object to be setup
+TYPE(gs_equil), INTENT(inout), TARGET :: equil !< Tokamaker equilibrium object
+REAL(8), INTENT(in) :: dt !< Desired timestep [s]
+REAL(8), INTENT(in) :: lin_tol !< Linear solver tolerance
+REAL(8), INTENT(in) :: nl_tol !< Non-linear solver tolerance
+LOGICAL, INTENT(in) :: mhd_flag(:) !< True for regions where MHD should be used (must include region 1)
+REAL(8), INTENT(in) :: dens_reg(:) !< Ion mass [kg] in each region (used as m_i for the compressible model)
+REAL(8), INTENT(in) :: visc_reg(:) !< Viscosity [m^2/s] in each region
+REAL(8), INTENT(in), optional :: eta_reg(:,:) !< Electrical resistivity [in plane, out of plane], in units of mu0. Defaults to TokaMaker region resistivities
+LOGICAL, INTENT(in), optional :: toroidal_flow !< Allow toroidal (phi) flow in MHD regions
+REAL(8), INTENT(in), optional :: mass_scale !< Factor by which the plasma (region 1) ion mass is inflated for numerical acceleration (default 100)
+LOGICAL, INTENT(in), optional :: use_spitzer !< Use Spitzer resistivity eta(n,T) in the MHD regions (default .TRUE.)
+CLASS(multigrid_mesh), POINTER :: mg_mesh
+LOGICAL :: tor_flow, spitzer
+REAL(r8) :: mscale
+INTEGER(i4) :: i,j
+TYPE(oft_xmhd_2d_sim), POINTER :: mhd_sim
+REAL(r8), POINTER, DIMENSION(:) :: tmp_arr, vals_out
+INTEGER(i4), POINTER, DIMENSION(:) :: cell_dofs
+type(seam_list), pointer, dimension(:) :: stitch_tmp
+type(map_list), pointer, dimension(:) :: map_tmp
+CLASS(oft_vector), pointer :: tmp_vec
+
+IF(.NOT.mhd_flag(1)) CALL oft_abort('setup_mhd requires mhd_flag(1)=.TRUE. (plasma region evolved with MHD)', &
+                                    'setup_mugtok_mhd_td', __FILE__)
+self%mhd_plasma = .TRUE.
+current_sim => self
+
+!--Take mesh and single field FE reps from TokaMaker equilibrium
+mesh => equil%device%mesh
+lag_rep => equil%device%fe_rep
+mg_mesh => equil%device%ML_fe_rep%ml_mesh
+
+!------------------------------------------------------------------------------
+! Set up TokaMaker time-dependent object (region 1 ignored via ignore_rmask)
+!------------------------------------------------------------------------------
+ALLOCATE(self%tkmr)
+IF(.NOT.ASSOCIATED(equil%device%dels_full)) &
+    CALL build_dels(equil%device%dels_full, equil%device, "none")
+equil%device%ignore_rmask = mhd_flag !ignore regions where MHD will be used
+self%tkmr%dt=dt
+CALL self%tkmr%setup(equil)
+CALL build_vac_op(self%tkmr,self%tkmr%vac_op)
+
+IF(self%tkmr%gs_device%ncoils > 0)THEN
+    DO i=1,self%tkmr%gs_device%ncoils
+        IF(self%tkmr%gs_device%Rcoils(i) > 0.d0) &
+            CALL oft_abort("V coils (Rcoils>0) are not supported; all coils must be prescribed I coils", &
+                           "setup_mugtok_mhd_td", __FILE__)
+    END DO
+END IF
+
+!------------------------------------------------------------------------------
+! Set up MUG time-dependent object (compressible)
+!------------------------------------------------------------------------------
+ALLOCATE(mhd_sim)
+ALLOCATE(mhd_sim%ignore_rmask(mesh%nreg))
+mhd_sim%ignore_rmask = .NOT. mhd_flag !ignore regions where MHD will not be used
+ALLOCATE(mhd_sim%eta(mesh%nreg, 2))
+ALLOCATE(mhd_sim%m_i(mesh%nreg))
+ALLOCATE(mhd_sim%nu(mesh%nreg))
+ALLOCATE(mhd_sim%gamma(mesh%nreg))
+ALLOCATE(mhd_sim%chi(mesh%nreg))
+ALLOCATE(mhd_sim%D_diff(mesh%nreg))
+mhd_sim%m_i = dens_reg
+!---Inflate the plasma (region 1) ion mass to slow the fast MHD waves (larger dt)
+mscale = 400.d0
+IF (PRESENT(mass_scale)) mscale = mass_scale
+mhd_sim%m_i(1) = mhd_sim%m_i(1)*mscale
+mhd_sim%nu = visc_reg
+mhd_sim%gamma = 5.d0/3.d0
+mhd_sim%chi = 0.d0    !unused: temperature is prescribed via the T(psi) closure
+mhd_sim%D_diff = 0.d0 !unused: density is a flat, pinned field
+IF(PRESENT(eta_reg)) THEN
+   mhd_sim%eta = eta_reg
+ELSE
+  mhd_sim%eta(:,1) = self%tkmr%eta_reg
+  mhd_sim%eta(:,2) = self%tkmr%eta_reg
+END IF
+
+!---Spitzer resistivity eta(n,T) by default (uses the T(psi) closure temperature)
+spitzer = .TRUE.
+IF (PRESENT(use_spitzer)) spitzer = use_spitzer
+mhd_sim%use_spitzer = spitzer
+
+tor_flow = .FALSE.
+IF (PRESENT(toroidal_flow)) tor_flow = toroidal_flow
+mhd_sim%cyl_flag = .TRUE.
+mhd_sim%incomp = .FALSE. !compressible model (so pressure = 2*k*n*T enters momentum)
+mhd_sim%dt = dt
+!Density field is kept flat at 1.0, so den_scale sets the physical number density
+mhd_sim%den_scale = 1.d20
+
+CALL mhd_sim%setup(mg_mesh, lag_rep%order, fe_rep_in=lag_rep)
+
+!---Temperature is a prescribed function of the local fields (T = T(psi)),
+!   evaluated pointwise in MUG instead of reconstructed from field-5 DOFs
+mhd_sim%T_func => mugtok_T_of_psi
+
+!------------------------------------------------------------------------------
+! Boundary conditions: n and T are prescribed (pinned); psi and F evolve;
+! velocity evolves in the MHD regions and is pinned to zero elsewhere
+!------------------------------------------------------------------------------
+IF (ASSOCIATED(mhd_sim%n_bc)) NULLIFY(mhd_sim%n_bc)
+IF (ASSOCIATED(mhd_sim%velx_bc)) NULLIFY(mhd_sim%velx_bc)
+IF (ASSOCIATED(mhd_sim%vely_bc)) NULLIFY(mhd_sim%vely_bc)
+IF (ASSOCIATED(mhd_sim%velz_bc)) NULLIFY(mhd_sim%velz_bc)
+IF (ASSOCIATED(mhd_sim%T_bc)) NULLIFY(mhd_sim%T_bc)
+IF (ASSOCIATED(mhd_sim%psi_bc)) NULLIFY(mhd_sim%psi_bc)
+IF (ASSOCIATED(mhd_sim%by_bc)) NULLIFY (mhd_sim%by_bc)
+
+ALLOCATE(mhd_sim%n_bc(mhd_sim%fe_rep%fields(1)%fe%ne))
+ALLOCATE(mhd_sim%velx_bc(mhd_sim%fe_rep%fields(2)%fe%ne))
+ALLOCATE(mhd_sim%vely_bc(mhd_sim%fe_rep%fields(3)%fe%ne))
+ALLOCATE(mhd_sim%velz_bc(mhd_sim%fe_rep%fields(4)%fe%ne))
+ALLOCATE(mhd_sim%T_bc(mhd_sim%fe_rep%fields(5)%fe%ne))
+ALLOCATE(mhd_sim%psi_bc(mhd_sim%fe_rep%fields(6)%fe%ne))
+ALLOCATE(mhd_sim%by_bc(mhd_sim%fe_rep%fields(7)%fe%ne))
+
+mhd_sim%psi_bc = .FALSE.
+mhd_sim%by_bc = .TRUE.
+mhd_sim%n_bc = .TRUE. !density prescribed (flat), not evolved
+mhd_sim%T_bc = .TRUE. !temperature prescribed via T(psi) closure, not evolved
+mhd_sim%velx_bc = .FALSE.
+mhd_sim%velz_bc = .FALSE.
+IF (tor_flow) THEN
+  mhd_sim%vely_bc = .FALSE.
+ELSE
+  mhd_sim%vely_bc = .TRUE.
+END IF
+!Pin velocity to zero outside the MHD regions
+ALLOCATE(cell_dofs(lag_rep%nce))
+DO i=1,mesh%nc
+  IF(.NOT.mhd_flag(mesh%reg(i)))THEN
+    CALL lag_rep%ncdofs(i,cell_dofs)
+    DO j=1,SIZE(cell_dofs)
+      mhd_sim%velx_bc(cell_dofs(j)) = .TRUE.
+      mhd_sim%vely_bc(cell_dofs(j)) = .TRUE.
+      mhd_sim%velz_bc(cell_dofs(j)) = .TRUE.
+    END DO
+  END IF
+END DO
+DEALLOCATE(cell_dofs)
+
+self%mug => mhd_sim
+
+!------------------------------------------------------------------------------------
+! Create solver fields, augmented with coil currents for compatibility with TokaMaker
+!------------------------------------------------------------------------------------
+self%fe_rep => self%mug%fe_rep
+IF (self%tkmr%gs_device%ncoils > 0) THEN
+    ALLOCATE(stitch_tmp(8),map_tmp(8))
+    DO i=1,7
+        stitch_tmp(i)%s=>self%fe_rep%fields(i)%fe%linkage
+        map_tmp(i)%m=>self%fe_rep%fields(i)%fe%map
+    END DO
+    stitch_tmp(8)%s=>self%tkmr%gs_device%coil_stitch
+    map_tmp(8)%m=>self%tkmr%gs_device%coil_map
+    CALL create_vector(self%aug_vec,stitch_tmp,map_tmp)
+    DEALLOCATE(stitch_tmp,map_tmp)
+    CALL self%aug_vec%new(self%u)
+    CALL self%aug_vec%new(self%rhs)
+    CALL self%aug_vec%new(self%tmp)
+ELSE
+    CALL self%fe_rep%vec_create(self%u)
+    CALL self%fe_rep%vec_create(self%rhs)
+    CALL self%fe_rep%vec_create(self%tmp)
+END IF
+
+!------------------------------------------------------------------------------
+! Set initial field values
+!------------------------------------------------------------------------------
+CALL self%u%set(1.d0, 1) !flat density (physical n = den_scale = 1e19)
+CALL self%u%set(0.d0, 2)
+CALL self%u%set(0.d0, 3)
+CALL self%u%set(0.d0, 4)
+CALL self%u%set(0.d0, 5)
+CALL self%u%set(self%tkmr%gs_equil%I%f_offset, 7) !F0 outside the plasma; overwritten inside below
+
+!Initialize field 6 (plasma poloidal flux) and field 8 (coil currents) from the
+!TokaMaker equilibrium, and populate MUG's vacuum flux (mug%psi_vac) from the coils.
+NULLIFY(tmp_arr, vals_out)
+CALL self%tkmr%gs_device%fe_rep%vec_create(tmp_vec)
+CALL tmp_vec%add(0.d0,1.d0,self%tkmr%gs_equil%psi) ! tmp_vec = total poloidal flux
+IF (self%tkmr%gs_device%ncoils > 0) THEN
+    CALL self%u%get_local(vals_out,8)
+    DO i=1,self%tkmr%gs_device%ncoils
+        CALL tmp_vec%add(1.d0,-self%tkmr%gs_equil%coil_currs(i),self%tkmr%gs_device%psi_coil(i)%f)
+        vals_out(i)=self%tkmr%gs_equil%coil_currs(i)
+    END DO
+    CALL self%u%restore_local(vals_out,8)
+    DEALLOCATE(vals_out)
+END IF
+CALL tmp_vec%get_local(tmp_arr)
+CALL self%u%restore_local(tmp_arr,6)
+DEALLOCATE(tmp_arr)
+CALL tmp_vec%delete
+DEALLOCATE(tmp_vec)
+
+CALL build_psi_vac(self, self%tkmr%gs_equil%coil_currs)
+
+!---Update plasma bounds from the total flux, then seed F (and T for diagnostics)
+!   from the equilibrium profiles inside the plasma
+CALL mugtok_refresh_bounds(self, self%u)
+CALL mugtok_seed_fields(self)
+
+!------------------------------------------------------------------------------
+! Build the nonlinear function, approximate Jacobian, preconditioner and solvers
+!------------------------------------------------------------------------------
+CALL mugtok_finalize_setup(self, dt, lin_tol, nl_tol)
+end subroutine setup_mugtok_mhd_td
+
+!---------------------------------------------------------------------------
+!> Temperature closure T(psi) for the MHD-plasma model. Returns T and its
+!! spatial gradient so that the momentum pressure force (2*k*n*T) reproduces
+!! the equilibrium pressure P(psi)=p_scale*P(psi) inside the plasma, and zero
+!! outside the LCFS. Matches the xmhd_2d_temp_func interface (uses the module
+!! current_sim pointer to reach the equilibrium).
+!---------------------------------------------------------------------------
+subroutine mugtok_T_of_psi(coords, n, dn, psi, dpsi, by, dby, T, dT, dT_dpsi)
+real(r8), intent(in) :: coords(3), n, dn(3), psi, dpsi(3), by, dby(3)
+real(r8), intent(out) :: T, dT(3)
+real(r8), intent(out), optional :: dT_dpsi !< Partial derivative dT/dpsi at fixed n (for the resistivity Jacobian)
+type(gs_equil), pointer :: eq
+real(r8) :: k_b, p_scale_i, denom, p_eq, dpdpsi
+eq => current_sim%tkmr%gs_equil
+k_b = current_sim%mug%k_boltz
+p_scale_i = eq%p_scale
+denom = 2.d0*k_b*n
+IF(gs_test_bounds(eq, coords(1:2)) .AND. (psi > eq%plasma_bounds(1)))THEN
+  p_eq = p_scale_i*eq%P%f(psi)/mu0
+  dpdpsi = p_scale_i*eq%P%fp(psi)/mu0
+  T = p_eq/denom
+  !dT = d/dx [ P(psi)/(2 k n) ] via the chain rule (n may vary in space)
+  dT = (dpdpsi*dpsi)/denom - p_eq*dn/(2.d0*k_b*n**2)
+  !dT/dpsi at fixed n (n is prescribed, not a function of psi)
+  IF(PRESENT(dT_dpsi)) dT_dpsi = dpdpsi/denom
+ELSE
+  T = 0.d0
+  dT = 0.d0
+  IF(PRESENT(dT_dpsi)) dT_dpsi = 0.d0
+END IF
+
+end subroutine mugtok_T_of_psi
+
+!---------------------------------------------------------------------------
+!> Update the equilibrium plasma bounds (and the P/I flux-function bounds)
+!! from the current total poloidal flux (field 6 + vacuum). Used so the T(psi)
+!! closure and the F/T seeding normalize psi consistently.
+!---------------------------------------------------------------------------
+subroutine mugtok_refresh_bounds(self, vec)
+class(oft_mugtok_td), intent(inout) :: self !< Simulation object
+class(oft_vector), intent(inout) :: vec !< Field vector whose psi (field 6) sets the bounds
+type(gs_equil), pointer :: eq
+real(r8), pointer, dimension(:) :: psi6, pvac, eqpsi
+eq => self%tkmr%gs_equil
+NULLIFY(psi6, pvac, eqpsi)
+CALL vec%get_local(psi6, 6)
+CALL self%mug%psi_vac%get_local(pvac)
+CALL eq%psi%get_local(eqpsi)
+eqpsi = psi6 + pvac ! total poloidal flux
+CALL eq%psi%restore_local(eqpsi)
+CALL gs_update_bounds(eq, track_opoint=.TRUE.)
+eq%P%plasma_bounds = eq%plasma_bounds
+eq%I%plasma_bounds = eq%plasma_bounds
+DEALLOCATE(psi6, pvac, eqpsi)
+end subroutine mugtok_refresh_bounds
+
+!---------------------------------------------------------------------------
+!> Seed the toroidal field function F (field 7) and, for diagnostics, the
+!! temperature (field 5) on the plasma-region DOFs from the equilibrium
+!! profiles. Assumes mugtok_refresh_bounds has set eq%psi to the total flux.
+!---------------------------------------------------------------------------
+subroutine mugtok_seed_fields(self)
+class(oft_mugtok_td), intent(inout) :: self !< Simulation object
+type(gs_equil), pointer :: eq
+real(r8), pointer, dimension(:) :: f_vals, t_vals, eqpsi
+integer(i4), allocatable :: cell_dofs_l(:)
+real(r8) :: f_pos(3), coord(3), psi_dof, F0_val, f_scale_i, p_scale_i, k_b, n_phys, p_eq
+logical :: in_plasma
+integer(i4) :: ic, jd, gd
+eq => self%tkmr%gs_equil
+F0_val = eq%I%f_offset
+f_scale_i = self%tkmr%f_scale
+p_scale_i = eq%p_scale
+k_b = self%mug%k_boltz
+n_phys = self%mug%den_scale ! density field is flat at 1.0
+NULLIFY(f_vals, t_vals, eqpsi)
+CALL self%u%get_local(f_vals, 7)
+CALL self%u%get_local(t_vals, 5)
+CALL eq%psi%get_local(eqpsi) ! total poloidal flux (set by mugtok_refresh_bounds)
+ALLOCATE(cell_dofs_l(lag_rep%nce))
+DO ic=1,mesh%nc
+  IF(mesh%reg(ic) /= 1) CYCLE ! plasma region only
+  CALL lag_rep%ncdofs(ic, cell_dofs_l)
+  DO jd=1,lag_rep%nce
+    gd = cell_dofs_l(jd)
+    CALL oft_blag_npos(lag_rep, ic, jd, f_pos)   ! DOF logical position
+    coord = mesh%log2phys(ic, f_pos)             ! -> physical (R,Z)
+    psi_dof = eqpsi(gd)
+    in_plasma = gs_test_bounds(eq, coord(1:2)) .AND. (psi_dof > eq%plasma_bounds(1))
+    IF(in_plasma)THEN
+      f_vals(gd) = SQRT(f_scale_i*eq%I%f(psi_dof) + F0_val**2)
+      p_eq = p_scale_i*eq%P%f(psi_dof)/mu0
+    ELSE
+      f_vals(gd) = F0_val
+      p_eq = 0.d0
+    END IF
+    t_vals(gd) = MAX(p_eq, 0.d0)/(2.d0*k_b*n_phys)
+  END DO
+END DO
+DEALLOCATE(cell_dofs_l)
+CALL self%u%restore_local(f_vals, 7)
+CALL self%u%restore_local(t_vals, 5)
+DEALLOCATE(f_vals, t_vals, eqpsi)
+end subroutine mugtok_seed_fields
 
 
 !-----------------------------------------------------------------
@@ -493,7 +862,7 @@ IF(dt/=self%nlfun%dt)THEN
     self%mug%dt = dt
     CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
 ELSE
-    CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .FALSE.)
+    CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
 END IF
 
 !Update preconditioner
@@ -591,6 +960,10 @@ IF(self%parent_sim%tkmr%gs_device%ncoils > 0)THEN
   CALL a%restore_local(coil_arr, 8)
   DEALLOCATE(coil_arr)
 END IF
+
+!---MHD-plasma model: refresh plasma bounds from this iterate's flux so the
+!   T(psi) closure normalizes psi consistently (psi changes every iteration)
+IF(self%parent_sim%mhd_plasma) CALL mugtok_refresh_bounds(self%parent_sim, a)
 
 !---Apply MUG RHS operator
 CALL b%set(0.d0)
@@ -706,6 +1079,10 @@ IF(self%parent_sim%tkmr%gs_device%ncoils > 0)THEN
   CALL a%restore_local(coil_arr, 8)
   DEALLOCATE(coil_arr)
 END IF
+
+!---MHD-plasma model: refresh plasma bounds from this iterate's flux so the
+!   T(psi) closure normalizes psi consistently (psi changes every iteration)
+IF(self%parent_sim%mhd_plasma) CALL mugtok_refresh_bounds(self%parent_sim, a)
 
 CALL b%set(0.d0)
 CALL self%parent_sim%mug%nlfun%apply_real(a,b) !Apply MUG LHS
@@ -1424,7 +1801,7 @@ DO
   !---Total psi (psi_solved + psi_vac)
   NULLIFY(plot_vals)
   CALL u%get_local(plot_vals,6)
-  plot_vals = plot_vals + pvac
+  plot_vals = plot_vals !+ pvac
   CALL mesh%save_vertex_scalar(plot_vals,xdmf_plot,'psi')
   !--- B from grad(psi + psi_vac) and F
   CALL grad_psi%u%restore_local(plot_vals)
@@ -1456,28 +1833,28 @@ NULLIFY(pvac)
 !---------------------------------------------------------------------------
 ! Pass 2: incompressible pressure (order-1)
 !---------------------------------------------------------------------------
-IF(self%mug%incomp)THEN
-  CALL xdmf_plot_p%setup("mugtok_td_p","pressure/")
-  CALL mesh%setup_io(xdmf_plot_p,lag_rep%order-1)
-  rst_cur=rst_start
-  nplotted=0
-  DO
-    IF(rst_cur > rst_end) EXIT
-    WRITE(rst_char,110)rst_cur
-    file_tmp='mugtok_'//rst_char//'.rst'
-    rst_exist=oft_file_exist(TRIM(file_tmp))
-    CALL oft_mpi_barrier(ierr)
-    IF(.NOT.rst_exist) EXIT
-    CALL hdf5_read(t,TRIM(file_tmp),'t')
-    CALL self%mug%rst_load(u,TRIM(file_tmp),'U')
-    CALL xdmf_plot_p%add_timestep(t)
-    NULLIFY(plot_vals)
-    CALL u%get_local(plot_vals,5)
-    CALL mesh%save_vertex_scalar(plot_vals,xdmf_plot_p,'p')
-    nplotted=nplotted+1
-    rst_cur=rst_cur+self%rst_freq
-  END DO
-END IF
+! IF(self%mug%incomp)THEN
+!   CALL xdmf_plot_p%setup("mugtok_td_p","pressure/")
+!   CALL mesh%setup_io(xdmf_plot_p,lag_rep%order-1)
+!   rst_cur=rst_start
+!   nplotted=0
+!   DO
+!     IF(rst_cur > rst_end) EXIT
+!     WRITE(rst_char,110)rst_cur
+!     file_tmp='mugtok_'//rst_char//'.rst'
+!     rst_exist=oft_file_exist(TRIM(file_tmp))
+!     CALL oft_mpi_barrier(ierr)
+!     IF(.NOT.rst_exist) EXIT
+!     CALL hdf5_read(t,TRIM(file_tmp),'t')
+!     CALL self%mug%rst_load(u,TRIM(file_tmp),'U')
+!     CALL xdmf_plot_p%add_timestep(t)
+!     NULLIFY(plot_vals)
+!     CALL u%get_local(plot_vals,5)
+!     CALL mesh%save_vertex_scalar(plot_vals,xdmf_plot_p,'p')
+!     nplotted=nplotted+1
+!     rst_cur=rst_cur+self%rst_freq
+!   END DO
+! END IF
 !---Cleanup
 CALL u%delete
 CALL ux%delete
