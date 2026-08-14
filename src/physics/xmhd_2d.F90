@@ -935,6 +935,8 @@ DO i=1,mesh%nc
       diag_vals(3) = diag_vals(3) + n*int_factor*coords(1)
       diag_vals(4) = diag_vals(4) + T*int_factor*coords(1)
       diag_vals(5) = diag_vals(5) + int_factor*coords(1) !total volume
+      diag_vals(3) = diag_vals(3) +self%dt*2.d0*k_boltz*dT(3)*int_factor*coords(1)/m_i &
+          + self%dt*2.d0*k_boltz*T*dn(3)*int_factor*coords(1)/(m_i*n)
     ELSE
       diag_vals(1) = diag_vals(1) + DOT_PRODUCT(btmp,btmp)*int_factor
       diag_vals(2) = diag_vals(2) + 0.5d0*m_i*n*DOT_PRODUCT(vel,vel)*int_factor
@@ -1056,8 +1058,8 @@ DO i=1,mesh%nc
         res_loc(jr, 6) = res_loc(jr, 6) &
         + basis_vals(jr)*psi*int_factor/eta(2) &
         + basis_vals(jr)*self%dt*DOT_PRODUCT(vel, dpsi)*int_factor/eta(2) &
-        + basis_vals(jr)*self%dt*tmp1(2)*int_factor/eta(2) !&
-        !+ self%dt*DOT_PRODUCT(basis_grads(:,jr), dpsi_0)*int_factor
+        + basis_vals(jr)*self%dt*tmp1(2)*int_factor/eta(2) &
+        + self%dt*DOT_PRODUCT(basis_grads(:,jr), dpsi_0)*int_factor
       END IF
       ! --By
       tmp1 = cross_product(dpsi,dvel(2, :))
@@ -1157,7 +1159,7 @@ real(r8), intent(in) :: T       !< Temperature [eV]
 real(r8), intent(out) :: eta(2) !< [in-plane, out-of-plane] resistivity in units of mu0
 real(r8), intent(out), optional :: deta_dT(2) !< d(eta)/dT [in-plane, out-of-plane], units of mu0 per eV
 real(r8), parameter :: Zi = 1.d0      ! ion charge number
-real(r8), parameter :: T_floor = 1000.d0 ! temperature floor [eV] to bound eta
+real(r8), parameter :: T_floor = 4.d0 ! temperature floor [eV] to bound eta
 real(r8) :: Tuse, n_cm3, lnLam, lnLam_raw, eta_par, eta_perp, dlnLam_dT, deta_par_dT
 Tuse = MAX(T, T_floor)
 n_cm3 = MAX(n, 1.d0)*1.d-6
@@ -1169,7 +1171,7 @@ eta_par = 5.2d-5*Zi*lnLam/Tuse**1.5d0
 eta_perp = 1.96d0*eta_par
 lnLam_raw = 24.d0 - LOG(SQRT(n_cm3)/T_floor)
 lnLam = MAX(lnLam_raw, 1.d0)
-! write(*,*) 'vac eta: ', 5.2d-5*Zi*lnLam/T_floor**1.5d0
+! write(*,*) 'vac eta: ', 5.2d-5*Zi*lnLam/T_floor**1.5d0/mu0
 ! write(*,*) eta_par
 !---Store as magnetic diffusivity (eta_physical/mu0), matching the eta convention
 eta(1) = eta_perp/mu0 ! in-plane (perpendicular)
@@ -1188,7 +1190,7 @@ IF(PRESENT(deta_dT))THEN
     deta_dT(1) = 1.96d0*deta_par_dT/mu0
   END IF
 END IF
-! eta = 1.d-3 ! NOTE: eta temporarily hardcoded to a constant; deta_dT above is the true Spitzer derivative
+!eta = 1.d-8 ! NOTE: eta temporarily hardcoded to a constant; deta_dT above is the true Spitzer derivative
 end subroutine spitzer_eta
 !---------------------------------------------------------------------------
 !> Compute the approximate Jacobian matrix for the nonlinear function being solved
@@ -1365,6 +1367,7 @@ DO i=1,mesh%nc
     IF ((.NOT.incomp) .AND. self%use_spitzer) THEN
       CALL spitzer_eta(n, T, eta, deta_dT=deta_dT)
     END IF
+    ! deta_dT = 0.d0
     div_vel = dvel(1,1) + dvel(3,3)
     btmp = cross_product(dpsi, [0.d0,1.d0,0.d0]) + by*[0.d0,1.d0,0.d0] + B_0
     IF(cyl_flag)THEN
@@ -1686,7 +1689,7 @@ DO i=1,mesh%nc
             + basis_vals(jr)*dt_fac*basis_vals(jc)*tmp3(2)*int_factor/eta(2)
           END DO
         END IF
-        ! --psi, psi
+        !--psi, psi
         IF(cyl_flag)THEN
           jac_loc(6, 6)%m(jr,jc) = jac_loc(6, 6)%m(jr,jc) &
           + basis_vals(jr)*basis_vals(jc)*int_factor/(eta(2)*(coords(1)+gs_epsilon))&
@@ -1766,10 +1769,10 @@ DO i=1,mesh%nc
                      *int_factor/(eta(2)**2)
             d7_eta = dt_fac*DOT_PRODUCT(basis_grads(:,jr), dby)*int_factor
           END IF
-          ! jac_loc(6, 6)%m(jr,jc) = jac_loc(6, 6)%m(jr,jc) &
-          !   + d6_eta*deta_dT(2)*dT_dpsi*basis_vals(jc)
-          ! jac_loc(7, 6)%m(jr,jc) = jac_loc(7, 6)%m(jr,jc) &
-          !   + d7_eta*deta_dT(1)*dT_dpsi*basis_vals(jc)
+          jac_loc(6, 6)%m(jr,jc) = jac_loc(6, 6)%m(jr,jc) &
+            + d6_eta*deta_dT(2)*dT_dpsi*basis_vals(jc)
+          jac_loc(7, 6)%m(jr,jc) = jac_loc(7, 6)%m(jr,jc) &
+            + d7_eta*deta_dT(1)*dT_dpsi*basis_vals(jc)
         END IF
       END DO
     END DO
@@ -2002,14 +2005,21 @@ class(oft_xmhd_2d_sim), intent(inout) :: self
 class(oft_vector), pointer, intent(inout) :: u !< Solution to save
 real(r8), intent(in) :: t !< Current solution time
 real(r8), intent(in) :: dt !< Current timestep
+real(r8), pointer :: psi_tmp(:), psi_vac_tmp(:)
 character(LEN=*), intent(in) :: filename !< Name of restart file
 character(LEN=*), intent(in) :: path !< Path to store solution vector in file
 DEBUG_STACK_PUSH
+NULLIFY(psi_tmp, psi_vac_tmp)
+CALL u%get_local(psi_tmp, 6)
+CALL self%psi_vac%get_local(psi_vac_tmp)
+psi_tmp = psi_tmp + psi_vac_tmp
+CALL u%restore_local(psi_tmp,6)
 CALL self%fe_rep%vec_save(u,filename,path)
 IF(oft_env%head_proc)THEN
   CALL hdf5_write(t,filename,'t')
   CALL hdf5_write(dt,filename,'dt')
 END IF
+NULLIFY(psi_tmp, psi_vac_tmp)
 DEBUG_STACK_POP
 end subroutine rst_save
 

@@ -483,7 +483,7 @@ ALLOCATE(self%mf_solver)
 self%mfmat%b0=1.d-4
 self%mf_solver%A=>self%mfmat
 self%mf_solver%its=1000
-self%mf_solver%nrits=20
+self%mf_solver%nrits=40
 self%mf_solver%atol=lin_tol
 self%mf_solver%itplot=1
 oft_env%pm = self%pm
@@ -638,7 +638,7 @@ ALLOCATE(mhd_sim%psi_bc(mhd_sim%fe_rep%fields(6)%fe%ne))
 ALLOCATE(mhd_sim%by_bc(mhd_sim%fe_rep%fields(7)%fe%ne))
 
 mhd_sim%psi_bc = .FALSE.
-mhd_sim%by_bc = .TRUE.
+mhd_sim%by_bc = .FALSE.
 mhd_sim%n_bc = .TRUE. !density prescribed (flat), not evolved
 mhd_sim%T_bc = .TRUE. !temperature prescribed via T(psi) closure, not evolved
 mhd_sim%velx_bc = .FALSE.
@@ -756,8 +756,10 @@ IF(gs_test_bounds(eq, coords(1:2)) .AND. (psi > eq%plasma_bounds(1)))THEN
   !dT/dpsi at fixed n (n is prescribed, not a function of psi)
   IF(PRESENT(dT_dpsi)) dT_dpsi = dpdpsi/denom
 ELSE
-  T = 0.d0
-  dT = 0.d0
+  p_eq = p_scale_i*eq%P%f(eq%plasma_bounds(1))/mu0
+  dpdpsi = p_scale_i*eq%P%fp(eq%plasma_bounds(1))/mu0
+  T = p_eq/denom
+  dT = (dpdpsi*dpsi)/denom - p_eq*dn/(2.d0*k_b*n**2)
   IF(PRESENT(dT_dpsi)) dT_dpsi = 0.d0
 END IF
 
@@ -860,8 +862,11 @@ IF(dt/=self%nlfun%dt)THEN
     dt=ABS(dt)
     self%nlfun%dt=dt
     self%mug%dt = dt
+    self%tkmr%dt=dt
+    CALL self%tkmr%update()
     CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
 ELSE
+    CALL self%tkmr%update()
     CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
 END IF
 
@@ -934,7 +939,10 @@ END IF
 
 !---Save the profile from this iteration to be used as the RHS in future timesteps
 CALL snapshot_f_profile(self)
-
+write(*,*) 'Diagnostic b: ', self%mug%nlfun%diag_vals(1)
+write(*,*) 'Diagnostic v: ', self%mug%nlfun%diag_vals(2)
+write(*,*) 'Diagnostic p force: ', self%mug%nlfun%diag_vals(3)
+write(*,*) 'Diagnostic T: ', self%mug%nlfun%diag_vals(4)
 end subroutine step_mugtok_td
 
 !------------------------------------------------------
@@ -1402,8 +1410,8 @@ real(r8), allocatable :: basis_vals(:), basis_grads(:,:), jac_loc(:,:)
 logical :: curved
 logical, allocatable :: plasma_no_F0(:)
 real(r8) :: nval(1,1), pval(1,1)
-IF(self%F0_node <= 0) RETURN
-F0 = self%F0_node
+!---Vacuum By diffusion Jacobian is assembled regardless of the F0 model;
+!   only the F0-specific constraint block below is gated on F0_node>0.
 dt = self%nlfun%dt
 quad => lag_rep%quad
 !------------------------------------------------------
@@ -1442,7 +1450,7 @@ DO i=1,mesh%nc
   END DO
   !$omp critical
   DO jr=1,lag_rep%nce
-    IF(self%plasma_flag(cell_dofs(jr))) CYCLE !Skip plasma DOFs (they get a different constraint)
+    IF(self%F0_node > 0 .AND. self%plasma_flag(cell_dofs(jr))) CYCLE !In the F0 model plasma DOFs get the F0 constraint instead; without it they get diffusion (matching add_f_res) on top of the MHD induction
     CALL mat%add_values([cell_dofs(jr)], cell_dofs, RESHAPE(jac_loc(jr,:),[1,lag_rep%nce]), &
                         1, lag_rep%nce, 7, 7)
   END DO
@@ -1451,40 +1459,46 @@ END DO
 DEALLOCATE(basis_vals, basis_grads, jac_loc, cell_dofs)
 !$omp end parallel
 !--------------------------------------------------------------------
-! Approximate F0/F0 diagonal (integral of dA/R over the plasma region)
+! F0 reduced-model constraint (only when the F0 model is active)
 !--------------------------------------------------------------------
-F0_diag = 0.d0
-!$omp parallel do private(m,curved,jac_mat,jac_det,coords) reduction(+:F0_diag)
-DO i=1,mesh%nc
-  IF(mesh%reg(i) /= 1) CYCLE ! plasma region only
-  curved = cell_is_curved(mesh,i)
-  DO m=1,quad%np
-    IF(curved.OR.(m==1)) CALL mesh%jacobian(i,quad%pts(:,m),jac_mat,jac_det)
-    coords = mesh%log2phys(i,quad%pts(:,m))
-    F0_diag = F0_diag + jac_det*quad%wts(m)/(coords(1)+gs_epsilon)
+IF(self%F0_node > 0)THEN
+  F0 = self%F0_node
+  !------------------------------------------------------------------
+  ! Approximate F0/F0 diagonal (integral of dA/R over the plasma region)
+  !------------------------------------------------------------------
+  F0_diag = 0.d0
+  !$omp parallel do private(m,curved,jac_mat,jac_det,coords) reduction(+:F0_diag)
+  DO i=1,mesh%nc
+    IF(mesh%reg(i) /= 1) CYCLE ! plasma region only
+    curved = cell_is_curved(mesh,i)
+    DO m=1,quad%np
+      IF(curved.OR.(m==1)) CALL mesh%jacobian(i,quad%pts(:,m),jac_mat,jac_det)
+      coords = mesh%log2phys(i,quad%pts(:,m))
+      F0_diag = F0_diag + jac_det*quad%wts(m)/(coords(1)+gs_epsilon)
+    END DO
   END DO
-END DO
-!$omp end parallel do
-pval(1,1) = F0_diag
-CALL mat%add_values([F0],[F0], pval, 1,1, 7,7)
-!------------------------------------------------------
-! Plasma DOF constraints (F(ind) - F0)
-!------------------------------------------------------
-ALLOCATE(plasma_no_F0(SIZE(self%plasma_flag)))
-plasma_no_F0 = self%plasma_flag
-plasma_no_F0(F0) = .FALSE.
-CALL fem_dirichlet_diag(lag_rep, mat, plasma_no_F0, 7) !1 on diagonal
-nval(1,1) = -1.d0 !-1 for F0 column 
-DO i=1,lag_rep%ne
-  IF(lag_rep%be(i) .OR. (.NOT.plasma_no_F0(i))) CYCLE
-  CALL mat%add_values([i],[F0], nval, 1,1, 7,7)
-END DO
-DO i=1,lag_rep%nbe
-  IF(.NOT.lag_rep%linkage%leo(i)) CYCLE
-  j = lag_rep%lbe(i)
-  IF(plasma_no_F0(j)) CALL mat%add_values([j],[F0], nval, 1,1, 7,7)
-END DO
-DEALLOCATE(plasma_no_F0)
+  !$omp end parallel do
+  pval(1,1) = F0_diag
+  CALL mat%add_values([F0],[F0], pval, 1,1, 7,7)
+  !------------------------------------------------------
+  ! Plasma DOF constraints (F(ind) - F0)
+  !------------------------------------------------------
+  ALLOCATE(plasma_no_F0(SIZE(self%plasma_flag)))
+  plasma_no_F0 = self%plasma_flag
+  plasma_no_F0(F0) = .FALSE.
+  CALL fem_dirichlet_diag(lag_rep, mat, plasma_no_F0, 7) !1 on diagonal
+  nval(1,1) = -1.d0 !-1 for F0 column
+  DO i=1,lag_rep%ne
+    IF(lag_rep%be(i) .OR. (.NOT.plasma_no_F0(i))) CYCLE
+    CALL mat%add_values([i],[F0], nval, 1,1, 7,7)
+  END DO
+  DO i=1,lag_rep%nbe
+    IF(.NOT.lag_rep%linkage%leo(i)) CYCLE
+    j = lag_rep%lbe(i)
+    IF(plasma_no_F0(j)) CALL mat%add_values([j],[F0], nval, 1,1, 7,7)
+  END DO
+  DEALLOCATE(plasma_no_F0)
+END IF
 end subroutine add_f_jac
 
 !------------------------------------------------------
@@ -1801,7 +1815,6 @@ DO
   !---Total psi (psi_solved + psi_vac)
   NULLIFY(plot_vals)
   CALL u%get_local(plot_vals,6)
-  plot_vals = plot_vals !+ pvac
   CALL mesh%save_vertex_scalar(plot_vals,xdmf_plot,'psi')
   !--- B from grad(psi + psi_vac) and F
   CALL grad_psi%u%restore_local(plot_vals)

@@ -13,5 +13,5 @@
 /
 
 &native_mesh_options
-  filename="equilibrium.h5"
+  filename="eq_o3.h5"
 /

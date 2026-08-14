@@ -38,7 +38,7 @@ TYPE(gs_factory), TARGET :: machine
 TYPE(oft_tmaker_td) :: tokamaker
 REAL(r8), POINTER, DIMENSION(:) :: tmp_arr
 !---Runtime options
-INTEGER(i4) :: order = 2
+INTEGER(i4) :: order = 3
 INTEGER(i4) :: nsteps = 1
 INTEGER(i4) :: rst_freq = 1
 INTEGER(i4) :: ndims, nl_its, l_its, nretry
@@ -52,8 +52,9 @@ REAL (r8):: ip_target = 7.87E6
 REAL(r8), allocatable, dimension(:) :: psi_eq, psi_pert, psi_total, eta_reg,curr_reg, areas, dens_reg, visc_reg, voltages
 REAL(r8), allocatable, dimension(:) :: coil_step !< Coil currents passed to each step (baseline, then pulsed)
 REAL(r8), allocatable, dimension(:) :: coil_base !< Fixed baseline coil currents (step overwrites equil%coil_currs)
-INTEGER(i4) :: nstep_total = 100 !< Number of time steps (dt*nstep should approach the wall time ~ms)
-INTEGER(i4) :: pulse_start = 5 !< Step at which the coil pulse turns on (let the system settle first)
+INTEGER(i4) :: nstep_total = 5000 !< Number of time steps (dt*nstep should approach the wall time ~ms)
+INTEGER(i4) :: pulse_start = 2!< Step at which the coil pulse turns on (let the system settle first)
+INTEGER(i4) :: pulse_end = 12 !< Step at which the coil pulse turns off (let the system settle first)
 LOGICAL :: do_pulse = .TRUE. !< Run WITH the coil pulse (.TRUE.) or a no-pulse baseline (.FALSE.) for common-mode subtraction
 REAL(r8) :: lin_tol = 1.d-11
 REAL(r8) :: nl_tol = 1.d-9
@@ -61,7 +62,7 @@ REAL (r8):: coords(3), psi(1), q(1)
 LOGICAL :: pm=.FALSE.
 LOGICAL :: success
 LOGICAL, allocatable, dimension(:) :: mhd_flag
-CHARACTER(LEN=25) :: filename_eq = 'equilibrium.h5' !< Name of input file for mesh, fix later for variable length
+CHARACTER(LEN=25) :: filename_eq = 'eq_o3.h5' !< Name of input file for mesh, fix later for variable length
 CHARACTER(LEN=25) :: filename_pert= 'paper_pert_0115.h5' !< Name of input file for mesh, fix later for variable length
 CHARACTER(LEN=25) :: tmp_str
 TYPE(oft_mugtok_td):: b_sim 
@@ -74,7 +75,7 @@ CALL oft_init
 !---------------------------------------------------------------------------
 CALL multigrid_construct_surf(mg_mesh)
 
-order = 2
+order = 3
 CALL oft_lag_setup(mg_mesh,order,ML_blag_obj=ML_blagrange,minlev=-1)
 IF(.NOT.oft_2D_lagrange_cast(blagrange,ML_blagrange%current_level))CALL oft_abort("Invalid lagrange FE object","setup",__FILE__)
 !---------------------------------------------------------------------------
@@ -116,15 +117,15 @@ machine%coil_regions(7)%area = 0.25
 machine%ncond_regs = 5
 ALLOCATE(machine%cond_regions(machine%ncond_regs))
 machine%cond_regions(1)%id = 4
-machine%cond_regions(1)%eta = 6.9d-7*10.d0/mu0
+machine%cond_regions(1)%eta = 6.9d-7*1000.d0/mu0
 machine%cond_regions(2)%id = 5
-machine%cond_regions(2)%eta = 1.14d-6*10.d0/mu0
+machine%cond_regions(2)%eta = 1.14d-6*1000.d0/mu0
 machine%cond_regions(3)%id = 6
-machine%cond_regions(3)%eta = 1.14d-6*10.d0/mu0
+machine%cond_regions(3)%eta = 1.14d-6*1000.d0/mu0
 machine%cond_regions(4)%id = 7
-machine%cond_regions(4)%eta = 6.9d-7*10.d0/mu0
+machine%cond_regions(4)%eta = 6.9d-7*1000.d0/mu0
 machine%cond_regions(5)%id = 8
-machine%cond_regions(5)%eta = 6.9d-7*10.d0/mu0
+machine%cond_regions(5)%eta = 6.9d-7*1000.d0/mu0
 
 
 CALL gs_setup_walls(machine)
@@ -199,8 +200,12 @@ CALL gs_update_bounds(equil)
 
 equil%Ip_target=ip_target*mu0
 equil%ip_ratio_target=ip_ratio_target
-equil%p_scale = 0.28658184156588085
-equil%ffp_scale = 2.596639717247778
+!ORDER 2
+! equil%p_scale = 0.28658184156588085
+! equil%ffp_scale = 2.596639717247778
+! ORDER 3
+equil%p_scale = 0.2866168882023207
+equil%ffp_scale = 2.5969479398703386
 tmp_str = 'tokamaker_f.prof'
 CALL gs_profile_load(tmp_str,equil%I)
 tmp_str = 'tokamaker_p.prof'
@@ -212,6 +217,7 @@ equil%vcontrol_val = 0.d0
 
 ALLOCATE(equil%coil_currs(machine%ncoil_regs))
 equil%coil_currs = [-10004540.249054534, 8131096.462417697, 8130193.40495448, -2752265.1799410507, -2755148.7923723585, -1429157.477860515,  -1424955.0239338675]*mu0
+equil%coil_currs = [-10004577.39633093, 8099063.653129182, 8099246.217039664, -2754682.325483237, -2754900.2110607256, -1425245.0543276411, -1424994.322781849]*mu0
 ALLOCATE(areas(machine%ncoil_regs))
 areas = [1.8,0.25, 0.25, 0.25, 0.25, 0.25, 0.25 ]
 ! equil%coil_currs = equil%coil_currs/areas
@@ -225,8 +231,8 @@ equil%I%f_offset = 36.d0
 ! damp them with viscosity) but small enough for the nonlinear solve to converge.
 ! Aim for dt*nstep_total ~ the wall time (~ms).
 dt = 1.d-5
-lin_tol = 1.d-4
-nl_tol = 1.d-3
+lin_tol = 1.d-5
+nl_tol = 1.d-4
 ! Compressible MHD plasma: dens_reg is the ion mass [kg] per region (m_i);
 ! the plasma (region 1) value is inflated internally by mass_scale (default 100)
 ALLOCATE(dens_reg(machine%mesh%nreg))
@@ -237,7 +243,7 @@ dens_reg(1) = 2.d0*proton_mass ! plasma ion mass [kg]
 ! the startup transient from an imperfect equilibrium settles quickly.
 ALLOCATE(visc_reg(machine%mesh%nreg))
 visc_reg = -1.d0
-visc_reg(1) = 1.d2
+visc_reg(1) = 1.d4
 
 ! Evolve the plasma (region 1) with compressible MHD; all other regions
 ! (conductors, vacuum) are handled by TokaMaker
@@ -251,7 +257,7 @@ b_sim%rst_freq = 1
 ! Use a complete LU of the coupled Jacobian (keeps the psi-velocity coupling that
 ! per-field block-Jacobi drops). Needed for good linear convergence in the stiff,
 ! near-ideal (physical eta) regime; costs more memory.
-b_sim%use_full_lu = .FALSE.
+b_sim%use_full_lu = .TRUE.
 ! Region 1 as MHD: density flat at 1e19, T = T(psi) closure, Spitzer eta(n,T),
 ! and plasma ion mass inflated by mass_scale (default 100).
 ! NOTE: set up in the UNPERTURBED equilibrium. Perturbing the coils before setup
@@ -263,26 +269,31 @@ CALL b_sim%setup_mhd(equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg)
 ! Capture a FIXED baseline: step() overwrites equil%coil_currs each step with the
 ! prescribed values, so we cannot use it as the unperturbed reference in the loop.
 ALLOCATE(coil_base(machine%ncoil_regs), coil_step(machine%ncoil_regs))
-coil_base = equil%coil_currs
-DO i=1,nstep_total
-  ! Start from the fixed baseline each step, then (if do_pulse) pulse a pair of PF
-  ! coils on from step `pulse_start` onward. Because field 6 is carried over between
-  ! steps (not re-derived), this changes the TOTAL flux and drives a real response.
-  ! For a clean signal, run once with do_pulse=.TRUE. and once with .FALSE. from the
-  ! same setup and subtract: the equilibrium-imbalance transient is common-mode and
-  ! cancels, leaving only the coil-driven motion.
-  coil_step = coil_base
-  IF(do_pulse .AND. i>=pulse_start)THEN
-    coil_step(2) = coil_base(2) - 1.d5*mu0
-    coil_step(3) = coil_base(3) + 1.d5*mu0
-  END IF
-  write(*,*) "Step: ", i, "  t = ", t
-  CALL b_sim%step(coil_step, t, dt, nl_its, l_its, nretry)
-  ! IF (MOD(i,25)==0 ) THEN
-  !   CALL b_sim%plot()
-  ! END IF
-END DO
-! CALL b_sim%plot()
+coil_step = equil%coil_currs
+! DO i=1,nstep_total
+!   ! Start from the fixed baseline each step, then (if do_pulse) pulse a pair of PF
+!   ! coils on from step `pulse_start` onward. Because field 6 is carried over between
+!   ! steps (not re-derived), this changes the TOTAL flux and drives a real response.
+!   ! For a clean signal, run once with do_pulse=.TRUE. and once with .FALSE. from the
+!   ! same setup and subtract: the equilibrium-imbalance transient is common-mode and
+!   ! cancels, leaving only the coil-driven motion.
+!   ! coil_step = coil_base
+!   IF(do_pulse .AND. i>=pulse_start .AND. i<=pulse_end)THEN
+!     coil_step(2) = coil_step(2) + 1.d5*mu0/10.0d0
+!     coil_step(3) = coil_step(3) - 1.d5*mu0/10.0d0
+!     dt = 4.d-5
+!   ELSE
+!     dt = 4.d-5
+!   END IF
+!   write(*,*) "Step: ", i, "  t = ", t
+!   write(*,*) "Coil currents: ", coil_step(1:3)
+!   write(*,*) "opoint: ", b_sim%tkmr%gs_equil%o_point
+!   CALL b_sim%step(coil_step, t, dt, nl_its, l_its, nretry)
+!   ! IF (MOD(i,25)==0 ) THEN
+!   !   CALL b_sim%plot()
+!   ! END IF
+! END DO
+CALL b_sim%plot()
 ! ALLOCATE(voltages(machine%ncoil_regs))
 ! voltages = 0.d0
 ! CALL tokamaker%setup(equil, dt, lin_tol, nl_tol, .FALSE.)
