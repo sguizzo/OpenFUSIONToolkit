@@ -23,7 +23,7 @@ USE mhd_utils, ONLY: mu0
 USE oft_gs, ONLY: gs_epsilon, gs_equil, gs_factory, gs_update_bounds, gs_test_bounds, flux_func, build_dels
 USE oft_gs_td, ONLY: oft_tmaker_td_mfop, build_vac_op, apply_rhs
 USE oft_mesh_local_util, ONLY: mesh_local_findedge
-USE xmhd_2d, ONLY: oft_xmhd_2d_sim, build_approx_jacobian
+USE xmhd_2d, ONLY: oft_xmhd_2d_sim, build_approx_jacobian, xmhd_2d_freeze_eta_temp
 USE oft_stitching, ONLY: seam_list
 IMPLICIT NONE
 #include "local.h"
@@ -511,13 +511,15 @@ end subroutine mugtok_finalize_setup
 !---------------------------------------------------------------------------
 !> Setup a combined simulation in which the plasma (region 1) is evolved as a
 !! compressible MHD region rather than by Grad-Shafranov. Density is a flat,
-!! pinned field (1e19 m^-3) and temperature is supplied as a closure T(psi)
-!! evaluated pointwise inside MUG (see mugtok_T_of_psi / xmhd_2d T_func), so
-!! neither density nor temperature is evolved. The poloidal flux (psi) and
-!! toroidal field function (F=R*B_phi) evolve with full MHD; F is initialized
-!! from the equilibrium profile.
+!! pinned field (1e19 m^-3). Temperature is initialized from the equilibrium
+!! pressure profile, T(psi)=P(psi)/(2*k*n), and then evolved with the MHD
+!! temperature equation in the MHD regions (pinned at their boundary and
+!! outside); set `evolve_T=.FALSE.` to instead hold T to the T(psi) closure
+!! evaluated pointwise inside MUG (see mugtok_T_of_psi / xmhd_2d T_func). The
+!! poloidal flux (psi) and toroidal field function (F=R*B_phi) evolve with full
+!! MHD; F is initialized from the equilibrium profile.
 !---------------------------------------------------------------------------
-subroutine setup_mugtok_mhd_td(self, equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg, toroidal_flow, mass_scale, use_spitzer)
+subroutine setup_mugtok_mhd_td(self, equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg, toroidal_flow, mass_scale, use_spitzer, chi_reg, evolve_T)
 CLASS(oft_mugtok_td), INTENT(inout), TARGET :: self !< Simulation object to be setup
 TYPE(gs_equil), INTENT(inout), TARGET :: equil !< Tokamaker equilibrium object
 REAL(8), INTENT(in) :: dt !< Desired timestep [s]
@@ -530,8 +532,10 @@ REAL(8), INTENT(in), optional :: eta_reg(:,:) !< Electrical resistivity [in plan
 LOGICAL, INTENT(in), optional :: toroidal_flow !< Allow toroidal (phi) flow in MHD regions
 REAL(8), INTENT(in), optional :: mass_scale !< Factor by which the plasma (region 1) ion mass is inflated for numerical acceleration (default 100)
 LOGICAL, INTENT(in), optional :: use_spitzer !< Use Spitzer resistivity eta(n,T) in the MHD regions (default .TRUE.)
+REAL(8), INTENT(in), optional :: chi_reg(:) !< Thermal diffusivity [m^2/s] in each region, used when the temperature is evolved (defaults to 1 m^2/s in the MHD regions and 0 elsewhere)
+LOGICAL, INTENT(in), optional :: evolve_T !< Evolve the temperature with the MHD temperature equation (default .TRUE.). If false, T is held to the T(psi) closure
 CLASS(multigrid_mesh), POINTER :: mg_mesh
-LOGICAL :: tor_flow, spitzer
+LOGICAL :: tor_flow, spitzer, evolve_temp
 REAL(r8) :: mscale
 INTEGER(i4) :: i,j
 TYPE(oft_xmhd_2d_sim), POINTER :: mhd_sim
@@ -589,8 +593,21 @@ IF (PRESENT(mass_scale)) mscale = mass_scale
 mhd_sim%m_i(1) = mhd_sim%m_i(1)*mscale
 mhd_sim%nu = visc_reg
 mhd_sim%gamma = 5.d0/3.d0
-mhd_sim%chi = 0.d0    !unused: temperature is prescribed via the T(psi) closure
 mhd_sim%D_diff = 0.d0 !unused: density is a flat, pinned field
+!---Thermal diffusivity for the evolved temperature. The default (1 m^2/s in the
+!   MHD regions) gives a diffusion time L^2/chi ~ 1 s, long compared to the
+!   ms-scale transients of interest, so the initial T(psi) profile is retained
+!   while advection of T stays smooth on the mesh scale.
+evolve_temp = .TRUE.
+IF (PRESENT(evolve_T)) evolve_temp = evolve_T
+IF (PRESENT(chi_reg)) THEN
+  mhd_sim%chi = chi_reg
+ELSE IF (evolve_temp) THEN
+  mhd_sim%chi = 0.d0
+  WHERE (mhd_flag) mhd_sim%chi = 1.d0
+ELSE
+  mhd_sim%chi = 0.d0 !unused: temperature is prescribed via the T(psi) closure
+END IF
 IF(PRESENT(eta_reg)) THEN
    mhd_sim%eta = eta_reg
 ELSE
@@ -598,7 +615,8 @@ ELSE
   mhd_sim%eta(:,2) = self%tkmr%eta_reg
 END IF
 
-!---Spitzer resistivity eta(n,T) by default (uses the T(psi) closure temperature)
+!---Spitzer resistivity eta(n,T) by default, using the evolved temperature (or the
+!   T(psi) closure temperature when the temperature is not evolved)
 spitzer = .TRUE.
 IF (PRESENT(use_spitzer)) spitzer = use_spitzer
 mhd_sim%use_spitzer = spitzer
@@ -613,13 +631,15 @@ mhd_sim%den_scale = 1.d20
 
 CALL mhd_sim%setup(mg_mesh, lag_rep%order, fe_rep_in=lag_rep)
 
-!---Temperature is a prescribed function of the local fields (T = T(psi)),
-!   evaluated pointwise in MUG instead of reconstructed from field-5 DOFs
-mhd_sim%T_func => mugtok_T_of_psi
+!---When the temperature is not evolved, it is a prescribed function of the local
+!   fields (T = T(psi)) evaluated pointwise in MUG instead of reconstructed from
+!   the field-5 DOFs. When it is evolved, field 5 carries T and the closure is
+!   used only to set the initial condition (see mugtok_seed_fields).
+IF (.NOT.evolve_temp) mhd_sim%T_func => mugtok_T_of_psi
 
 !------------------------------------------------------------------------------
-! Boundary conditions: n and T are prescribed (pinned); psi and F evolve;
-! velocity evolves in the MHD regions and is pinned to zero elsewhere
+! Boundary conditions: n is prescribed (pinned); psi and F evolve; velocity and
+! (when evolved) temperature evolve in the MHD regions and are pinned elsewhere
 !------------------------------------------------------------------------------
 IF (ASSOCIATED(mhd_sim%n_bc)) NULLIFY(mhd_sim%n_bc)
 IF (ASSOCIATED(mhd_sim%velx_bc)) NULLIFY(mhd_sim%velx_bc)
@@ -640,7 +660,8 @@ ALLOCATE(mhd_sim%by_bc(mhd_sim%fe_rep%fields(7)%fe%ne))
 mhd_sim%psi_bc = .FALSE.
 mhd_sim%by_bc = .FALSE.
 mhd_sim%n_bc = .TRUE. !density prescribed (flat), not evolved
-mhd_sim%T_bc = .TRUE. !temperature prescribed via T(psi) closure, not evolved
+!Temperature: evolved in the MHD regions, or prescribed everywhere via T(psi)
+mhd_sim%T_bc = .NOT.evolve_temp
 mhd_sim%velx_bc = .FALSE.
 mhd_sim%velz_bc = .FALSE.
 IF (tor_flow) THEN
@@ -648,7 +669,8 @@ IF (tor_flow) THEN
 ELSE
   mhd_sim%vely_bc = .TRUE.
 END IF
-!Pin velocity to zero outside the MHD regions
+!Pin velocity to zero outside the MHD regions, and (when evolved) hold the
+!temperature fixed there, which sets its boundary condition at the MHD boundary
 ALLOCATE(cell_dofs(lag_rep%nce))
 DO i=1,mesh%nc
   IF(.NOT.mhd_flag(mesh%reg(i)))THEN
@@ -657,6 +679,7 @@ DO i=1,mesh%nc
       mhd_sim%velx_bc(cell_dofs(j)) = .TRUE.
       mhd_sim%vely_bc(cell_dofs(j)) = .TRUE.
       mhd_sim%velz_bc(cell_dofs(j)) = .TRUE.
+      mhd_sim%T_bc(cell_dofs(j)) = .TRUE.
     END DO
   END IF
 END DO
@@ -719,10 +742,14 @@ DEALLOCATE(tmp_vec)
 
 CALL build_psi_vac(self, self%tkmr%gs_equil%coil_currs)
 
-!---Update plasma bounds from the total flux, then seed F (and T for diagnostics)
-!   from the equilibrium profiles inside the plasma
+!---Update plasma bounds from the total flux, then seed F and T from the
+!   equilibrium profiles inside the plasma
 CALL mugtok_refresh_bounds(self, self%u)
 CALL mugtok_seed_fields(self)
+
+!---Capture the seeded temperature for the Spitzer resistivity, so the first
+!   Jacobian build below sees the initial eta profile
+CALL xmhd_2d_freeze_eta_temp(self%mug, self%u)
 
 !------------------------------------------------------------------------------
 ! Build the nonlinear function, approximate Jacobian, preconditioner and solvers
@@ -789,9 +816,12 @@ DEALLOCATE(psi6, pvac, eqpsi)
 end subroutine mugtok_refresh_bounds
 
 !---------------------------------------------------------------------------
-!> Seed the toroidal field function F (field 7) and, for diagnostics, the
-!! temperature (field 5) on the plasma-region DOFs from the equilibrium
-!! profiles. Assumes mugtok_refresh_bounds has set eq%psi to the total flux.
+!> Seed the toroidal field function F (field 7) and the temperature (field 5) on
+!! the plasma-region DOFs from the equilibrium profiles, T = P(psi)/(2*k*n).
+!! When the temperature is evolved this is its initial condition (and, on the
+!! DOFs pinned outside the MHD regions, its boundary value); otherwise it is
+!! carried for diagnostics only. Assumes mugtok_refresh_bounds has set eq%psi to
+!! the total flux.
 !---------------------------------------------------------------------------
 subroutine mugtok_seed_fields(self)
 class(oft_mugtok_td), intent(inout) :: self !< Simulation object
@@ -853,6 +883,10 @@ CLASS(oft_native_matrix), POINTER :: P => NULL()
 CLASS(oft_matrix), pointer :: pre
 
 current_sim=>self
+
+!Freeze the temperature used for the Spitzer resistivity at the start of the step,
+!so that eta is the same coefficient in the RHS and LHS residual passes below
+CALL xmhd_2d_freeze_eta_temp(self%mug, self%u)
 
 !Update plasma time advance operator
 CALL self%tkmr%update()
