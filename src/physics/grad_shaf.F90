@@ -5105,8 +5105,9 @@ IF(PRESENT(filename))THEN
   ELSE
     CALL hdf5_create_file(filename)
     CALL hdf5_create_group(filename,'mesh')
-    CALL hdf5_write(self%device%fe_rep%mesh%r,filename,'mesh/R')
+    CALL hdf5_write(self%device%fe_rep%mesh%r(1:2,:),filename,'mesh/R')
     CALL hdf5_write(self%device%fe_rep%mesh%lc,filename,'mesh/LC')
+    CALL hdf5_write(self%device%fe_rep%mesh%reg,filename,'mesh/REG')
     CALL hdf5_create_group(filename,'tokamaker')
     CALL hdf5_write(self%device%fe_rep%order,filename,'tokamaker/FE_ORDER')
     CALL br%get_local(vals_tmp)
