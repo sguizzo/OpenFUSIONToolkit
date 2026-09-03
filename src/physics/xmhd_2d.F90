@@ -83,6 +83,7 @@ TYPE, public :: oft_xmhd_2d_sim
   REAL(r8) :: t = 0.d0 !< current time
   REAL(r8), ALLOCATABLE :: chi(:) !< thermal diffusivity, by region
   REAL(r8), ALLOCATABLE :: nu(:) !< kinematic viscosity [m^2/s], by region
+  REAL(r8), ALLOCATABLE :: force_y(:) !< body force density in the out-of-plane (y) direction [N/m^3], by region. y is the ignorable direction, so the pressure gradient has no y-component and this force is balanced only by viscosity and advection
   REAL(r8), ALLOCATABLE :: gamma(:) !< adiabatic index, by region, by region
   REAL(r8), ALLOCATABLE :: D_diff(:) !< diffusivity, by region
   REAL(r8) :: k_boltz = elec_charge !< Boltzmann constant (use elec_charge for T in eV)
@@ -740,7 +741,7 @@ LOGICAL :: linear,cyl_flag, incomp
 INTEGER(i4) :: i,l
 REAL(r8) :: k_boltz = elec_charge
 REAL(r8) :: m_i=proton_mass
-REAL(r8) :: chi, eta(2), nu, D_diff, gamma, diag_vals(5), B_0(3), diag_vec(3)
+REAL(r8) :: chi, eta(2), nu, D_diff, gamma, diag_vals(5), B_0(3), diag_vec(3), force_y
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights,psi_weights,by_weights, T_res, &
                               n_res, psi_res, by_res, vtmp, velx_res, vely_res, velz_res
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
@@ -828,6 +829,7 @@ DO i=1,mesh%nc
   nu = self%parent_sim%nu(mesh%reg(i))
   gamma = self%parent_sim%gamma(mesh%reg(i))
   D_diff = self%parent_sim%D_diff(mesh%reg(i))
+  force_y = self%parent_sim%force_y(mesh%reg(i))
   !---------------------------------------------------------------------------
   ! Quadrature Loop
   !---------------------------------------------------------------------------
@@ -985,6 +987,14 @@ DO i=1,mesh%nc
         - self%dt*basis_vals(jr)*btmp(1)*btmp(2)*int_factor/(mu0*m_i*n) & !!nonzero
         + self%dt*basis_vals(jr)*nu*vel(2)*int_factor/(coords(1)+gs_epsilon) &
         + self%dt*basis_vals(jr)*vel(1)*vel(2)*int_factor
+        !---Out-of-plane body force. y is the ignorable direction, so grad(p) has no
+        !   y-component and this term is balanced only by viscosity and advection.
+        !   force_y is a force DENSITY [N/m^3]; dividing by m_i*n (with n already in
+        !   physical units) gives the acceleration, matching the pressure term above.
+        !   The sign is negative because the residual carries everything but the
+        !   source to the LHS. No Jacobian contribution: force_y does not depend on u.
+        res_loc(jr,3) = res_loc(jr,3) &
+        - self%dt*basis_vals(jr)*force_y*int_factor*coords(1)/(m_i*n)
       ELSE
         res_loc(jr, 2:4) = res_loc(jr, 2:4) &
           + basis_vals(jr)*vel*int_factor&
@@ -1006,6 +1016,14 @@ DO i=1,mesh%nc
             + nu*self%dt*DOT_PRODUCT(basis_grads(:,jr),dvel(k,:))*int_factor &
             - nu*basis_vals(jr)*self%dt*DOT_PRODUCT(dn,dvel(k,:))*int_factor/n
         END DO
+        !---Out-of-plane body force. y is the ignorable direction, so grad(p) has no
+        !   y-component and this term is balanced only by viscosity and advection.
+        !   force_y is a force DENSITY [N/m^3]; dividing by m_i*n (with n already in
+        !   physical units) gives the acceleration, matching the pressure term above.
+        !   The sign is negative because the residual carries everything but the
+        !   source to the LHS. No Jacobian contribution: force_y does not depend on u.
+        res_loc(jr,3) = res_loc(jr,3) &
+        - self%dt*basis_vals(jr)*force_y*int_factor/(m_i*n)
       END IF
       !---Psi
       tmp1 = cross_product(B_0,vel)
@@ -1808,6 +1826,10 @@ CALL self%fe_rep%mat_create(self%jacobian)
 IF (.NOT. ALLOCATED(self%nu)) THEN
   ALLOCATE(self%nu(mesh%nreg))
   self%nu = -1.d0
+END IF
+IF (.NOT. ALLOCATED(self%force_y)) THEN
+  ALLOCATE(self%force_y(mesh%nreg))
+  self%force_y = 0.d0
 END IF
 IF (.NOT. ALLOCATED(self%D_diff)) THEN
   ALLOCATE(self%D_diff(mesh%nreg))
