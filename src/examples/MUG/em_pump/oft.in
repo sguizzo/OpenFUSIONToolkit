@@ -1,0 +1,43 @@
+&runtime_options
+  ppn=1
+  debug=0
+/
+
+&mesh_options
+  grid_order=2   ! required: the library aborts if this namelist is absent
+/
+
+&native_mesh_options
+  filename="pump_mesh_native.h5"
+/
+
+&em_pump_options
+  order=2
+  n_seg=24
+  n_per_lam=12
+  nsteps=20
+  rst_freq=1
+  dt=2.0E-3
+  freq=50.0
+  I0=4.0E4
+  ramp_time=1.0E-2
+  rho_fluid=1.94E3
+  eta_fluid=1.625E-3
+  eta_wall=1.2E-6
+  nu_fluid=3.0E-5
+  lin_tol=1.0E-7
+  nl_tol=1.0E-6
+  v_inlet=1.0
+  wall_region=4
+  iron_region=3
+  coil_reg0=5
+  dt_recover=20
+  mu_relax=0.0
+  mf_b0=1.0E-7
+  flow_on=F
+/
+
+&mugtok_plot_options
+  rst_start=0
+  rst_end=2000
+/

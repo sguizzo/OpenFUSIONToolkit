@@ -20,7 +20,7 @@ USE fem_utils, ONLY: fem_dirichlet_diag, fem_dirichlet_vec
 USE oft_lag_basis, ONLY: oft_scalar_bfem, oft_blag_eval, oft_blag_geval
 USE oft_blag_operators, ONLY: oft_blag_vproject, oft_blag_getmop, oft_lag_bginterp
 USE mhd_utils, ONLY: mu0
-USE oft_gs, ONLY: gs_epsilon, gs_equil, gs_factory, gs_update_bounds, gs_test_bounds, flux_func, build_dels
+USE oft_gs, ONLY: gs_epsilon, gs_equil, gs_factory, gs_update_bounds, gs_test_bounds, flux_func, build_dels, gs_update_mu, gs_mu_of_B
 USE oft_gs_td, ONLY: oft_tmaker_td_mfop, build_vac_op, apply_rhs
 USE oft_mesh_local_util, ONLY: mesh_local_findedge
 USE xmhd_2d, ONLY: oft_xmhd_2d_sim, build_approx_jacobian
@@ -59,6 +59,11 @@ LOGICAL, ALLOCATABLE, DIMENSION(:) :: plasma_flag !< True for DOFs in or on the 
 INTEGER(i4) :: F0_node = 0 !< Index of the first plasma_flag=.TRUE. DOF, used to evolve F0 (0 if none)
 REAL(r8) :: f_scale_prev = 1.d0 !< FF' scale (tkmr%f_scale) from previous timestep
 CLASS(flux_func), POINTER :: I_prev => NULL() !< FF' profile (gs_equil%I) from previous timestep
+LOGICAL :: has_iron = .FALSE. !< True if any mesh region has a magnetic susceptibility set. Detected once at setup so the permeability term costs nothing on devices without iron
+LOGICAL :: mu_jac_deriv = .FALSE. !< Assemble the d(mu)/d|B| term into the approximate Jacobian (add_iron_jacobian). Preconditioner-only, so it cannot change the converged solution; set false to recover the older behaviour where jac_op's only iron content was vac_op's frozen 1/mu_cell
+LOGICAL :: mu_knee_damp = .FALSE. !< Pass `knee_damp` to gs_update_mu: damp the relaxation target where the B-H curve is steep, so saturated cells fall back toward mu=1 rather than tracking mu(|B|). Only meaningful when mu_relax > 0
+REAL(r8) :: mu_relax = 0.d0 !< Relaxation weight in (0,1] for refreshing the cached per-cell permeability `gs_device%mu_cell` from the current solution, once per step, before the Jacobian is built. 0 (the default) leaves mu_cell frozen at its initial value, which is what happens on a device without iron. The PHYSICS does not depend on this: add_iron_terms adds dt*(1/mu(|B|) - 1/mu_cell)*stiffness, correcting the residual for whatever is cached, so any value converges to the same solution. What it changes is how much of the true operator sits in the assembled Jacobian rather than in that correction, and hence how representative the preconditioner is. Damping matters because mu falls steeply past the B-H knee (d ln mu / d ln B is about -5 at 1.5 T and -10 at 2 T), where undamped substitution can oscillate
+REAL(r8), ALLOCATABLE, DIMENSION(:) :: source_term !< Prescribed toroidal current density \f$ J_{\phi} \f$ [A/m^2] in each mesh region (defaults to zero). Set by the driver before each call to `step` to impose a known, time-varying current distribution (e.g. the drive coils of an EM pump) without giving those regions to TokaMaker as circuit coils. Uses the same normalization as `gs_coil_source`, so a region carrying current I with n turns over area A takes source_term = I*n/A
 
 contains
     !> Setup time-dependent simulation
@@ -94,7 +99,7 @@ CONTAINS
 !---------------------------------------------------------
 !> Setup combined MUG and TokaMaker simulation object
 !---------------------------------------------------------
-subroutine setup_mugtok_td(self, equil, dt,lin_tol,nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg, incomp, toroidal_flow)
+subroutine setup_mugtok_td(self, equil, dt,lin_tol,nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg, incomp, toroidal_flow, plasma_reg)
 CLASS(oft_mugtok_td), INTENT(inout), TARGET :: self !< Simulation object to be setup
 TYPE(gs_equil), INTENT(inout), TARGET :: equil !< Tokamaker equilibrium object
 REAL(8), INTENT(in) :: dt !< Desired timestep [s]
@@ -105,10 +110,11 @@ REAL(8), INTENT(in) :: dens_reg(:) !< Density [kg/m^3] in each region [unused wh
 REAL(8), INTENT(in) :: visc_reg(:) !< Viscosity [m^2/s] in each region [unused where mhd_flag is false]
 REAL(8), INTENT(in), optional :: eta_reg(:,:)!< Electrical resistivity [in plane, out of plane], in units of mu0, in each region. Defaults to TokaMaker region resistivites
 LOGICAL, INTENT(in), optional :: incomp !< If true, use incompressible MHD model (false currently not supported)
-LOGICAL, INTENT(in), optional :: toroidal_flow !< Allow toroidal (phi) flow in MHD regions 
-CLASS(multigrid_mesh), POINTER :: mg_mesh 
+LOGICAL, INTENT(in), optional :: toroidal_flow !< Allow toroidal (phi) flow in MHD regions
+INTEGER(i4), INTENT(in), optional :: plasma_reg !< Mesh region holding the Grad-Shafranov plasma (default 1). Pass 0 for a plasma-free device (e.g. an EM pump), in which case no F0/plasma constraints are applied and region 1 is free to be an ordinary MHD region.
+CLASS(multigrid_mesh), POINTER :: mg_mesh
 LOGICAL :: tor_flow
-INTEGER(i4) :: i,j,ierr
+INTEGER(i4) :: i,j,ierr,preg
 TYPE(oft_xmhd_2d_sim), POINTER :: mhd_sim
 REAL(r8), POINTER, DIMENSION(:) :: tmp_arr, vals_out
 TYPE(oft_graph_ptr), ALLOCATABLE :: graphs(:,:), fe_graphs(:,:), known_graphs(:)
@@ -121,6 +127,17 @@ INTEGER(i4), POINTER, DIMENSION(:) :: cell_dofs, cell_dofs_p
 type(seam_list), pointer, dimension(:) :: stitch_tmp
 type(map_list), pointer, dimension(:) :: map_tmp
 CLASS(oft_vector), pointer :: tmp_vec
+
+!---Region holding the Grad-Shafranov plasma (0 => plasma-free device)
+preg = 1
+IF(PRESENT(plasma_reg)) preg = plasma_reg
+IF(preg > SIZE(mhd_flag)) CALL oft_abort('"plasma_reg" exceeds the number of mesh regions', &
+                                         'setup_mugtok_td', __FILE__)
+IF(preg > 0)THEN
+    IF(mhd_flag(preg)) CALL oft_abort('Region "plasma_reg" is flagged for MHD; use setup_mhd to evolve the '// &
+                                      'Grad-Shafranov plasma with MHD, or pass plasma_reg=0 for a plasma-free device', &
+                                      'setup_mugtok_td', __FILE__)
+END IF
 
 !--Take mesh and single field FE reps from TokaMaker equilibrium
 mesh => equil%device%mesh
@@ -156,6 +173,13 @@ END IF
 ALLOCATE(mhd_sim)
 ALLOCATE(mhd_sim%ignore_rmask(mesh%nreg))
 mhd_sim%ignore_rmask = .NOT. mhd_flag !ignore regions where MHD will not be used
+!---Prescribed toroidal current source, zero unless the driver sets it
+IF(.NOT.ALLOCATED(self%source_term))ALLOCATE(self%source_term(mesh%nreg))
+self%source_term = 0.d0
+!---Detect magnetic regions once, so the per-iteration permeability hook is
+!   skipped entirely on devices without iron
+self%has_iron = .FALSE.
+IF(ASSOCIATED(equil%device%mag_suscep)) self%has_iron = ANY(equil%device%mag_suscep > -1.d98)
 ALLOCATE(mhd_sim%eta(mesh%nreg, 2))
 ALLOCATE(mhd_sim%m_i(mesh%nreg))
 ALLOCATE(mhd_sim%nu(mesh%nreg))
@@ -165,9 +189,19 @@ IF(PRESENT(eta_reg)) THEN
    mhd_sim%eta = eta_reg
 ELSE
   !Default to TokaMaker region resistivity if none are provided
-  mhd_sim%eta(:,1) = self%tkmr%eta_reg 
+  mhd_sim%eta(:,1) = self%tkmr%eta_reg
   mhd_sim%eta(:,2) = self%tkmr%eta_reg
 END IF
+!---TokaMaker marks the plasma region with eta=-1 and vacuum regions with a large
+!   positive value, so the defaults may not always be physically meaningful, check here
+DO i=1,mesh%nreg
+  IF(.NOT.mhd_flag(i))CYCLE
+  IF(ANY(mhd_sim%eta(i,:) <= 0.d0))THEN
+    WRITE(*,'(A,I0,A,2ES11.3)')'MHD region ',i,' has non-positive resistivity: ',mhd_sim%eta(i,:)
+    CALL oft_abort('Resistivity must be positive in every MHD region; pass "eta_reg" explicitly '// &
+                   '(TokaMaker only assigns eta to "conductor" regions)','setup_mugtok_td',__FILE__)
+  END IF
+END DO
 
 IF (PRESENT(incomp)) THEN
     mhd_sim%incomp = incomp
@@ -190,20 +224,25 @@ CALL mhd_sim%setup(mg_mesh, lag_rep%order, fe_rep_in =lag_rep)
 !------------------------------------------------------------------------------
 ! Set up plasma flag and F0 node
 !------------------------------------------------------------------------------
-! Flag DOFs that lie in (or on the border of) region 1, the plasma
+! Flag DOFs that lie in (or on the border of) the plasma region. When preg==0
+! (plasma-free device) nothing is flagged, F0_node stays 0, and every F0/plasma
+! constraint downstream (dense Jacobian block, F0 residual, plasma-node rows)
+! switches itself off.
 ALLOCATE(self%plasma_flag(mhd_sim%fe_rep%fields(7)%fe%ne))
 self%plasma_flag = .FALSE.
-ALLOCATE(cell_dofs(lag_rep%nce))
-DO i = 1, mesh%nc
-    IF (mesh%reg(i) == 1) THEN
-        CALL lag_rep%ncdofs(i, cell_dofs) ! By DOFs (order-2)
-        DO j = 1, SIZE(cell_dofs)
-            self%plasma_flag(cell_dofs(j)) = .TRUE.
-        END DO
-    END IF
-END DO
-DEALLOCATE(cell_dofs)
-!---Index of the first plasma DOF, which will be used to evolve F0
+IF (preg > 0) THEN
+    ALLOCATE(cell_dofs(lag_rep%nce))
+    DO i = 1, mesh%nc
+        IF (mesh%reg(i) == preg) THEN
+            CALL lag_rep%ncdofs(i, cell_dofs) ! By DOFs (order-2)
+            DO j = 1, SIZE(cell_dofs)
+                self%plasma_flag(cell_dofs(j)) = .TRUE.
+            END DO
+        END IF
+    END DO
+    DEALLOCATE(cell_dofs)
+END IF
+!---Index of the first plasma DOF, which will be used to evolve F0 (0 if none)
 self%F0_node = FINDLOC(self%plasma_flag, .TRUE., DIM=1)
 
 !------------------------------------------------------------------------------
@@ -275,6 +314,11 @@ IF (mhd_sim%incomp) THEN
 END IF
 DEALLOCATE(cell_dofs, cell_dofs_p)
 
+!---Re-apply the axis regularity conditions. mhd_sim%setup already ran setup_bc,
+!   but the block above nullifies and reallocates every BC flag, so that work was
+!   discarded and has to be redone here.
+CALL mhd_sim%apply_axis_bc()
+
 self%mug => mhd_sim
 
 !------------------------------------------------------------------------------------
@@ -307,6 +351,8 @@ IF (self%tkmr%gs_device%ncoils > 0) THEN
     CALL self%aug_vec%new(self%rhs)
     CALL self%aug_vec%new(self%tmp)
 ELSE
+    !Still create these vectors even if not used to avoid errors down the road
+    CALL self%fe_rep%vec_create(self%aug_vec)
     CALL self%fe_rep%vec_create(self%u)
     call self%fe_rep%vec_create(self%rhs)
     call self%fe_rep%vec_create(self%tmp)
@@ -321,7 +367,15 @@ CALL self%u%set(0.d0, 2)
 CALL self%u%set(0.d0, 3)
 CALL self%u%set(0.d0, 4)
 CALL self%u%set(0.d0, 5)
-CALL self%u%set(self%tkmr%gs_equil%I%f_offset, 7) !Set initial F to F0 value from TokaMaker equilibrium
+!---Set initial F (=R*B_phi) to the F0 value from the TokaMaker equilibrium. A
+!   plasma-free device carries no toroidal field (the coils drive I_phi and the
+!   induced current is also toroidal), so F starts at zero and the FF' profile
+!   is not required to be present at all.
+IF (self%F0_node > 0) THEN
+    CALL self%u%set(self%tkmr%gs_equil%I%f_offset, 7)
+ELSE
+    CALL self%u%set(0.d0, 7)
+END IF
 
 !Initialize field 6 (plasma poloidal flux) and field 8 (coil currents) from the
 !TokaMaker equilibrium, and populate MUG's vacuum flux (mug%psi_vac) from the coils.
@@ -480,8 +534,45 @@ REAL(r8), pointer :: tmp_arr(:), currs_tmp(:)
 CLASS(oft_vector), pointer :: tmp_vec
 CLASS(oft_native_matrix), POINTER :: P => NULL()
 CLASS(oft_matrix), pointer :: pre
+LOGICAL :: mu_updated
 
 current_sim=>self
+
+!---Refresh the preconditioner matrix with a more up-to-date mu 
+!-- The extent to which it is updated depends on mu_relax
+!-- mu_cell = (1-mu_relax)*mu_cell + mu_relax*mu(|B|)
+mu_updated = .FALSE.
+IF(self%has_iron .AND. self%mu_relax > 0.d0)THEN
+    BLOCK
+    REAL(r8), POINTER, DIMENSION(:) :: psi_ind, psi_vac
+    REAL(r8), ALLOCATABLE :: psi_tot(:)
+    NULLIFY(psi_ind, psi_vac)
+    CALL self%u%get_local(psi_ind, 6)
+    CALL self%mug%psi_vac%get_local(psi_vac)
+    ALLOCATE(psi_tot(SIZE(psi_ind)))
+    psi_tot = psi_ind + psi_vac
+    CALL self%u%restore_local(psi_ind, 6)
+    CALL self%mug%psi_vac%restore_local(psi_vac)
+    DEALLOCATE(psi_ind, psi_vac)
+    CALL self%tkmr%gs_equil%psi%restore_local(psi_tot)
+    DEALLOCATE(psi_tot)
+    !---rebuild_dels=.FALSE.: `dels` is the full jacobian, which this
+    !   time-dependent path never applies
+    IF(self%pm)THEN
+        BLOCK
+        REAL(r8) :: bstats(4), muchg
+        CALL gs_update_mu(self%tkmr%gs_equil, relax=self%mu_relax, rebuild_dels=.FALSE., &
+                          mu_change=muchg, bpol_stats=bstats, knee_damp=self%mu_knee_damp)
+        WRITE(*,'(A,5(A,ES11.4))')'  iron:','  max|B_pol|=',bstats(1),'  mean|B_pol|=',bstats(2), &
+            '  min mu(B)=',bstats(3),'  mean mu(B)=',bstats(4),'  max d(mu_cell)/mu=',muchg
+        END BLOCK
+    ELSE
+        CALL gs_update_mu(self%tkmr%gs_equil, relax=self%mu_relax, rebuild_dels=.FALSE., &
+                          knee_damp=self%mu_knee_damp)
+    END IF
+    mu_updated = .TRUE.
+    END BLOCK
+END IF
 
 !Update timestep if it has changed since setup, and build approximate jacobian for preconditioning
 IF(dt/=self%nlfun%dt)THEN
@@ -495,7 +586,8 @@ IF(dt/=self%nlfun%dt)THEN
 ELSE
     !Update plasma time advance operator
     CALL self%tkmr%update()
-    CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .FALSE.)
+    !---vac_op must be rebuilt whenever mu_cell moved
+    CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = mu_updated)
 END IF
 
 !Update preconditioner
@@ -507,6 +599,7 @@ CALL self%tmp%add(0.d0,1.d0,self%u)
 CALL apply_rhs_mugtok(self%nlfun,self%u,self%rhs)
 
 NULLIFY(currs_tmp)
+nretry=0
 DO j = 1,4
     !---Prescribe the I-coil currents using the coil current input vector
     IF(self%tkmr%gs_device%ncoils > 0)THEN
@@ -526,9 +619,19 @@ DO j = 1,4
     IF(self%nksolver%cits<0)THEN
         CALL self%u%add(0.d0,1.d0,self%tmp)
         self%nlfun%dt=self%nlfun%dt/2.d0
+        !---The halved timestep has to reach every sub-operator, not just nlfun.
+        !   vac_op is assembled from tkmr%dt (passed as both the dt and the
+        !   global scale), so leaving it stale assembles the TokaMaker psi block
+        !   for a different timestep than the MUG blocks and add_iron_terms use.
+        !   The resync branch above cannot catch this: step() returns
+        !   dt = nlfun%dt, so the next call arrives with dt == nlfun%dt.
+        self%mug%dt = self%nlfun%dt
+        self%tkmr%dt = self%nlfun%dt
+        CALL self%tkmr%update()
         CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
         CALL self%pre%update(.TRUE.)
         CALL apply_rhs_mugtok(self%nlfun,self%u,self%rhs)
+        nretry=nretry+1
         CYCLE
     ELSE
         EXIT
@@ -599,7 +702,14 @@ CALL b%set(0.d0)
 CALL self%parent_sim%mug%nlfun%apply_real(a,b)
 
 !---Add F RHS in the non-MHD regions, which are currently not computed in either code
-CALL add_f_terms(self, a, b, 0.d0) !use dt = 0 to get RHS 
+CALL add_f_terms(self, a, b, 0.d0) !use dt = 0 to get RHS
+
+!---Add any prescribed toroidal current source to the psi RHS. This is a known
+!   quantity rather than a function of the solution, so it appears here only and
+!   is deliberately absent from nlfun_apply (the Newton residual is nlfun - rhs).
+!   Uses the real dt, matching the dt scaling of the LHS operator.
+CALL add_source_terms(self, b, self%dt)
+
 NULLIFY(tmp_arr1)
 CALL b%get_local(tmp_arr1, 6) !put psi RHS into tmp array to add to TokaMaker
 
@@ -714,6 +824,10 @@ CALL self%parent_sim%mug%nlfun%apply_real(a,b) !Apply MUG LHS
 
 !---Add F LHS in the non-MHD regions, which are currently not computed in either code
 CALL add_f_terms(self, a, b, self%dt)
+
+!---Correct the psi stiffness for field-dependent permeability. LHS only.
+CALL add_iron_terms(self, a, b, self%dt)
+
 NULLIFY(tmp_arr1)
 CALL b%get_local(tmp_arr1, 6)
 
@@ -724,10 +838,13 @@ tmp_arr1 = tmp_arr1 + tmp_arr2
 CALL b%restore_local(tmp_arr1, 6)
 NULLIFY(tmp_arr2, tmp_arr1)
 
-! Put coil current RHS into field 8
-CALL tmp_out%get_local(tmp_arr2, 2)
-CALL b%restore_local(tmp_arr2, 8)
-NULLIFY(tmp_arr2)
+! Put coil current RHS into field 8. Guarded because with no coils tmp_out is a
+! single-block vector and b has no field 8 (apply_rhs_mugtok guards the same copy).
+IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
+    CALL tmp_out%get_local(tmp_arr2, 2)
+    CALL b%restore_local(tmp_arr2, 8)
+    NULLIFY(tmp_arr2)
+END IF
 
 ! Cleanup
 CALL tmp_in%delete()
@@ -801,6 +918,10 @@ DO i=1,mesh%nc
         + basis_vals(jr)*by*int_factor/(coords(1)+gs_epsilon) &
         + dt*eta1*DOT_PRODUCT(basis_grads(:,jr),dby)*int_factor/(coords(1)+gs_epsilon)
     END DO
+  END DO
+  !---Drop any contribution to rows MUG has pinned
+  DO jr=1,lag_rep%nce
+    IF(self%parent_sim%mug%by_bc(cell_dofs(jr)))res_loc(jr) = 0.d0
   END DO
   !---Add local values to the full residual vector
   !$omp ordered
@@ -980,6 +1101,7 @@ end subroutine add_f_terms
 !------------------------------------------------------------------------------
 subroutine snapshot_f_profile(self)
 class(oft_mugtok_td), intent(inout) :: self !< Simulation object
+IF(self%F0_node <= 0)RETURN !Return if plasma free device
 IF(ASSOCIATED(self%I_prev))THEN
   CALL self%I_prev%delete()
   DEALLOCATE(self%I_prev)
@@ -1010,6 +1132,180 @@ IF(ASSOCIATED(cw))DEALLOCATE(cw)
 end subroutine build_psi_vac
 
 !------------------------------------------------------------------------------
+!> Add the nonlinear-permeability correction to the psi (field 6) residual
+!!
+!! TokaMaker assembles the Delta* stiffness into `vac_op` using the cached
+!! per-cell permeability `mu_cell`, and applies it as a plain matvec. That makes
+!! mu invisible to the nonlinear solver: whatever value is baked into the matrix
+!! is frozen for the whole solve. This routine adds the difference between the
+!! true field-dependent permeability and that cached value,
+!!
+!!   dt * ( 1/mu(|B|) - 1/mu_cell ) * grad(phi_i).grad(psi) / R
+!!
+!! so that the assembled operator plus this term equals the operator that would
+!! have been built with mu evaluated at the current iterate. Two consequences:
+!!
+!!  - The residual is exact for any `mu_cell`. Nothing has to keep the cached
+!!    value fresh for correctness; a stale one only makes this term larger and
+!!    the preconditioner less representative.
+!!  - Because mu is evaluated from this routine's own argument, the matrix-free
+!!    Jacobian differences it along with everything else and picks up d(1/mu)/dB
+!!    for free. That is what lets the existing Newton solver handle the
+!!    nonlinearity directly, instead of needing an outer Picard iteration.
+!!
+!! Only cells in magnetic regions contribute; elsewhere mu_cell is 1 and the
+!! table returns 1, so the correction vanishes identically.
+!!
+!! The dt factor and the sign convention match the assembled operator, which
+!! build_vac_op creates with scale=dt (see add_source_terms for the same scaling).
+!------------------------------------------------------------------------------
+subroutine add_iron_terms(self, a, b, dt)
+class(oft_mugtok_td_mfop), intent(inout) :: self !< Time-advance operator
+class(oft_vector), target, intent(inout) :: a !< Source field (current iterate)
+class(oft_vector), intent(inout) :: b !< Result (correction accumulated into field 6)
+real(r8), intent(in) :: dt !< Timestep [s]
+real(r8), pointer, dimension(:) :: psi_weights, psi_res, pvac
+type(oft_quad_type), pointer :: quad
+integer(i4) :: i
+logical :: curved
+integer(i4) :: m, jr
+integer(i4), allocatable :: cell_dofs(:)
+real(r8) :: jac_mat(3,4), jac_det, int_factor, coords(3), dpsi(3), Bpol, nu, nu_frozen
+real(r8), allocatable :: basis_grads(:,:), psi_loc(:), res_loc(:)
+
+IF(.NOT.self%parent_sim%has_iron)RETURN
+
+quad => lag_rep%quad
+!---Work with the total flux: with coils present field 6 holds only the induced
+!   part and the coil vacuum flux lives in psi_vac, but mu depends on the total.
+NULLIFY(psi_weights, psi_res, pvac)
+CALL a%get_local(psi_weights, 6)
+IF(self%parent_sim%tkmr%gs_device%ncoils > 0)THEN
+  CALL self%parent_sim%mug%psi_vac%get_local(pvac)
+  psi_weights = psi_weights + pvac
+  DEALLOCATE(pvac)
+END IF
+CALL b%get_local(psi_res, 6)
+!$omp parallel private(m,jr,curved,cell_dofs,jac_mat,jac_det,int_factor,coords, &
+!$omp   dpsi,Bpol,nu,nu_frozen,basis_grads,psi_loc,res_loc)
+ALLOCATE(basis_grads(3,lag_rep%nce), cell_dofs(lag_rep%nce), &
+         psi_loc(lag_rep%nce), res_loc(lag_rep%nce))
+!$omp do ordered
+DO i=1,mesh%nc
+  IF(self%parent_sim%tkmr%gs_device%mag_suscep(mesh%reg(i)) < -1.d98)CYCLE
+  curved=cell_is_curved(mesh,i)
+  CALL lag_rep%ncdofs(i,cell_dofs)
+  res_loc = 0.d0
+  psi_loc = psi_weights(cell_dofs)
+  nu_frozen = 1.d0/self%parent_sim%tkmr%gs_device%mu_cell(i)
+  DO m=1,quad%np
+    IF(curved.OR.(m==1))CALL mesh%jacobian(i,quad%pts(:,m),jac_mat,jac_det)
+    DO jr=1,lag_rep%nce
+      CALL oft_blag_geval(lag_rep,i,jr,quad%pts(:,m),basis_grads(:,jr),jac_mat)
+    END DO
+    coords = mesh%log2phys(i,quad%pts(:,m))
+    int_factor = jac_det*quad%wts(m)
+    dpsi = 0.d0
+    DO jr=1,lag_rep%nce
+      dpsi = dpsi + psi_loc(jr)*basis_grads(:,jr)
+    END DO
+    !---B_pol = |grad(psi)|/R, matching the convention in gs_update_mu
+    Bpol = SQRT(SUM(dpsi(1:2)**2))/(coords(1)+gs_epsilon)
+    nu = 1.d0/gs_mu_of_B(Bpol)
+    DO jr=1,lag_rep%nce
+      res_loc(jr) = res_loc(jr) + dt*(nu-nu_frozen) &
+        *DOT_PRODUCT(basis_grads(1:2,jr),dpsi(1:2))*int_factor/(coords(1)+gs_epsilon)
+    END DO
+  END DO
+  !---Boundary rows are owned by the free-boundary BC, not the PDE
+  DO jr=1,lag_rep%nce
+    IF(lag_rep%be(cell_dofs(jr)))res_loc(jr) = 0.d0
+  END DO
+  !$omp ordered
+  DO jr=1,lag_rep%nce
+    !$omp atomic
+    psi_res(cell_dofs(jr)) = psi_res(cell_dofs(jr)) + res_loc(jr)
+  END DO
+  !$omp end ordered
+END DO
+DEALLOCATE(basis_grads,cell_dofs,psi_loc,res_loc)
+!$omp end parallel
+CALL b%restore_local(psi_res, 6)
+DEALLOCATE(psi_res, psi_weights)
+end subroutine add_iron_terms
+
+!------------------------------------------------------------------------------
+!------------------------------------------------------------------------------
+!> Add a prescribed toroidal current source to the psi (field 6) right-hand side
+!!
+!! Imposes a known \f$ J_{\phi} \f$ in the regions flagged by `source_term`,
+!! letting a driver drive current in a region without handing that region to
+!! TokaMaker as a circuit coil.
+
+!! Because the source does not depend on the solution, it belongs on the RHS
+!! only (called from apply_rhs_mugtok, never from nlfun_apply) and contributes
+!! nothing to the Jacobian.
+!------------------------------------------------------------------------------
+subroutine add_source_terms(self, b, dt)
+class(oft_mugtok_td_mfop), intent(inout) :: self !< Time-advance operator
+class(oft_vector), intent(inout) :: b !< Result (source is accumulated into field 6)
+real(r8), intent(in) :: dt !< Timestep [s]
+real(r8), pointer, dimension(:) :: psi_res
+type(oft_quad_type), pointer :: quad
+integer(i4) :: i
+logical :: curved
+integer(i4) :: m, jr
+integer(i4), allocatable :: cell_dofs(:)
+real(r8) :: jac_mat(3,4), jac_det, int_factor, j_phi
+real(r8), allocatable :: basis_vals(:), res_loc(:)
+
+IF(.NOT.ALLOCATED(self%parent_sim%source_term))RETURN
+IF(ALL(ABS(self%parent_sim%source_term) < 1.d-30))RETURN
+
+quad => lag_rep%quad
+NULLIFY(psi_res)
+CALL b%get_local(psi_res, 6)
+!$omp parallel private(m,jr,curved,cell_dofs,jac_mat,jac_det,int_factor,j_phi, &
+!$omp   basis_vals,res_loc)
+ALLOCATE(basis_vals(lag_rep%nce), cell_dofs(lag_rep%nce), res_loc(lag_rep%nce))
+!$omp do ordered
+DO i=1,mesh%nc
+  j_phi = self%parent_sim%source_term(mesh%reg(i))
+  IF(ABS(j_phi) < 1.d-30)CYCLE
+  curved=cell_is_curved(mesh,i)
+  CALL lag_rep%ncdofs(i,cell_dofs)
+  res_loc = 0.d0
+  DO m=1,quad%np
+    IF(curved.OR.(m==1))CALL mesh%jacobian(i,quad%pts(:,m),jac_mat,jac_det)
+    int_factor = jac_det*quad%wts(m)
+    DO jr=1,lag_rep%nce
+      CALL oft_blag_eval(lag_rep,i,jr,quad%pts(:,m),basis_vals(jr))
+      res_loc(jr) = res_loc(jr) + basis_vals(jr)*int_factor
+    END DO
+  END DO
+  !---Boundary rows of the psi equation are set by the free-boundary BC rather
+  !   than the PDE, so a volume source must not touch them. This is the same
+  !   guard build_dels applies to its local matrix. Source regions are interior
+  !   in any sensible setup, so this only bites if one is placed against the
+  !   domain edge.
+  DO jr=1,lag_rep%nce
+    IF(lag_rep%be(cell_dofs(jr)))res_loc(jr) = 0.d0
+  END DO
+  !---Add local values to the full residual vector
+  !$omp ordered
+  DO jr=1,lag_rep%nce
+    !$omp atomic
+    psi_res(cell_dofs(jr)) = psi_res(cell_dofs(jr)) + dt*j_phi*res_loc(jr)
+  END DO
+  !$omp end ordered
+END DO
+DEALLOCATE(basis_vals,cell_dofs,res_loc)
+!$omp end parallel
+CALL b%restore_local(psi_res, 6)
+DEALLOCATE(psi_res)
+end subroutine add_source_terms
+
+!------------------------------------------------------------------------------
 !> Add approximate Jacobian entries corresponding to add_f_terms
 !!  1) F resistive-diffusion Jacobian in solid conductor (and vacuum) regions
 !!  2) An approximate F0/F0 diagonal = integral over the plasma region of dA/R
@@ -1027,8 +1323,8 @@ real(r8), allocatable :: basis_vals(:), basis_grads(:,:), jac_loc(:,:)
 logical :: curved
 logical, allocatable :: plasma_no_F0(:)
 real(r8) :: nval(1,1), pval(1,1)
-IF(self%F0_node <= 0) RETURN
-F0 = self%F0_node
+!---Vacuum By diffusion Jacobian is assembled regardless of the F0 model;
+!   only the F0-specific constraint block below is gated on F0_node>0.
 dt = self%nlfun%dt
 quad => lag_rep%quad
 !------------------------------------------------------
@@ -1067,7 +1363,8 @@ DO i=1,mesh%nc
   END DO
   !$omp critical
   DO jr=1,lag_rep%nce
-    IF(self%plasma_flag(cell_dofs(jr))) CYCLE !Skip plasma DOFs (they get a different constraint)
+    IF(self%F0_node > 0 .AND. self%plasma_flag(cell_dofs(jr))) CYCLE !In the F0 model plasma DOFs get the F0 constraint instead; without it they get diffusion (matching add_f_terms) on top of the MHD induction
+    IF(self%mug%by_bc(cell_dofs(jr))) CYCLE !Row pinned by MUG (e.g. the axis); matches the same guard in add_f_terms
     CALL mat%add_values([cell_dofs(jr)], cell_dofs, RESHAPE(jac_loc(jr,:),[1,lag_rep%nce]), &
                         1, lag_rep%nce, 7, 7)
   END DO
@@ -1075,41 +1372,47 @@ DO i=1,mesh%nc
 END DO
 DEALLOCATE(basis_vals, basis_grads, jac_loc, cell_dofs)
 !$omp end parallel
-!--------------------------------------------------------------------
-! Approximate F0/F0 diagonal (integral of dA/R over the plasma region)
-!--------------------------------------------------------------------
-F0_diag = 0.d0
-!$omp parallel do private(m,curved,jac_mat,jac_det,coords) reduction(+:F0_diag)
-DO i=1,mesh%nc
-  IF(mesh%reg(i) /= 1) CYCLE ! plasma region only
-  curved = cell_is_curved(mesh,i)
-  DO m=1,quad%np
-    IF(curved.OR.(m==1)) CALL mesh%jacobian(i,quad%pts(:,m),jac_mat,jac_det)
-    coords = mesh%log2phys(i,quad%pts(:,m))
-    F0_diag = F0_diag + jac_det*quad%wts(m)/(coords(1)+gs_epsilon)
+!------------------------------------------------------
+! F0 reduced-model constraint (only when the F0 model is active)
+!------------------------------------------------------
+IF(self%F0_node > 0)THEN
+  F0 = self%F0_node
+  !------------------------------------------------------------------
+  ! Approximate F0/F0 diagonal (integral of dA/R over the plasma region)
+  !------------------------------------------------------------------
+  F0_diag = 0.d0
+  !$omp parallel do private(m,curved,jac_mat,jac_det,coords) reduction(+:F0_diag)
+  DO i=1,mesh%nc
+    IF(mesh%reg(i) /= 1) CYCLE ! plasma region only
+    curved = cell_is_curved(mesh,i)
+    DO m=1,quad%np
+      IF(curved.OR.(m==1)) CALL mesh%jacobian(i,quad%pts(:,m),jac_mat,jac_det)
+      coords = mesh%log2phys(i,quad%pts(:,m))
+      F0_diag = F0_diag + jac_det*quad%wts(m)/(coords(1)+gs_epsilon)
+    END DO
   END DO
-END DO
-!$omp end parallel do
-pval(1,1) = F0_diag
-CALL mat%add_values([F0],[F0], pval, 1,1, 7,7)
-!------------------------------------------------------
-! Plasma DOF constraints (F(ind) - F0)
-!------------------------------------------------------
-ALLOCATE(plasma_no_F0(SIZE(self%plasma_flag)))
-plasma_no_F0 = self%plasma_flag
-plasma_no_F0(F0) = .FALSE.
-CALL fem_dirichlet_diag(lag_rep, mat, plasma_no_F0, 7) !1 on diagonal
-nval(1,1) = -1.d0 !-1 for F0 column 
-DO i=1,lag_rep%ne
-  IF(lag_rep%be(i) .OR. (.NOT.plasma_no_F0(i))) CYCLE
-  CALL mat%add_values([i],[F0], nval, 1,1, 7,7)
-END DO
-DO i=1,lag_rep%nbe
-  IF(.NOT.lag_rep%linkage%leo(i)) CYCLE
-  j = lag_rep%lbe(i)
-  IF(plasma_no_F0(j)) CALL mat%add_values([j],[F0], nval, 1,1, 7,7)
-END DO
-DEALLOCATE(plasma_no_F0)
+  !$omp end parallel do
+  pval(1,1) = F0_diag
+  CALL mat%add_values([F0],[F0], pval, 1,1, 7,7)
+  !------------------------------------------------------
+  ! Plasma DOF constraints (F(ind) - F0)
+  !------------------------------------------------------
+  ALLOCATE(plasma_no_F0(SIZE(self%plasma_flag)))
+  plasma_no_F0 = self%plasma_flag
+  plasma_no_F0(F0) = .FALSE.
+  CALL fem_dirichlet_diag(lag_rep, mat, plasma_no_F0, 7) !1 on diagonal
+  nval(1,1) = -1.d0 !-1 for F0 column
+  DO i=1,lag_rep%ne
+    IF(lag_rep%be(i) .OR. (.NOT.plasma_no_F0(i))) CYCLE
+    CALL mat%add_values([i],[F0], nval, 1,1, 7,7)
+  END DO
+  DO i=1,lag_rep%nbe
+    IF(.NOT.lag_rep%linkage%leo(i)) CYCLE
+    j = lag_rep%lbe(i)
+    IF(plasma_no_F0(j)) CALL mat%add_values([j],[F0], nval, 1,1, 7,7)
+  END DO
+  DEALLOCATE(plasma_no_F0)
+END IF
 end subroutine add_f_jac
 
 !------------------------------------------------------
@@ -1209,56 +1512,68 @@ DO i = 1, V%i_map(row_block)%n
     DEALLOCATE(cols, vals)
 END DO
 
-!Add TokaMaker Jacobian to 6,8 block (MAYBE UNNECESSARY FOR ICOILS)
-row_block = 1
-col_block = 2
-DO i = 1, V%i_map(row_block)%n
-    jp=V%map(row_block,col_block)%ext(1,i)
-    jn=V%map(row_block,col_block)%ext(2,i)
-    colcount = jn-jp+1
-    ALLOCATE(cols(colcount), vals(colcount))
-    cols = V%lc(jp:jn)
-    vals = V%M(jp:jn)
-    cols = cols - V%j_map(col_block)%offset
-    CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
-        1, colcount, 6, 8)
-    DEALLOCATE(cols, vals)
-END DO
+!---Coil-current coupling blocks. With no coils TokaMaker's vac_op is a
+!   single-block matrix (build_dels only builds the 2x2 augmented form when
+!   ncoils>0) and jac_op is nfields x nfields, so both V%i_map(2) and block
+!   index 8 are out of bounds here.
+IF(self%tkmr%gs_device%ncoils > 0)THEN
+    !Add TokaMaker Jacobian to 6,8 block (MAYBE UNNECESSARY FOR ICOILS)
+    row_block = 1
+    col_block = 2
+    DO i = 1, V%i_map(row_block)%n
+        jp=V%map(row_block,col_block)%ext(1,i)
+        jn=V%map(row_block,col_block)%ext(2,i)
+        colcount = jn-jp+1
+        ALLOCATE(cols(colcount), vals(colcount))
+        cols = V%lc(jp:jn)
+        vals = V%M(jp:jn)
+        cols = cols - V%j_map(col_block)%offset
+        CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
+            1, colcount, 6, 8)
+        DEALLOCATE(cols, vals)
+    END DO
 
-!Add TokaMaker Jacobian to 8,6 block (MAYBE UNNECESSARY FOR ICOILS)
-row_block = 2
-col_block = 1
-DO i = 1, V%i_map(row_block)%n
-    jp=V%map(row_block,col_block)%ext(1,i)
-    jn=V%map(row_block,col_block)%ext(2,i)
-    colcount = jn-jp+1
-    ALLOCATE(cols(colcount), vals(colcount))
-    cols = V%lc(jp:jn)
-    vals = V%M(jp:jn)
-    cols = cols - V%j_map(col_block)%offset
-    CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
-        1, colcount, 8, 6)
-    DEALLOCATE(cols, vals)
-END DO
+    !Add TokaMaker Jacobian to 8,6 block (MAYBE UNNECESSARY FOR ICOILS)
+    row_block = 2
+    col_block = 1
+    DO i = 1, V%i_map(row_block)%n
+        jp=V%map(row_block,col_block)%ext(1,i)
+        jn=V%map(row_block,col_block)%ext(2,i)
+        colcount = jn-jp+1
+        ALLOCATE(cols(colcount), vals(colcount))
+        cols = V%lc(jp:jn)
+        vals = V%M(jp:jn)
+        cols = cols - V%j_map(col_block)%offset
+        CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
+            1, colcount, 8, 6)
+        DEALLOCATE(cols, vals)
+    END DO
 
-!Add TokaMaker Jacobian to 8,8 block
-row_block = 2
-col_block = 2
-DO i = 1, V%i_map(row_block)%n
-    jp=V%map(row_block,col_block)%ext(1,i)
-    jn=V%map(row_block,col_block)%ext(2,i)
-    colcount = jn-jp+1
-    ALLOCATE(cols(colcount), vals(colcount))
-    cols = V%lc(jp:jn)
-    vals = V%M(jp:jn)
-    cols = cols - V%j_map(col_block)%offset
-    CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
-        1, colcount, 8, 8)
-    DEALLOCATE(cols, vals)
-END DO
+    !Add TokaMaker Jacobian to 8,8 block
+    row_block = 2
+    col_block = 2
+    DO i = 1, V%i_map(row_block)%n
+        jp=V%map(row_block,col_block)%ext(1,i)
+        jn=V%map(row_block,col_block)%ext(2,i)
+        colcount = jn-jp+1
+        ALLOCATE(cols(colcount), vals(colcount))
+        cols = V%lc(jp:jn)
+        vals = V%M(jp:jn)
+        cols = cols - V%j_map(col_block)%offset
+        CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
+            1, colcount, 8, 8)
+        DEALLOCATE(cols, vals)
+    END DO
+END IF
 
 !---Add missing F contributions corresponding to add_f_terms 
 CALL add_f_jac(self, mat)
+
+!---Add the Jacobian of the permeability correction that add_iron_terms puts in
+!   the residual. Without this jac_op's iron block is vac_op's frozen
+!   dt*(1/mu_cell)*stiffness, and mu_relax>0 amplifies the omission (see
+!   add_iron_jacobian). Preconditioner-only: the residual is already exact.
+IF(self%mu_jac_deriv) CALL add_iron_jacobian(self, mat, a)
 
 CALL self%aug_vec%new(tmp)
 CALL mat%assemble(tmp)
@@ -1544,6 +1859,123 @@ CALL lmop%delete
 DEALLOCATE(lmop)
 end subroutine compute_gradf
 
+!------------------------------------------------------------------------------
+!> Jacobian of the field-dependent permeability correction that add_iron_terms
+!> adds to the residual
+!!
+!! add_iron_terms puts dt*(nu(|B|) - 1/mu_cell)*stiffness into the residual, but
+!! nothing put its derivative into the approximate Jacobian: jac_op's only iron
+!! content is vac_op's dt*(1/mu_cell)*stiffness. That omission is what limits
+!! `mu_relax`. Because jac_op is inverted exactly (oft_lusolver) and its iron
+!! block scales like 1/mu_cell, jac_op^-1 scales like mu_cell there, so raising
+!! mu_relax matches the retained term and simultaneously amplifies the omitted
+!! one by mu -- which is why tracking mu(|B|) converges worse, not better, once
+!! cells pass the B-H knee.
+!!
+!! Differentiating res_j = sum_q dt*(nu - nu_frozen)*(grad(phi_j).grad(psi))*w/R
+!! with respect to psi_k, using |B| = |grad(psi)|/R, gives two symmetric pieces:
+!!   (A) dt*(nu - nu_frozen)*(grad(phi_j).grad(phi_k))*w/R
+!!       which lifts vac_op's frozen 1/mu_cell up to the true nu(|B|), and
+!!   (B) -dt*(dmu/d|B|)/mu**2 * (grad(phi_j).grad(psi))*(grad(phi_k).grad(psi))
+!!                            * w/(|grad(psi)|*R**2)
+!!       the field dependence itself: a rank-1 outer product per quadrature
+!!       point, positive definite wherever dmu/d|B| < 0. That sign is physical --
+!!       saturation stiffens the iron against further flux -- and it is the term
+!!       that is 5-13x the retained one past the knee.
+!!
+!! Preconditioner-only: the residual already carries the exact nonlinearity, so
+!! this cannot change the converged solution, only how fast it is reached.
+!------------------------------------------------------------------------------
+subroutine add_iron_jacobian(self, mat, a)
+class(oft_mugtok_td), intent(inout) :: self !< Simulation object
+class(oft_matrix), pointer, intent(inout) :: mat !< Matrix to add entries to
+class(oft_vector), intent(inout) :: a !< Current iterate
+real(r8), pointer, dimension(:) :: psi_weights, pvac
+type(oft_quad_type), pointer :: quad
+integer(i4) :: i, m, jr, jc
+integer(i4), allocatable :: cell_dofs(:)
+real(r8) :: jac_mat(3,4), jac_det, int_factor, coords(3), dpsi(3), Bpol, absP
+real(r8) :: nu, nu_frozen, mu_loc, dmu, coefA, coefB, dt, Rloc
+real(r8), allocatable :: basis_grads(:,:), psi_loc(:), jac_loc(:,:), gdotp(:)
+logical :: curved
+real(r8), parameter :: absP_min = 1.d-12 ! below this grad(psi) the rank-1 term vanishes faster than it blows up
+
+IF(.NOT.self%has_iron)RETURN
+dt = self%nlfun%dt
+quad => lag_rep%quad
+
+!---Total flux, matching add_iron_terms: field 6 holds only the induced part
+NULLIFY(psi_weights, pvac)
+CALL a%get_local(psi_weights, 6)
+IF(self%tkmr%gs_device%ncoils > 0)THEN
+  CALL self%mug%psi_vac%get_local(pvac)
+  psi_weights = psi_weights + pvac
+  DEALLOCATE(pvac)
+END IF
+
+!$omp parallel private(m,jr,jc,curved,cell_dofs,jac_mat,jac_det,int_factor,coords, &
+!$omp   dpsi,Bpol,absP,nu,nu_frozen,mu_loc,dmu,coefA,coefB,Rloc,basis_grads,psi_loc, &
+!$omp   jac_loc,gdotp)
+ALLOCATE(basis_grads(3,lag_rep%nce), cell_dofs(lag_rep%nce), psi_loc(lag_rep%nce), &
+         jac_loc(lag_rep%nce,lag_rep%nce), gdotp(lag_rep%nce))
+!$omp do
+DO i=1,mesh%nc
+  IF(self%tkmr%gs_device%mag_suscep(mesh%reg(i)) < -1.d98)CYCLE
+  curved=cell_is_curved(mesh,i)
+  CALL lag_rep%ncdofs(i,cell_dofs)
+  psi_loc = psi_weights(cell_dofs)
+  nu_frozen = 1.d0/self%tkmr%gs_device%mu_cell(i)
+  jac_loc = 0.d0
+  DO m=1,quad%np
+    IF(curved.OR.(m==1))CALL mesh%jacobian(i,quad%pts(:,m),jac_mat,jac_det)
+    DO jr=1,lag_rep%nce
+      CALL oft_blag_geval(lag_rep,i,jr,quad%pts(:,m),basis_grads(:,jr),jac_mat)
+    END DO
+    coords = mesh%log2phys(i,quad%pts(:,m))
+    Rloc = coords(1)+gs_epsilon
+    int_factor = jac_det*quad%wts(m)
+    dpsi = 0.d0
+    DO jr=1,lag_rep%nce
+      dpsi = dpsi + psi_loc(jr)*basis_grads(:,jr)
+    END DO
+    absP = SQRT(SUM(dpsi(1:2)**2))
+    Bpol = absP/Rloc
+    mu_loc = gs_mu_of_B(Bpol, dmu_dB=dmu)
+    nu = 1.d0/mu_loc
+    !---(A) lift the frozen 1/mu_cell to the true nu(|B|)
+    coefA = dt*(nu-nu_frozen)*int_factor/Rloc
+    !---(B) field dependence of mu; rank-1 in gdotp
+    IF(absP > absP_min)THEN
+      coefB = -dt*dmu/(mu_loc*mu_loc)*int_factor/(absP*Rloc*Rloc)
+    ELSE
+      coefB = 0.d0
+    END IF
+    DO jr=1,lag_rep%nce
+      gdotp(jr) = DOT_PRODUCT(basis_grads(1:2,jr),dpsi(1:2))
+    END DO
+    DO jr=1,lag_rep%nce
+      DO jc=1,lag_rep%nce
+        jac_loc(jr,jc) = jac_loc(jr,jc) &
+          + coefA*DOT_PRODUCT(basis_grads(1:2,jr),basis_grads(1:2,jc)) &
+          + coefB*gdotp(jr)*gdotp(jc)
+      END DO
+    END DO
+  END DO
+  !$omp critical
+  DO jr=1,lag_rep%nce
+    !---Boundary rows belong to the free-boundary BC, matching add_iron_terms
+    IF(lag_rep%be(cell_dofs(jr)))CYCLE
+    CALL mat%add_values([cell_dofs(jr)], cell_dofs, RESHAPE(jac_loc(jr,:),[1,lag_rep%nce]), &
+                        1, lag_rep%nce, 6, 6)
+  END DO
+  !$omp end critical
+END DO
+DEALLOCATE(basis_grads, cell_dofs, psi_loc, jac_loc, gdotp)
+!$omp end parallel
+DEALLOCATE(psi_weights)
+end subroutine add_iron_jacobian
+
+!------------------------------------------------------------------------------
 !---------------------------
 ! Delete matrix-free operator 
 !---------------------------

@@ -101,6 +101,7 @@ TYPE, public :: oft_xmhd_2d_sim
   LOGICAL, CONTIGUOUS, POINTER, DIMENSION(:) :: T_bc => NULL() !< T BC flag
   LOGICAL, CONTIGUOUS, POINTER, DIMENSION(:) :: psi_bc => NULL() !< psi BC flag
   LOGICAL, CONTIGUOUS, POINTER, DIMENSION(:) :: by_bc => NULL() !< by BC flag
+  LOGICAL, CONTIGUOUS, POINTER, DIMENSION(:) :: axis_bc => NULL() !< True for DOFs on the symmetry axis (R=0). Built in setup when cyl_flag is set, and empty otherwise, so a mesh that never reaches the axis makes every axis condition a no-op
   TYPE(oft_fem_comp_type), POINTER :: fe_rep => NULL() !< Finite element representation for solution field
   TYPE(xdmf_plot_file) :: xdmf_plot
   CLASS(oft_vector), POINTER :: u => NULL() !< current solution vector
@@ -117,6 +118,8 @@ TYPE, public :: oft_xmhd_2d_sim
   PROCEDURE :: setup => setup
   !> Set default boundary conditions
   PROCEDURE :: setup_bc => setup_bc
+  !> Apply regularity conditions on the symmetry axis
+  PROCEDURE :: apply_axis_bc => apply_axis_bc
   !> Run simulation
   PROCEDURE :: run_simulation => run_simulation
   !> Run simulation in linear mode
@@ -1855,6 +1858,24 @@ IF (.NOT. ALLOCATED(self%ignore_rmask)) THEN
   ALLOCATE(self%ignore_rmask(mesh%nreg))
   self%ignore_rmask = .FALSE.
 END IF
+!---Flag DOFs on the symmetry axis so setup_bc can apply the regularity
+!   conditions there. Built from geometry alone, matching how TokaMaker
+!   identifies the axis (grad_shaf.F90, compute_bcmat)
+IF(self%cyl_flag .AND. .NOT.ASSOCIATED(self%axis_bc))THEN
+  BLOCK
+  LOGICAL, ALLOCATABLE :: vert_flag(:), edge_flag(:)
+  INTEGER(i4) :: iax
+  ALLOCATE(vert_flag(mesh%np), edge_flag(mesh%ne), self%axis_bc(oft_blagrange%ne))
+  vert_flag = mesh%r(1,:) < 1.d-8
+  edge_flag = .FALSE.
+  DO iax=1,mesh%ne
+    IF(vert_flag(mesh%le(1,iax)).AND.vert_flag(mesh%le(2,iax)))edge_flag(iax)=.TRUE.
+  END DO
+  CALL bfem_map_flag(oft_blagrange, vert_flag, edge_flag, self%axis_bc)
+  DEALLOCATE(vert_flag, edge_flag)
+  END BLOCK
+END IF
+
 ! Set boundary conditions not alreadys set
 CALL self%setup_bc()
 
@@ -1867,7 +1888,6 @@ end subroutine setup
 
 !---------------------------------------------------------------------------
 !> Set any boundary conditions not already set with default values
-!> Note that default BCs on pressure 
 !---------------------------------------------------------------------------
 subroutine setup_bc(self)
 class(oft_xmhd_2d_sim), intent(inout) :: self
@@ -1881,9 +1901,9 @@ IF(.NOT.ASSOCIATED(self%n_bc))THEN
     self%n_bc=>oft_blagrange%global%gbe
   END IF
 END IF
-IF(.NOT.ASSOCIATED(self%velx_bc))self%velx_bc=>oft_blagrange%global%gbe
-IF(.NOT.ASSOCIATED(self%vely_bc))self%vely_bc=>oft_blagrange%global%gbe
-IF(.NOT.ASSOCIATED(self%velz_bc))self%velz_bc=>oft_blagrange%global%gbe
+CALL default_bc(self%velx_bc,freeze_axis=.TRUE.)
+CALL default_bc(self%vely_bc,freeze_axis=.TRUE.)
+CALL default_bc(self%velz_bc,freeze_axis=.FALSE.) ! v_Z is finite on the axis
 IF (self%incomp) THEN
   !Default pressure BC is freezing one node to fix gauge
   !Only works for single MHD region simulations, must be overwritten if several MHD regions exist
@@ -1900,9 +1920,45 @@ IF (self%incomp) THEN
 ELSE
   IF(.NOT.ASSOCIATED(self%T_bc))self%T_bc=>oft_blagrange%global%gbe
 END IF
-IF(.NOT.ASSOCIATED(self%psi_bc))self%psi_bc=>oft_blagrange%global%gbe
-IF(.NOT.ASSOCIATED(self%by_bc))self%by_bc=>oft_blagrange%global%gbe
+CALL default_bc(self%psi_bc,freeze_axis=.TRUE.)
+CALL default_bc(self%by_bc,freeze_axis=.TRUE.)
+CALL self%apply_axis_bc()
+CONTAINS
+!---------------------------------------------------------------------------
+!> Give a field its default boundary flag, and the storage to go with it
+!!
+!! A field that apply_axis_bc will write to needs its own array: every field
+!! otherwise aliases oft_blagrange%global%gbe, which the FE library reads too,
+!! so merging the axis condition through an alias would pin the axis on all of
+!! them at once. 
+!---------------------------------------------------------------------------
+subroutine default_bc(flag,freeze_axis)
+LOGICAL, CONTIGUOUS, POINTER, INTENT(inout) :: flag(:)
+LOGICAL, INTENT(in) :: freeze_axis !< apply_axis_bc will write to this field
+IF(ASSOCIATED(flag))RETURN
+IF(freeze_axis.AND.self%cyl_flag.AND.ASSOCIATED(self%axis_bc))THEN
+  ALLOCATE(flag(oft_blagrange%ne))
+  flag = oft_blagrange%global%gbe
+ELSE
+  flag=>oft_blagrange%global%gbe
+END IF
+end subroutine default_bc
 end subroutine setup_bc
+
+!---------------------------------------------------------------------------
+!> Apply regularity conditions on the symmetry axis (R=0)
+!! Freeze velx, vely, psi, and by  (velz is finite on the axis)
+!---------------------------------------------------------------------------
+subroutine apply_axis_bc(self)
+class(oft_xmhd_2d_sim), intent(inout) :: self
+IF(.NOT.self%cyl_flag)RETURN
+IF(.NOT.ASSOCIATED(self%axis_bc))RETURN
+IF(.NOT.ANY(self%axis_bc))RETURN
+self%velx_bc = self%velx_bc .OR. self%axis_bc
+self%vely_bc = self%vely_bc .OR. self%axis_bc
+self%psi_bc  = self%psi_bc  .OR. self%axis_bc
+self%by_bc   = self%by_bc   .OR. self%axis_bc
+end subroutine apply_axis_bc
 
 !---------------------------------------------------------------------------
 !> Save xMHD solution state to a restart file

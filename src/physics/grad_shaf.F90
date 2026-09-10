@@ -194,6 +194,8 @@ TYPE :: gs_factory
   INTEGER(i4), POINTER, DIMENSION(:) :: lim_con => NULL() !< Limiter contour list (contains all limiters)
   INTEGER(i4), POINTER, DIMENSION(:) :: lim_ptr => NULL() !< Pointer to start of each
   REAL(r8), POINTER, DIMENSION(:) :: cond_weights => NULL() !< Needs docs
+  REAL(r8), POINTER, DIMENSION(:) :: mag_suscep => NULL() !< Magnetic susceptibility by region. Values <= -1.d98 mark a non-magnetic region (the default), so a region only participates in the nonlinear-permeability model once a driver sets this
+  REAL(r8), POINTER, DIMENSION(:) :: mu_cell => NULL() !< Relative permeability in each cell, updated from |B| by gs_update_mu. Initialized to 1 everywhere, so it is a no-op until a driver enables magnetic regions
   REAL(r8), POINTER, DIMENSION(:) :: coil_vcont => NULL() !< Virtual VSC definition as weighted sum of other coils
   REAL(r8), POINTER, DIMENSION(:) :: Rcoils => NULL() !< Lumped resistance [Ohms] of each coil (negative for Icoils)
   REAL(r8), POINTER, DIMENSION(:) :: coils_dt => NULL() !< Coil currents at start of step for quasi-static calculations
@@ -537,6 +539,13 @@ SELECT TYPE(this=>ML_lag_2d%current_level)
     CALL oft_abort("Invalid FE space","gs_setup",__FILE__)
 END SELECT
 self%mesh=>self%fe_rep%mesh
+!---Nonlinear-permeability state. Allocated here (rather than only in the Python
+!   wrapper, as on tMaker_iron) so Fortran drivers get it too. The defaults make
+!   this inert: mu_cell=1 leaves the Delta* operator unchanged, and the
+!   mag_suscep sentinel marks every region non-magnetic until a driver opts in.
+ALLOCATE(self%mu_cell(self%mesh%nc),self%mag_suscep(self%mesh%nreg))
+self%mu_cell=1.d0
+self%mag_suscep=-1.d99
 ALLOCATE(self%zerob_bc)
 self%zerob_bc%ML_lag_rep=>self%ML_fe_rep
 ALLOCATE(self%zerogrnd_bc)
@@ -5263,7 +5272,7 @@ real(8), optional, intent(in) :: dt !< Timestep size for time-dependent version
 real(8), optional, intent(in) :: scale !< Global scale factor
 integer(i4) :: i,m,jr,jc
 integer(i4), allocatable :: j(:),j2(:)
-real(r8) :: vol,det,goptmp(3,4),elapsed_time,pt(3),dt_in,main_scale
+real(r8) :: vol,det,goptmp(3,4),elapsed_time,pt(3),dt_in,main_scale,mu_loc
 real(r8), allocatable :: rop(:),gop(:,:),lop(:,:),eta_reg(:)
 logical :: curved
 integer(i4) :: nnonaxi
@@ -5379,7 +5388,7 @@ IF(nnonaxi>0)THEN
   ALLOCATE(nonaxi_vals(self%region_info%block_max+1,self%region_info%nnonaxi))
   nonaxi_vals=0.d0
 END IF
-!$omp parallel private(j,rop,gop,det,lop,curved,goptmp,m,vol,jc,jr,pt,nonaxi_tmp)
+!$omp parallel private(j,rop,gop,det,lop,curved,goptmp,m,vol,jc,jr,pt,nonaxi_tmp,mu_loc)
 allocate(j(self%fe_rep%nce)) ! Local DOF and matrix indices
 allocate(rop(self%fe_rep%nce),gop(3,self%fe_rep%nce)) ! Reconstructed gradient operator
 allocate(lop(self%fe_rep%nce,self%fe_rep%nce)) ! Local laplacian matrix
@@ -5388,6 +5397,8 @@ IF(nnonaxi>0)allocate(nonaxi_tmp(self%fe_rep%nce))
 do i=1,self%fe_rep%mesh%nc
   !---Skip cell if in 'ignore' region
   IF(self%ignore_rmask(self%fe_rep%mesh%reg(i))) CYCLE
+  !---Relative permeability of this cell (1 unless a magnetic region is active)
+  mu_loc=self%mu_cell(i)
   !---Get local reconstructed operators
   lop=0.d0
   IF(nnonaxi>0)nonaxi_tmp=0.d0
@@ -5402,7 +5413,7 @@ do i=1,self%fe_rep%mesh%nc
     !---Compute local matrix contributions
     do jr=1,self%fe_rep%nce
       do jc=1,self%fe_rep%nce
-        lop(jr,jc) = lop(jr,jc) + DOT_PRODUCT(gop(1:2,jr),gop(1:2,jc))*det/(pt(1)+gs_epsilon)
+        lop(jr,jc) = lop(jr,jc) + DOT_PRODUCT(gop(1:2,jr),gop(1:2,jc))*det/(pt(1)+gs_epsilon)/mu_loc
       end do
     end do
     IF(dt_in>0.d0.AND.eta_reg(smesh%reg(i))>0.d0)THEN
@@ -5793,6 +5804,8 @@ END IF
 IF(ASSOCIATED(self%bc_rhs_list))DEALLOCATE(self%bc_rhs_list)
 IF(ASSOCIATED(self%bc_lmat))DEALLOCATE(self%bc_lmat)
 IF(ASSOCIATED(self%bc_bmat))DEALLOCATE(self%bc_bmat)
+IF(ASSOCIATED(self%mag_suscep))DEALLOCATE(self%mag_suscep)
+IF(ASSOCIATED(self%mu_cell))DEALLOCATE(self%mu_cell)
 IF(ASSOCIATED(self%dels_dt))THEN
   CALL self%dels_dt%delete()
   DEALLOCATE(self%dels_dt)
@@ -5844,6 +5857,384 @@ IF(ASSOCIATED(self%eta))THEN
 END IF
 ! TODO: Destroy P_ani
 end subroutine equil_destroy
+!------------------------------------------------------------------------------
+!> Relative permeability of the iron as a function of local |B_pol|
+!!
+!! The B-H table is the one carried on the tMaker_iron branch. Kept as a single
+!! function so that anything evaluating mu inside a residual and anything caching
+!! it into an operator cannot drift apart.
+!!
+!! Note this is only C0: `linterp` is piecewise linear, so d(mu)/d|B| jumps at the
+!! table breakpoints. That is harmless when the result is cached into a matrix,
+!! but a caller that differentiates it (e.g. a matrix-free Jacobian probing a
+!! residual) can see a noisy derivative near a breakpoint. Replace with a
+!! monotone cubic if that shows up in convergence.
+!------------------------------------------------------------------------------
+FUNCTION gs_mu_of_B(Bpol,dmu_dB) RESULT(mu_r)
+real(r8), intent(in) :: Bpol !< Poloidal field magnitude [T]
+real(r8), optional, intent(out) :: dmu_dB !< d(mu_r)/d|B| [1/T]. The table is interpolated piecewise-linearly, so this is the slope of the bracketing segment: exact between knots, discontinuous across them, and zero outside the table's range
+real(r8) :: mu_r !< Relative permeability
+integer(4) :: k_lo,k_hi,k_mid
+real(8), parameter :: Bpol_vals(468) = [ &
+  0d0, 0.005d0, 0.01d0, 0.015d0, &
+  0.02d0, 0.025d0, 0.03d0, 0.035d0, &
+  0.04d0, 0.045d0, 0.05d0, 0.055d0, &
+  0.06d0, 0.065d0, 0.07d0, 0.075d0, &
+  0.08d0, 0.085d0, 0.09d0, 0.095d0, &
+  0.1d0, 0.105d0, 0.11d0, 0.115d0, &
+  0.12d0, 0.125d0, 0.13d0, 0.135d0, &
+  0.14d0, 0.145d0, 0.15d0, 0.155d0, &
+  0.16d0, 0.165d0, 0.17d0, 0.175d0, &
+  0.18d0, 0.185d0, 0.19d0, 0.195d0, &
+  0.2d0, 0.205d0, 0.21d0, 0.215d0, &
+  0.22d0, 0.225d0, 0.23d0, 0.235d0, &
+  0.24d0, 0.245d0, 0.25d0, 0.255d0, &
+  0.26d0, 0.265d0, 0.27d0, 0.275d0, &
+  0.28d0, 0.285d0, 0.29d0, 0.295d0, &
+  0.3d0, 0.305d0, 0.31d0, 0.315d0, &
+  0.32d0, 0.325d0, 0.33d0, 0.335d0, &
+  0.34d0, 0.345d0, 0.35d0, 0.355d0, &
+  0.36d0, 0.365d0, 0.37d0, 0.375d0, &
+  0.38d0, 0.385d0, 0.39d0, 0.395d0, &
+  0.4d0, 0.405d0, 0.41d0, 0.415d0, &
+  0.42d0, 0.425d0, 0.43d0, 0.435d0, &
+  0.44d0, 0.445d0, 0.45d0, 0.455d0, &
+  0.46d0, 0.465d0, 0.47d0, 0.475d0, &
+  0.48d0, 0.485d0, 0.49d0, 0.495d0, &
+  0.5d0, 0.505d0, 0.51d0, 0.515d0, &
+  0.52d0, 0.525d0, 0.53d0, 0.535d0, &
+  0.54d0, 0.545d0, 0.55d0, 0.555d0, &
+  0.56d0, 0.565d0, 0.57d0, 0.575d0, &
+  0.58d0, 0.585d0, 0.59d0, 0.595d0, &
+  0.6d0, 0.605d0, 0.61d0, 0.615d0, &
+  0.62d0, 0.625d0, 0.63d0, 0.635d0, &
+  0.64d0, 0.645d0, 0.65d0, 0.655d0, &
+  0.66d0, 0.665d0, 0.67d0, 0.675d0, &
+  0.68d0, 0.685d0, 0.69d0, 0.695d0, &
+  0.7d0, 0.705d0, 0.71d0, 0.715d0, &
+  0.72d0, 0.725d0, 0.73d0, 0.735d0, &
+  0.74d0, 0.745d0, 0.75d0, 0.755d0, &
+  0.76d0, 0.765d0, 0.77d0, 0.775d0, &
+  0.78d0, 0.785d0, 0.79d0, 0.795d0, &
+  0.8d0, 0.805d0, 0.81d0, 0.815d0, &
+  0.82d0, 0.825d0, 0.83d0, 0.835d0, &
+  0.84d0, 0.845d0, 0.85d0, 0.855d0, &
+  0.86d0, 0.865d0, 0.87d0, 0.875d0, &
+  0.88d0, 0.885d0, 0.89d0, 0.895d0, &
+  0.9d0, 0.905d0, 0.91d0, 0.915d0, &
+  0.92d0, 0.925d0, 0.93d0, 0.935d0, &
+  0.94d0, 0.945d0, 0.95d0, 0.955d0, &
+  0.96d0, 0.965d0, 0.97d0, 0.975d0, &
+  0.98d0, 0.985d0, 0.99d0, 0.995d0, &
+  1d0, 1.005d0, 1.01d0, 1.015d0, &
+  1.02d0, 1.025d0, 1.03d0, 1.035d0, &
+  1.04d0, 1.045d0, 1.05d0, 1.055d0, &
+  1.06d0, 1.065d0, 1.07d0, 1.075d0, &
+  1.08d0, 1.085d0, 1.09d0, 1.095d0, &
+  1.1d0, 1.105d0, 1.11d0, 1.115d0, &
+  1.12d0, 1.125d0, 1.13d0, 1.135d0, &
+  1.14d0, 1.145d0, 1.15d0, 1.155d0, &
+  1.16d0, 1.165d0, 1.17d0, 1.175d0, &
+  1.18d0, 1.185d0, 1.19d0, 1.195d0, &
+  1.2d0, 1.205d0, 1.21d0, 1.215d0, &
+  1.22d0, 1.225d0, 1.23d0, 1.235d0, &
+  1.24d0, 1.245d0, 1.25d0, 1.255d0, &
+  1.26d0, 1.265d0, 1.27d0, 1.275d0, &
+  1.28d0, 1.285d0, 1.29d0, 1.295d0, &
+  1.3d0, 1.305d0, 1.31d0, 1.315d0, &
+  1.32d0, 1.325d0, 1.33d0, 1.335d0, &
+  1.34d0, 1.345d0, 1.35d0, 1.355d0, &
+  1.36d0, 1.365d0, 1.37d0, 1.375d0, &
+  1.38d0, 1.385d0, 1.39d0, 1.395d0, &
+  1.4d0, 1.405d0, 1.41d0, 1.415d0, &
+  1.42d0, 1.425d0, 1.43d0, 1.435d0, &
+  1.44d0, 1.445d0, 1.45d0, 1.455d0, &
+  1.46d0, 1.465d0, 1.47d0, 1.475d0, &
+  1.48d0, 1.485d0, 1.49d0, 1.495d0, &
+  1.5d0, 1.505d0, 1.51d0, 1.515d0, &
+  1.52d0, 1.525d0, 1.53d0, 1.535d0, &
+  1.54d0, 1.545d0, 1.55d0, 1.555d0, &
+  1.56d0, 1.565d0, 1.57d0, 1.575d0, &
+  1.58d0, 1.585d0, 1.59d0, 1.595d0, &
+  1.6d0, 1.605d0, 1.61d0, 1.615d0, &
+  1.62d0, 1.625d0, 1.63d0, 1.635d0, &
+  1.64d0, 1.645d0, 1.65d0, 1.655d0, &
+  1.66d0, 1.665d0, 1.67d0, 1.675d0, &
+  1.68d0, 1.685d0, 1.69d0, 1.695d0, &
+  1.7d0, 1.705d0, 1.71d0, 1.715d0, &
+  1.72d0, 1.725d0, 1.73d0, 1.735d0, &
+  1.74d0, 1.745d0, 1.75d0, 1.755d0, &
+  1.76d0, 1.765d0, 1.77d0, 1.775d0, &
+  1.78d0, 1.785d0, 1.79d0, 1.795d0, &
+  1.8d0, 1.805d0, 1.81d0, 1.815d0, &
+  1.82d0, 1.825d0, 1.83d0, 1.835d0, &
+  1.84d0, 1.845d0, 1.85d0, 1.855d0, &
+  1.86d0, 1.865d0, 1.87d0, 1.875d0, &
+  1.88d0, 1.885d0, 1.89d0, 1.895d0, &
+  1.9d0, 1.905d0, 1.91d0, 1.915d0, &
+  1.92d0, 1.925d0, 1.93d0, 1.935d0, &
+  1.94d0, 1.945d0, 1.95d0, 1.955d0, &
+  1.96d0, 1.965d0, 1.97d0, 1.975d0, &
+  1.98d0, 1.985d0, 1.99d0, 1.995d0, &
+  2d0, 2.005d0, 2.01d0, 2.015d0, &
+  2.02d0, 2.025d0, 2.03d0, 2.035d0, &
+  2.04d0, 2.045d0, 2.05d0, 2.055d0, &
+  2.06d0, 2.065d0, 2.07d0, 2.075d0, &
+  2.08d0, 2.085d0, 2.09d0, 2.095d0, &
+  2.1d0, 2.105d0, 2.11d0, 2.115d0, &
+  2.12d0, 2.125d0, 2.13d0, 2.135d0, &
+  2.14d0, 2.145d0, 2.15d0, 2.155d0, &
+  2.16d0, 2.165d0, 2.17d0, 2.175d0, &
+  2.18d0, 2.185d0, 2.19d0, 2.195d0, &
+  2.2d0, 2.205d0, 2.21d0, 2.215d0, &
+  2.22d0, 2.225d0, 2.23d0, 2.235d0, &
+  2.24d0, 2.245d0, 2.25d0, 2.55d0, &
+  2.8d0, 3.05d0, 3.3d0, 3.55d0, &
+  3.8d0, 4.05d0, 4.3d0, 4.55d0, &
+  4.8d0, 5.05d0, 5.3d0, 5.55d0, &
+  5.8d0, 6.05d0, 98.2d0, 100000d0]
+real(8), parameter :: mu_vals(468) = [ &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038d0, 1038d0, 1038d0, &
+  1038d0, 1038.47d0, 1039.84d0, 1042.09d0, &
+  1045.17d0, 1049.05d0, 1053.69d0, 1059.06d0, &
+  1065.11d0, 1071.81d0, 1079.12d0, 1087.01d0, &
+  1095.43d0, 1104.36d0, 1113.75d0, 1123.56d0, &
+  1133.77d0, 1144.32d0, 1155.19d0, 1166.34d0, &
+  1177.73d0, 1189.32d0, 1201.08d0, 1212.97d0, &
+  1224.96d0, 1236.99d0, 1249.05d0, 1261.08d0, &
+  1273.06d0, 1284.95d0, 1296.7d0, 1308.29d0, &
+  1319.67d0, 1330.81d0, 1341.67d0, 1352.22d0, &
+  1362.41d0, 1372.21d0, 1381.58d0, 1390.49d0, &
+  1398.9d0, 1407.04d0, 1415.17d0, 1423.28d0, &
+  1431.36d0, 1439.4d0, 1447.4d0, 1455.34d0, &
+  1463.23d0, 1471.04d0, 1478.77d0, 1486.42d0, &
+  1493.98d0, 1501.43d0, 1508.77d0, 1515.99d0, &
+  1523.08d0, 1530.03d0, 1536.84d0, 1543.5d0, &
+  1550d0, 1556.46d0, 1562.98d0, 1569.53d0, &
+  1576.08d0, 1582.57d0, 1588.98d0, 1595.26d0, &
+  1601.38d0, 1607.3d0, 1612.99d0, 1618.4d0, &
+  1623.49d0, 1628.24d0, 1632.6d0, 1636.53d0, &
+  1640d0, 1643.22d0, 1646.44d0, 1649.64d0, &
+  1652.81d0, 1655.93d0, 1659.01d0, 1662.01d0, &
+  1664.94d0, 1667.79d0, 1670.53d0, 1673.16d0, &
+  1675.67d0, 1678.05d0, 1680.28d0, 1682.35d0, &
+  1684.25d0, 1685.97d0, 1687.5d0, 1688.83d0, &
+  1689.94d0, 1690.82d0, 1691.47d0, 1691.87d0, &
+  1692d0, 1691.84d0, 1691.38d0, 1690.61d0, &
+  1689.56d0, 1688.22d0, 1686.6d0, 1684.71d0, &
+  1682.56d0, 1680.16d0, 1677.51d0, 1674.63d0, &
+  1671.51d0, 1668.17d0, 1664.61d0, 1660.85d0, &
+  1656.89d0, 1652.73d0, 1648.4d0, 1643.88d0, &
+  1639.2d0, 1634.35d0, 1629.36d0, 1624.21d0, &
+  1618.93d0, 1613.52d0, 1607.99d0, 1602.34d0, &
+  1596.58d0, 1590.73d0, 1584.79d0, 1578.76d0, &
+  1572.65d0, 1566.48d0, 1560.24d0, 1553.96d0, &
+  1547.62d0, 1541.25d0, 1534.86d0, 1528.44d0, &
+  1522d0, 1515.15d0, 1507.5d0, 1499.07d0, &
+  1489.89d0, 1479.98d0, 1469.37d0, 1458.08d0, &
+  1446.14d0, 1433.56d0, 1420.38d0, 1406.62d0, &
+  1392.3d0, 1377.45d0, 1362.09d0, 1346.25d0, &
+  1329.95d0, 1313.21d0, 1296.07d0, 1278.54d0, &
+  1260.65d0, 1242.43d0, 1223.89d0, 1205.07d0, &
+  1185.98d0, 1166.66d0, 1147.12d0, 1127.4d0, &
+  1107.51d0, 1087.48d0, 1067.33d0, 1047.1d0, &
+  1026.8d0, 1006.45d0, 986.093d0, 965.74d0, &
+  945.419d0, 925.154d0, 904.97d0, 884.891d0, &
+  864.943d0, 845.149d0, 825.534d0, 806.122d0, &
+  786.938d0, 768.007d0, 749.353d0, 731d0, &
+  712.974d0, 695.298d0, 677.997d0, 661.096d0, &
+  644.619d0, 628.59d0, 613.035d0, 597.978d0, &
+  583.442d0, 569.453d0, 556.036d0, 543.214d0, &
+  531.013d0, 519.456d0, 508.569d0, 498.375d0, &
+  488.9d0, 479.838d0, 470.867d0, 461.989d0, &
+  453.205d0, 444.516d0, 435.923d0, 427.427d0, &
+  419.028d0, 410.73d0, 402.531d0, 394.434d0, &
+  386.439d0, 378.547d0, 370.76d0, 363.078d0, &
+  355.503d0, 348.036d0, 340.678d0, 333.429d0, &
+  326.291d0, 319.265d0, 312.352d0, 305.554d0, &
+  298.87d0, 292.302d0, 285.852d0, 279.52d0, &
+  273.308d0, 267.216d0, 261.245d0, 255.397d0, &
+  249.673d0, 244.074d0, 238.6d0, 233.253d0, &
+  228.034d0, 222.944d0, 217.984d0, 213.155d0, &
+  208.458d0, 203.895d0, 199.465d0, 195.172d0, &
+  191.014d0, 186.994d0, 183.113d0, 179.371d0, &
+  175.77d0, 172.255d0, 168.77d0, 165.315d0, &
+  161.892d0, 158.501d0, 155.141d0, 151.814d0, &
+  148.521d0, 145.26d0, 142.034d0, 138.842d0, &
+  135.685d0, 132.563d0, 129.477d0, 126.427d0, &
+  123.413d0, 120.437d0, 117.498d0, 114.598d0, &
+  111.735d0, 108.912d0, 106.128d0, 103.384d0, &
+  100.68d0, 98.0172d0, 95.3953d0, 92.815d0, &
+  90.2769d0, 87.7813d0, 85.3287d0, 82.9195d0, &
+  80.5543d0, 78.2334d0, 75.9574d0, 73.7266d0, &
+  71.5416d0, 69.4027d0, 67.3105d0, 65.2654d0, &
+  63.2678d0, 61.3182d0, 59.4171d0, 57.5649d0, &
+  55.762d0, 54.009d0, 52.3062d0, 50.6541d0, &
+  49.0533d0, 47.504d0, 46.0069d0, 44.5623d0, &
+  43.1706d0, 41.8325d0, 40.5482d0, 39.3183d0, &
+  38.1432d0, 37.0234d0, 35.9593d0, 34.9513d0, &
+  34d0, 33.081d0, 32.1702d0, 31.2683d0, &
+  30.376d0, 29.4941d0, 28.6233d0, 27.7644d0, &
+  26.918d0, 26.0849d0, 25.2659d0, 24.4616d0, &
+  23.6728d0, 22.9003d0, 22.1447d0, 21.4067d0, &
+  20.6872d0, 19.9869d0, 19.3064d0, 18.6466d0, &
+  18.008d0, 17.3916d0, 16.798d0, 16.2279d0, &
+  15.682d0, 15.1612d0, 14.6661d0, 14.1975d0, &
+  13.756d0, 13.3425d0, 12.9576d0, 12.6021d0, &
+  12.2768d0, 11.9823d0, 11.7193d0, 11.4887d0, &
+  11.2911d0, 11.1273d0, 10.998d0, 5.97516d0, &
+  3.86956d0, 3d0, 2.61212d0, 2.34099d0, &
+  2.15675d0, 2.0295d0, 1.92457d0, 1.82822d0, &
+  1.74195d0, 1.66727d0, 1.60572d0, 1.55879d0, &
+  1.52802d0, 1.5149d0, 1.02137d0, 1d0]
+mu_r = linterp(Bpol_vals,mu_vals,SIZE(Bpol_vals),Bpol,1)
+!---Slope of the bracketing segment, found by bisection on the (non-uniformly
+!   spaced) table. Flat outside the tabulated range, matching linterp's clamping.
+IF(PRESENT(dmu_dB))THEN
+  dmu_dB=0.d0
+  IF((Bpol>Bpol_vals(1)).AND.(Bpol<Bpol_vals(SIZE(Bpol_vals))))THEN
+    k_lo=1; k_hi=SIZE(Bpol_vals)
+    DO WHILE(k_hi-k_lo>1)
+      k_mid=(k_lo+k_hi)/2
+      IF(Bpol_vals(k_mid)>Bpol)THEN
+        k_hi=k_mid
+      ELSE
+        k_lo=k_mid
+      END IF
+    END DO
+    dmu_dB=(mu_vals(k_hi)-mu_vals(k_lo))/(Bpol_vals(k_hi)-Bpol_vals(k_lo))
+  END IF
+END IF
+END FUNCTION gs_mu_of_B
+!------------------------------------------------------------------------------
+!> Update the per-cell relative permeability from the local field strength
+!!
+!! Ported from the tMaker_iron branch, with three changes:
+!!  1) mu is evaluated per cell from that cell's own |B_pol|, rather than from a
+!!     single |B_pol| averaged over the whole region. Region averaging is fine for
+!!     a tokamak iron core but washes out the axial variation along a linear
+!!     device, which is exactly the structure of interest there.
+!!  2) The relaxation weight is a parameter instead of a hard-coded 1/5. Damping
+!!     costs one nonlinear iteration per application when this is driven from
+!!     inside a Newton loop, so the right value depends on the caller.
+!!  3) Rebuilding `dels` is optional. `dels` is the un-scaled operator used by
+!!     gs_vacuum_solve; a time-dependent caller applies `vac_op` instead and must
+!!     rebuild that itself, making the `dels` rebuild dead work.
+!!
+!! Only regions with `mag_suscep` set above the -1.d98 sentinel are touched, so
+!! this is a no-op on a device with no magnetic regions.
+!------------------------------------------------------------------------------
+subroutine gs_update_mu(self,relax,rebuild_dels,mu_change,bpol_stats,knee_damp)
+class(gs_equil), intent(inout) :: self !< G-S equilibrium object
+real(r8), optional, intent(in) :: relax !< Weight on the newly computed mu, in (0,1]. 1 (default) is undamped successive substitution; smaller values damp the mu fixed-point iteration at the cost of converging more slowly
+logical, optional, intent(in) :: rebuild_dels !< Rebuild the `dels` operator when done (default true, matching tMaker_iron). Pass false if the caller applies a different operator and rebuilds it itself
+real(r8), optional, intent(out) :: mu_change !< Largest relative change |dmu|/mu over the magnetic cells, for monitoring convergence of the mu iteration
+real(r8), optional, intent(out) :: bpol_stats(4) !< Diagnostic over the magnetic cells: [max |B_pol|, mean |B_pol|, min mu(|B|), mean mu(|B|)]. Reports the field the B-H table is actually being sampled at, which says whether the iron is anywhere near the knee
+logical, optional, intent(in) :: knee_damp !< Damp the relaxation target by 1/(1+|dln(mu)/dln(B)|) so cells past the B-H knee are driven back toward mu=1 instead of tracking mu(|B|). The assembled Jacobian carries no d(mu)/d|B| term, and mu_cell sets how much jac_op^-1 amplifies that omission: below the knee the omitted term is ~0 and tracking mu(|B|) is nearly exact, above it the term is 5-13x the retained one and tracking makes the preconditioner far worse than leaving mu_cell at 1. Default false (track mu(|B|) everywhere)
+type(oft_lag_bginterp), target :: psi_geval
+real(8) :: goptmp(3,4),v,gpsitmp(3),pt(3),ftmp(3)
+real(8) :: Bpol,mu_new,mu_old,wt,max_change
+real(8) :: bmax,bsum,mutab,mutab_min,mutab_sum
+real(8) :: slope,mu_lo,mu_hi,mu_target
+logical :: do_knee
+real(8), parameter :: knee_h=0.05d0   ! relative offset for the log-slope probe
+real(8), parameter :: knee_bmin=1.d-3 ! below this |B| the curve is flat; skip the probe
+integer(4) :: i,nmag
+logical :: do_dels
+type(gs_factory), pointer :: device
+DEBUG_STACK_PUSH
+device=>self%device
+wt=1.d0
+IF(PRESENT(relax))wt=relax
+IF((wt<=0.d0).OR.(wt>1.d0))CALL oft_abort('"relax" must lie in (0,1]','gs_update_mu',__FILE__)
+do_dels=.TRUE.
+IF(PRESENT(rebuild_dels))do_dels=rebuild_dels
+do_knee=.FALSE.
+IF(PRESENT(knee_damp))do_knee=knee_damp
+IF(.NOT.ASSOCIATED(device%mag_suscep))THEN
+  IF(PRESENT(mu_change))mu_change=0.d0
+  DEBUG_STACK_POP
+  RETURN
+END IF
+!---Evaluate |B_pol| at each magnetic cell's centroid and relax mu toward the
+!   table value. B_pol = |grad(psi)|/R, matching the convention used elsewhere.
+psi_geval%u=>self%psi
+CALL psi_geval%setup(device%fe_rep)
+ftmp=1.d0/3.d0
+max_change=0.d0
+bmax=0.d0; bsum=0.d0; nmag=0; mutab_min=1.d99; mutab_sum=0.d0
+!$omp parallel do private(goptmp,v,gpsitmp,pt,Bpol,mu_new,mu_old,mutab, &
+!$omp   slope,mu_lo,mu_hi,mu_target) &
+!$omp   reduction(max:max_change,bmax) reduction(min:mutab_min) &
+!$omp   reduction(+:bsum,nmag,mutab_sum)
+do i=1,device%fe_rep%mesh%nc
+  IF(device%mag_suscep(device%fe_rep%mesh%reg(i))<-1.d98)CYCLE
+  call device%fe_rep%mesh%jacobian(i,ftmp,goptmp,v)
+  call psi_geval%interp(i,ftmp,goptmp,gpsitmp)
+  pt=device%fe_rep%mesh%log2phys(i,ftmp)
+  gpsitmp=gpsitmp*self%psiscale/(pt(1)+gs_epsilon)
+  Bpol=SQRT(SUM(gpsitmp(1:2)**2))
+  mu_old=device%mu_cell(i)
+  mutab=gs_mu_of_B(Bpol)
+  !---Damp the target where the B-H curve is steep (see `knee_damp`)
+  mu_target=mutab
+  IF(do_knee)THEN
+    slope=0.d0
+    IF(Bpol>knee_bmin)THEN
+      mu_lo=gs_mu_of_B(Bpol*(1.d0-knee_h)); mu_hi=gs_mu_of_B(Bpol*(1.d0+knee_h))
+      IF(mu_lo>0.d0.AND.mu_hi>0.d0)slope=ABS(LOG(mu_hi/mu_lo))/(2.d0*knee_h)
+    END IF
+    mu_target=MAX(1.d0, mutab/(1.d0+slope))   ! mu_r < 1 is unphysical
+  END IF
+  mu_new=(1.d0-wt)*mu_old + wt*mu_target
+  device%mu_cell(i)=mu_new
+  max_change=MAX(max_change,ABS(mu_new-mu_old)/mu_old)
+  bmax=MAX(bmax,Bpol); bsum=bsum+Bpol; nmag=nmag+1
+  mutab_min=MIN(mutab_min,mutab); mutab_sum=mutab_sum+mutab
+end do
+CALL psi_geval%delete()
+IF(PRESENT(mu_change))mu_change=max_change
+IF(PRESENT(bpol_stats))THEN
+  IF(nmag>0)THEN
+    bpol_stats=[bmax, bsum/REAL(nmag,8), mutab_min, mutab_sum/REAL(nmag,8)]
+  ELSE
+    bpol_stats=0.d0
+  END IF
+END IF
+!---Rebuild the un-scaled operator, unless the caller owns that
+IF(do_dels)THEN
+  IF(device%free)THEN
+    CALL build_dels(device%dels,device,"free")
+  ELSE
+    CALL build_dels(device%dels,device,"zerob")
+  END IF
+END IF
+DEBUG_STACK_POP
+end subroutine gs_update_mu
 !------------------------------------------------------------------------------
 !> Compute boundary condition matrix for free-boundary case
 !------------------------------------------------------------------------------
