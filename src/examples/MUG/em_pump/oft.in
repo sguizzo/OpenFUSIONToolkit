@@ -13,8 +13,8 @@
 
 &em_pump_options
   order=2
-  n_seg=24
-  n_per_lam=12
+  n_seg=6
+  n_per_lam=3
   nsteps=20
   rst_freq=1
   dt=2.0E-3
@@ -28,9 +28,10 @@
   lin_tol=1.0E-7
   nl_tol=1.0E-6
   v_inlet=1.0
-  wall_region=4
-  iron_region=3
-  coil_reg0=5
+  first_wall_region=5
+  second_wall_region=6
+  iron_region=4
+  coil_reg0=7
   dt_recover=20
   mu_relax=0.0
   mf_b0=1.0E-7

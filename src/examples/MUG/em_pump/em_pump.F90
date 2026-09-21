@@ -66,7 +66,8 @@ REAL(r8) :: v_inlet   = 1.d0       !< Mean axial velocity imposed at the inlet [
 REAL(r8) :: lin_tol   = 1.d-7      !< Linear solver tolerance
 REAL(r8) :: nl_tol    = 1.d-6      !< Nonlinear solver tolerance
 REAL(r8) :: mu_relax  = 0.5d0      !< Relaxation weight for the cached iron permeability
-INTEGER(i4) :: wall_region = 4     !< Mesh region of the duct wall
+INTEGER(i4) :: first_wall_region = 4     !< Mesh region of the duct wall
+INTEGER(i4) :: second_wall_region = 6    !
 INTEGER(i4) :: iron_region = 3     !< Mesh region of the iron yoke
 INTEGER(i4) :: coil_reg0   = 5     !< Mesh region of coil segment 0; segments are contiguous
 INTEGER(i4) :: dt_recover  = 20    !< Clean steps before dt is doubled back toward its namelist value (0 disables)
@@ -76,7 +77,7 @@ LOGICAL :: mu_knee_damp = .FALSE.   !< Damp the mu relaxation target where the B
 LOGICAL :: solver_pm = .FALSE.      !< Print the nonlinear and linear solver convergence history (diagnostic; very verbose)
 NAMELIST/em_pump_options/order,n_seg,n_per_lam,nsteps,rst_freq,dt,freq,I0,ramp_time, &
   rho_fluid,eta_fluid,eta_wall,nu_fluid,v_inlet,lin_tol,nl_tol, &
-  mu_relax,wall_region,iron_region,coil_reg0,dt_recover,flow_on,mf_b0,solver_pm, &
+  mu_relax,first_wall_region,second_wall_region,iron_region,coil_reg0,dt_recover,flow_on,mf_b0,solver_pm, &
   mu_knee_damp,mu_jac_deriv
 
 !==============================================================================
@@ -149,9 +150,11 @@ machine%ncoil_regs = 0
 machine%ncoils = 0
 ALLOCATE(machine%coil_regions(0))
 machine%ncond_regs = 1
-ALLOCATE(machine%cond_regions(1))
-machine%cond_regions(1)%id = wall_region
+ALLOCATE(machine%cond_regions(2))
+machine%cond_regions(1)%id = first_wall_region
 machine%cond_regions(1)%eta = eta_wall/mu0
+machine%cond_regions(2)%id = second_wall_region
+machine%cond_regions(2)%eta = eta_wall/mu0
 CALL gs_setup_walls(machine)
 ALLOCATE(machine%coil_nturns(nreg,0))
 
@@ -229,7 +232,8 @@ mhd_flag = .FALSE.  ; mhd_flag(1) = .TRUE.
 dens_reg = -1.d0    ; dens_reg(1) = rho_fluid
 visc_reg = -1.d0    ; visc_reg(1) = nu_fluid
 eta_reg  = -1.d0    ; eta_reg(1,:) = eta_fluid/mu0
-eta_reg(wall_region,:) = eta_wall/mu0   ! not MHD, but add_f_terms wants a real eta
+eta_reg(first_wall_region,:) = eta_wall/mu0   ! not MHD, but add_f_terms wants a real eta
+eta_reg(second_wall_region,:) = eta_wall/mu0   ! not MHD, but add_f_terms wants a real eta
 
 lambda = REAL(n_per_lam,8)*seg_pitch
 v_sync = lambda*freq
