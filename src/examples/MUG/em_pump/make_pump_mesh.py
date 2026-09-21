@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Build the cylindrical-duct induction pump mesh for the MUG em_pump driver.
 
 Edit the INPUTS block below and run:  python3 make_pump_mesh.py
@@ -16,21 +15,23 @@ import numpy as np
 # =============================================================================
 
 # --- Radii [m], inside to out ------------------------------------------------
-pipe_rout     = 0.040   # fluid radius, i.e. the duct bore (80 mm diameter)
-wall_rout     = 0.045   # duct wall outer radius
-coil_rin      = 0.055   # winding inner radius
-coil_rout     = 0.105   # winding outer radius
-yoke_rout     = 0.155   # stator outer radius; the iron runs in from here to coil_rin
+pipe_rout           = 0.040   # fluid radius, i.e. the duct bore (80 mm diameter)
+first_wall_rout     = 0.050   # duct wall outer radius
+second_wall_rin     = 0.060   # 'tube inside' inner radius (I believe this is to keep LN2 out?)
+second_wall_rout    = 0.070   # 'tube inside' outer radius
+coil_rin            = 0.075   # winding inner radius
+coil_rout           = 0.125   # winding outer radius
+yoke_rout           = 0.175   # stator outer radius; the iron runs in from here to coil_rin
 
 # --- Axial extents [m] -------------------------------------------------------
-chan_len      = 0.72    # full duct length; runs past the pump section at both ends
+chan_len      = 0.95    # full duct length; runs past the pump section at both ends
                         # so the outflow boundary is clear of the driven region
-pump_len      = 0.72    # axial length of the coil stack, i.e. the active pump section
-iron_len      = 0.72    # axial length of the stator; >= pump_len, the excess becoming end teeth
+pump_len      = 0.95    # axial length of the coil stack, i.e. the active pump section
+iron_len      = 0.95    # axial length of the stator; >= pump_len, the excess becoming end teeth
 
 # --- Winding -----------------------------------------------------------------
-n_seg         = 24      # number of coil segments
-seg_gap       = 0.010   # insulating gap between adjacent segments; this IS the stator tooth width
+n_seg         = 6      # number of coil segments
+seg_gap       = 0.050   # insulating gap between adjacent segments; this IS the stator tooth width
                         # (tooth = seg_pitch - seg_h).  5 mm teeth saturate to mu_r ~ 10 at I0 = 4e4
 
 # --- Materials ---------------------------------------------------------------
@@ -38,10 +39,11 @@ eta_wall      = 1.2e-6  # duct wall resistivity [Ohm-m]; 316 stainless-ish
 
 # --- Mesh resolution [m] -----------------------------------------------------
 fluid_dx      = 0.010   # channel
-wall_dx       = 0.015   # duct wall
+wall_dx       = 0.007   # duct wall
 coil_dx       = 0.024   # coils
 iron_dx       = 0.016   # iron; must resolve the tooth, so keep it below seg_gap
-vac_dx        = 0.040   # vacuum
+vac_dx        = 0.024   # vacuum
+airgap_dx     = 0.007   # airgap
 
 # --- Output ------------------------------------------------------------------
 mesh_file     = "pump_mesh_native.h5"   # OFT native format, what the Fortran driver reads
@@ -51,7 +53,7 @@ show_plots    = True                    # draw the topology and the finished mes
 # =============================================================================
 # SETUP
 # =============================================================================
-
+os.environ["OFT_ROOTPATH"] = '/Users/eleanorwinkler/Documents/Lab_Computational_Work/OpenFUSIONToolkit/install_release'
 tokamaker_python_path = os.getenv('OFT_ROOTPATH')
 if tokamaker_python_path is not None:
     sys.path.append(os.path.join(tokamaker_python_path,'python'))
@@ -59,9 +61,9 @@ if tokamaker_python_path is not None:
 from OpenFUSIONToolkit.TokaMaker.meshing import gs_Domain
 from OpenFUSIONToolkit.util import write_native_mesh
 
-if not (0.0 < pipe_rout < wall_rout <= coil_rin < coil_rout < yoke_rout):
+if not (0.0 < pipe_rout < first_wall_rout <= second_wall_rin < second_wall_rout <= coil_rin < coil_rout < yoke_rout):
     raise SystemExit(
-        "radii must increase: 0 < pipe_rout < wall_rout <= coil_rin < coil_rout < yoke_rout"
+        "radii must increase: 0 < pipe_rout < first_wall_rout <= second_wall_rin < second_wall_rout <= coil_rin < coil_rout < yoke_rout"
     )
 if iron_len < pump_len:
     raise SystemExit("iron_len must be at least pump_len, or the end coils fall outside the iron")
@@ -83,7 +85,9 @@ gs_mesh = gs_Domain()
 
 gs_mesh.define_region("air", vac_dx, "boundary")
 gs_mesh.define_region("channel", fluid_dx, "plasma")
-gs_mesh.define_region("wall", wall_dx, "conductor", eta=eta_wall)
+gs_mesh.define_region("first_wall", wall_dx, "conductor", eta=eta_wall)
+gs_mesh.define_region("air_gap", airgap_dx, "vacuum")
+gs_mesh.define_region("second_wall", wall_dx, "conductor", eta=eta_wall)
 for k in range(n_seg):
     gs_mesh.define_region(f"coil_{k:02d}", coil_dx, "coil")
 gs_mesh.define_region("iron_yoke", iron_dx, "vacuum")
@@ -93,9 +97,20 @@ gs_mesh.define_region("iron_yoke", iron_dx, "vacuum")
 gs_mesh.add_rectangle(pipe_rout / 2.0, 0.0, pipe_rout, chan_len,
                       "channel", parent_name="air")
 # Duct wall
-gs_mesh.add_rectangle(0.5 * (pipe_rout + wall_rout), 0.0,
-                      wall_rout - pipe_rout, chan_len,
-                      "wall", parent_name="air")
+gs_mesh.add_rectangle(0.5 * (pipe_rout + first_wall_rout), 0.0,
+                      first_wall_rout - pipe_rout, chan_len,
+                      "first_wall", parent_name="air")
+
+#airgap
+gs_mesh.add_rectangle(0.5 * (first_wall_rout + second_wall_rin), 0.0,
+                      second_wall_rin - first_wall_rout, chan_len,
+                      "air_gap", parent_name="air")
+
+# Second wall
+gs_mesh.add_rectangle(0.5 * (second_wall_rin + second_wall_rout), 0.0,
+                      second_wall_rout - second_wall_rin, chan_len,
+                      "second_wall", parent_name="air")
+
 # Stator iron: one comb-shaped region, back iron plus the teeth between coils,
 # with the coil slots cut out and left open to the air gap. Drawn as an explicit
 # contour rather than a rectangle so that every coil corner is already a vertex
@@ -165,5 +180,6 @@ for name, rid in sorted(ids.items(), key=lambda kv: kv[1]):
     if not name.startswith("COIL_"):
         print(f"  {rid:3d}  {name}")
 print(f"  {ids['COIL_00']:3d} .. {ids[f'COIL_{n_seg-1:02d}']:<3d}  COIL_00 .. COIL_{n_seg-1:02d}")
-print(f"\n&em_pump_options:  wall_region={ids['WALL']}  iron_region={ids['IRON_YOKE']}"
+print(f"\n&em_pump_options:  first_wall_region={ids['FIRST_WALL']} air_gap_region={ids['AIR_GAP']} second_wall_region={ids['SECOND_WALL']}  iron_region={ids['IRON_YOKE']}"
       f"  coil_reg0={ids['COIL_00']}  n_seg={n_seg}  pump_len={pump_len}  chan_zmax={chan_len/2}")
+
