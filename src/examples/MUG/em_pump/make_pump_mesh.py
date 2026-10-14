@@ -14,14 +14,20 @@ import numpy as np
 # INPUTS
 # =============================================================================
 
+
 # --- Radii [m], inside to out ------------------------------------------------
-pipe_rout           = 0.040   # fluid radius, i.e. the duct bore (80 mm diameter)
-first_wall_rout     = 0.050   # duct wall outer radius
-second_wall_rin     = 0.060   # 'tube inside' inner radius (I believe this is to keep LN2 out?)
-second_wall_rout    = 0.070   # 'tube inside' outer radius
-coil_rin            = 0.075   # winding inner radius
-coil_rout           = 0.125   # winding outer radius
-yoke_rout           = 0.175   # stator outer radius; the iron runs in from here to coil_rin
+iron_core_rout      = float(sys.argv[2])*1e-3 if len(sys.argv) > 2 else 0
+print(f"Making mesh with an iron core of radius {iron_core_rout}")
+iron_core_wall_rout = 0 if not iron_core_rout else iron_core_rout + 0.010 
+fluid_rad_thickness = float(sys.argv[1])*1e-3 if len(sys.argv) > 1 else 0.040             # fluid radius, i.e. the duct bore (defaults to 80 mm diameter)
+fluid_rout          = fluid_rad_thickness + iron_core_wall_rout
+print (f"making mesh with a fluid thickness/radius of {fluid_rad_thickness}")
+first_wall_rout     = 0.010 + fluid_rout # duct wall outer radius
+second_wall_rin     = 0.020 + fluid_rout # 'tube inside' inner radius (I believe this is to keep LN2 out?)
+second_wall_rout    = 0.030 + fluid_rout # 'tube inside' outer radius
+coil_rin            = 0.035 + fluid_rout # winding inner radius
+coil_rout           = 0.085 + fluid_rout # winding outer radius
+yoke_rout           = 0.135 + fluid_rout # stator outer radius; the iron runs in from here to coil_rin
 
 # --- Axial extents [m] -------------------------------------------------------
 chan_len      = 0.95    # full duct length; runs past the pump section at both ends
@@ -38,7 +44,7 @@ seg_gap       = 0.050   # insulating gap between adjacent segments; this IS the 
 eta_wall      = 1.2e-6  # duct wall resistivity [Ohm-m]; 316 stainless-ish
 
 # --- Mesh resolution [m] -----------------------------------------------------
-fluid_dx      = 0.010   # channel
+fluid_dx      = fluid_rad_thickness/4   # channel
 wall_dx       = 0.007   # duct wall
 coil_dx       = 0.024   # coils
 iron_dx       = 0.016   # iron; must resolve the tooth, so keep it below seg_gap
@@ -61,9 +67,9 @@ if tokamaker_python_path is not None:
 from OpenFUSIONToolkit.TokaMaker.meshing import gs_Domain
 from OpenFUSIONToolkit.util import write_native_mesh
 
-if not (0.0 < pipe_rout < first_wall_rout <= second_wall_rin < second_wall_rout <= coil_rin < coil_rout < yoke_rout):
+if not (0.0 < fluid_rad_thickness < first_wall_rout <= second_wall_rin < second_wall_rout <= coil_rin < coil_rout < yoke_rout):
     raise SystemExit(
-        "radii must increase: 0 < pipe_rout < first_wall_rout <= second_wall_rin < second_wall_rout <= coil_rin < coil_rout < yoke_rout"
+        "radii must increase: 0 < fluid_rad_thickness < first_wall_rout <= second_wall_rin < second_wall_rout <= coil_rin < coil_rout < yoke_rout"
     )
 if iron_len < pump_len:
     raise SystemExit("iron_len must be at least pump_len, or the end coils fall outside the iron")
@@ -92,13 +98,28 @@ for k in range(n_seg):
     gs_mesh.define_region(f"coil_{k:02d}", coil_dx, "coil")
 gs_mesh.define_region("iron_yoke", iron_dx, "vacuum")
 
-# Fluid.  A solid cylinder on the axis: R in [0, pipe_rout], so its centre is
-# pipe_rout/2 and its width is pipe_rout.
-gs_mesh.add_rectangle(pipe_rout / 2.0, 0.0, pipe_rout, chan_len,
-                      "channel", parent_name="air")
+if iron_core_rout:
+    print("There's an iron core")
+    gs_mesh.define_region("iron_core", iron_dx, "vacuum")
+    gs_mesh.define_region("inner_wall", wall_dx, "conductor", eta=eta_wall)
+
+    gs_mesh.add_rectangle(iron_core_rout / 2.0, 0.0, iron_core_rout, chan_len, 
+                          "iron_core", parent_name="air")
+    gs_mesh.add_rectangle(0.5 * (iron_core_rout + iron_core_wall_rout), 0.0, 
+                          iron_core_wall_rout - iron_core_rout, chan_len,
+                          "inner_wall", parent_name="air")
+    gs_mesh.add_rectangle(0.5 * (fluid_rout + iron_core_wall_rout), 0.0,
+                          fluid_rout - iron_core_wall_rout, chan_len,
+                          "channel", parent_name="air")
+
+else: 
+    # Fluid.  A solid cylinder on the axis: R in [0, fluid_rad_thickness], so its centre is
+    # fluid_rad_thickness/2 and its width is fluid_rad_thickness.
+    gs_mesh.add_rectangle(fluid_rout / 2.0, 0.0, fluid_rout, chan_len,
+                        "channel", parent_name="air")
 # Duct wall
-gs_mesh.add_rectangle(0.5 * (pipe_rout + first_wall_rout), 0.0,
-                      first_wall_rout - pipe_rout, chan_len,
+gs_mesh.add_rectangle(0.5 * (fluid_rout + first_wall_rout), 0.0,
+                      first_wall_rout - fluid_rout, chan_len,
                       "first_wall", parent_name="air")
 
 #airgap

@@ -66,9 +66,10 @@ REAL(r8) :: v_inlet   = 1.d0       !< Mean axial velocity imposed at the inlet [
 REAL(r8) :: lin_tol   = 1.d-7      !< Linear solver tolerance
 REAL(r8) :: nl_tol    = 1.d-6      !< Nonlinear solver tolerance
 REAL(r8) :: mu_relax  = 0.5d0      !< Relaxation weight for the cached iron permeability
-INTEGER(i4) :: first_wall_region = 4     !< Mesh region of the duct wall
+INTEGER(i4) :: first_wall_region = 5     !< Mesh region of the duct wall
 INTEGER(i4) :: second_wall_region = 6    !
-INTEGER(i4) :: iron_region = 3     !< Mesh region of the iron yoke
+INTEGER(i4) :: iron_region = 4     !< Mesh region of the iron yoke/stator
+INTEGER(i4) :: iron_core_region = 0!< Mesh region of the iron core; if this is zero, then there is no iron core region 
 INTEGER(i4) :: coil_reg0   = 5     !< Mesh region of coil segment 0; segments are contiguous
 INTEGER(i4) :: dt_recover  = 20    !< Clean steps before dt is doubled back toward its namelist value (0 disables)
 LOGICAL :: flow_on = .TRUE.        !< Solve the flow. .FALSE. freezes velocity and pressure at zero everywhere, leaving only the electromagnetics: the fluid still carries eddy currents, so this computes the induced currents in every component with no flow physics in the loop
@@ -77,7 +78,7 @@ LOGICAL :: mu_knee_damp = .FALSE.   !< Damp the mu relaxation target where the B
 LOGICAL :: solver_pm = .FALSE.      !< Print the nonlinear and linear solver convergence history (diagnostic; very verbose)
 NAMELIST/em_pump_options/order,n_seg,n_per_lam,nsteps,rst_freq,dt,freq,I0,ramp_time, &
   rho_fluid,eta_fluid,eta_wall,nu_fluid,v_inlet,lin_tol,nl_tol, &
-  mu_relax,first_wall_region,second_wall_region,iron_region,coil_reg0,dt_recover,flow_on,mf_b0,solver_pm, &
+  mu_relax,first_wall_region,second_wall_region,iron_region,iron_core_region,coil_reg0,dt_recover,flow_on,mf_b0,solver_pm, &
   mu_knee_damp,mu_jac_deriv
 
 !==============================================================================
@@ -150,18 +151,34 @@ machine%ncoil_regs = 0
 machine%ncoils = 0
 ALLOCATE(machine%coil_regions(0))
 machine%ncond_regs = 1
-ALLOCATE(machine%cond_regions(2))
-machine%cond_regions(1)%id = first_wall_region
-machine%cond_regions(1)%eta = eta_wall/mu0
-machine%cond_regions(2)%id = second_wall_region
-machine%cond_regions(2)%eta = eta_wall/mu0
-CALL gs_setup_walls(machine)
+! ALLOCATE(machine%cond_regions(2))
+! machine%cond_regions(1)%id = first_wall_region
+! machine%cond_regions(1)%eta = eta_wall/mu0
+! machine%cond_regions(2)%id = second_wall_region
+! machine%cond_regions(2)%eta = eta_wall/mu0
+! CALL gs_setup_walls(machine)
 ALLOCATE(machine%coil_nturns(nreg,0))
 
 !---Give the yoke nonlinear-permeability. mag_suscep defaults to
 !   "not magnetic" (0) everywhere. The value set here is only a flag, since
 !   mu itself comes from the B-H table inside gs_update_mu.
-machine%mag_suscep(iron_region) = 1.d0
+machine%mag_suscep(iron_region) = 1.d0 !can turn this to zero to turn off iron
+
+IF (iron_core_region /= 0) THEN
+  machine%mag_suscep(iron_core_region) = 1.d0 
+  ALLOCATE(machine%cond_regions(3))
+  machine%cond_regions(3)%id = iron_core_region + 1 !< Assume that the wall surrounding the iron core is the next region
+  machine%cond_regions(3)%eta = eta_wall/mu0
+ELSE
+  ALLOCATE(machine%cond_regions(2))
+END IF
+
+machine%cond_regions(1)%id = first_wall_region
+machine%cond_regions(1)%eta = eta_wall/mu0
+machine%cond_regions(2)%id = second_wall_region
+machine%cond_regions(2)%eta = eta_wall/mu0
+CALL gs_setup_walls(machine)
+
 
 !---Suppress the O-/X-point search, which is not necessary without a plasma
 !---and is computationally expensive
