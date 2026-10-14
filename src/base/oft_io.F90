@@ -648,6 +648,34 @@ call h5close_f(error)
 DEBUG_STACK_POP
 end subroutine hdf5_field_get_sizes
 !------------------------------------------------------------------------------
+!> Get the names of the immediate child members of a HDF5 group
+!------------------------------------------------------------------------------
+subroutine hdf5_get_group_members(filepath,path,names)
+character(LEN=*), intent(in) :: filepath !< Path to file
+character(LEN=*), intent(in) :: path !< Path of group in file
+character(LEN=80), allocatable, dimension(:), intent(out) :: names !< Names of group members
+integer(4) :: error,i,nmembers,obj_type
+integer(HID_T) :: file_id
+DEBUG_STACK_PUSH
+!---Initialize HDF5 and open file
+call h5open_f(error)
+call h5fopen_f(TRIM(filepath), H5F_ACC_RDONLY_F, file_id, error)
+IF(error/=0)CALL oft_abort('Error opening file','hdf5_get_group_members',__FILE__)
+!---Get number of members and their names
+CALL h5gn_members_f(file_id, "/"//TRIM(path), nmembers, error)
+IF(error/=0)CALL oft_abort('Error reading group size','hdf5_get_group_members',__FILE__)
+ALLOCATE(names(nmembers))
+DO i=1,nmembers
+  names(i)=''
+  CALL h5gget_obj_info_idx_f(file_id, "/"//TRIM(path), i-1, names(i), obj_type, error)
+  IF(error/=0)CALL oft_abort('Error reading group member name','hdf5_get_group_members',__FILE__)
+END DO
+!---Close file and finalize HDF5
+call h5fclose_f(file_id, error)
+call h5close_f(error)
+DEBUG_STACK_POP
+end subroutine hdf5_get_group_members
+!------------------------------------------------------------------------------
 !> Create an empty HDF5 output file
 !------------------------------------------------------------------------------
 subroutine hdf5_create_file(filename,persistent_space_tracking)

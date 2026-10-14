@@ -67,6 +67,21 @@ ABSTRACT INTERFACE
 END INTERFACE
 
 !------------------------------------------------------------------------------
+!> Interface for an optional closure that tests whether the temperature sink
+!! term (T_sink/tau_sink) should be applied at a point, evaluated pointwise at
+!! each quadrature point (like xmhd_2d_temp_func). When not supplied, the sink
+!! term is never applied.
+!------------------------------------------------------------------------------
+ABSTRACT INTERFACE
+  FUNCTION xmhd_2d_sink_func(coords, psi) RESULT(apply_sink)
+    IMPORT :: r8
+    REAL(r8), INTENT(in) :: coords(3) !< Physical coordinates (R, phi, Z)
+    REAL(r8), INTENT(in) :: psi       !< Total poloidal flux at the point
+    LOGICAL :: apply_sink             !< True if the sink term should be applied at this point
+  END FUNCTION xmhd_2d_sink_func
+END INTERFACE
+
+!------------------------------------------------------------------------------
 !> Object to compute left-hand side of system for nonlinear solves
 !------------------------------------------------------------------------------
 TYPE, extends(oft_noop_matrix) :: xmhd_2d_nlfun
@@ -96,6 +111,8 @@ TYPE, public :: oft_xmhd_2d_sim
   LOGICAL :: cyl_flag = .FALSE. !Use cylindrical coordinates
   LOGICAL :: incomp = .FALSE. !Run incompressible MHD?
   LOGICAL :: linear = .FALSE. !Run sim. in linear mode
+  LOGICAL :: drop_convection = .FALSE. !< Drop the convective derivative (v.grad(v)) term from the momentum equation. Default off (full nonlinear momentum equation)
+  LOGICAL :: evolve_pressure = .FALSE. !< Add -(T/n)*D_diff*lap(n)/(gamma-1) to the temperature equation so that density diffusion conserves pressure (p=nT) instead of acting as a source/sink of pressure. Default off
   LOGICAL :: timestep_cn = .FALSE. ! Use Crank-Nicolson timestep
   INTEGER(i4) :: nsteps = -1 !< # of timesteps
   INTEGER(i4) :: rst_base = 0 !< starting index of restart files
@@ -103,18 +120,26 @@ TYPE, public :: oft_xmhd_2d_sim
   INTEGER(i4) :: pre_freq = 1 !< frequency to update preconditioner
   INTEGER(i4) :: ittarget = 40 !< Needs docs
   REAL(r8) :: dt = -1.d0 !< timestep
-  REAL(r8) :: jac_dt = -1.d0 !< timestep for computing approximate jacobian
+  REAL(r8) :: jac_dt = -1.d0 !< timestep for computing  approximate jacobian
   REAL(r8) :: t = 0.d0 !< current time
-  REAL(r8), ALLOCATABLE :: chi(:) !< thermal diffusivity, by region
-  REAL(r8), ALLOCATABLE :: nu(:) !< kinematic viscosity [m^2/s], by region
+  REAL(r8), ALLOCATABLE :: chi(:) !< thermal diffusivity, by region. When chi_aniso=.FALSE. this is the (isotropic) diffusivity; when .TRUE. it is the cross-field (perpendicular) diffusivity
+  REAL(r8), ALLOCATABLE :: kappa(:) !< Optional thermal conductivity kappa=chi*n [1/(m s)], by region. If allocated, it is used in place of chi(:), with chi=kappa/n evaluated pointwise (cross-field value when chi_aniso=.TRUE.)
+  LOGICAL :: chi_aniso = .FALSE. !< If true, use anisotropic thermal conduction: chi(:) is the cross-field diffusivity and the field-aligned diffusivity is chi(:)*chi_par_mult (default false: isotropic, using chi(:) in all directions)
+  REAL(r8) :: chi_par_mult = 1.d5 !< Ratio of field-aligned to cross-field thermal diffusivity when chi_aniso=.TRUE.
+  REAL(r8), ALLOCATABLE :: nu(:) !< kinematic viscosity [m^2/s], by region. This is the TOTAL viscosity nu1+nu2 (see nu2_ratio); the momentum equation uses nu1=nu/(1+nu2_ratio) as the shear (grad^2) coefficient and nu2=nu1*nu2_ratio as the bulk (grad(div)) coefficient
+  REAL(r8) :: nu2_ratio = 0.d0 !< Ratio nu2/nu1 of bulk (compressive) to shear kinematic viscosity. Adds a -nu2*grad(div(v)) bulk-viscosity term to the momentum equation, damping compressive motion independently of shear (nu1). Default 0 recovers the original pure-shear (grad^2) viscosity exactly, with nu1=nu(:)
   REAL(r8), ALLOCATABLE :: gamma(:) !< adiabatic index, by region, by region
   REAL(r8), ALLOCATABLE :: D_diff(:) !< diffusivity, by region
   REAL(r8) :: k_boltz = elec_charge !< Boltzmann constant (use elec_charge for T in eV)
   REAL(r8) :: den_scale = 1.d19 !< scale factor used to normalize density
   PROCEDURE(xmhd_2d_temp_func), POINTER, NOPASS :: T_func => NULL() !< Optional closure giving T (and dT) as a function of the local fields; when associated (compressible only), T is evaluated from this instead of from its own DOFs
+  PROCEDURE(xmhd_2d_sink_func), POINTER, NOPASS :: sink_func => NULL() !< Optional closure testing whether the temperature sink term should be applied at a point; evaluated pointwise at each quadrature point (compressible only)
+  REAL(r8) :: T_sink = -1.d0 !< Temperature the sink term relaxes towards where `sink_func` returns true, dT/dt = -(T-T_sink)/tau_sink. Only meaningful when `tau_sink>0`
+  REAL(r8) :: tau_sink = -1.d0 !< Relaxation timescale for the temperature sink term. The sink term is disabled unless explicitly set to a positive value
   LOGICAL :: use_spitzer = .FALSE. !< If true (compressible only), override the region eta with Spitzer resistivity eta(n,T) at each quadrature point
   CLASS(oft_vector), POINTER :: T_eta => NULL() !< Snapshot of the temperature field used to evaluate the Spitzer resistivity when T is evolved. Frozen once per timestep by `xmhd_2d_freeze_eta_temp` so that eta is identical in the RHS (dt=0) and LHS (dt>0) evaluations of the residual; see that routine for why this matters
-  LOGICAL :: T_eta_valid = .FALSE. !< True once `T_eta` holds a valid temperature snapshot
+  CLASS(oft_vector), POINTER :: n_eta => NULL() !< Snapshot of the (normalized) density field used with `T_eta` for the Spitzer resistivity; frozen alongside it by `xmhd_2d_freeze_eta_temp`
+  LOGICAL :: T_eta_valid = .FALSE. !< True once `T_eta` (and `n_eta`) hold a valid snapshot
   REAL(r8), ALLOCATABLE :: m_i(:) !< ion mass, by region
   REAL(r8), ALLOCATABLE :: eta(:, :) !< electrical resistivity, in units of mu0, by region. First column is in plane, second column is out of plane (for anisotropic resistivity)
   LOGICAL, ALLOCATABLE :: ignore_rmask(:) !< Mask for regions to ignore when populating physics (defaults to false)
@@ -770,15 +795,17 @@ class(xmhd_2d_nlfun), intent(inout) :: self !< NL function object
 class(oft_vector), target, intent(inout) :: a !< Source field
 class(oft_vector), intent(inout) :: b !< Result of metric function
 type(oft_quad_type), pointer :: quad
-LOGICAL :: linear,cyl_flag, incomp, eta_lag
+LOGICAL :: linear,cyl_flag, incomp, eta_lag, use_kappa
 INTEGER(i4) :: i,l
 REAL(r8) :: k_boltz = elec_charge
 REAL(r8) :: m_i=proton_mass
-REAL(r8) :: chi, eta(2), nu, D_diff, gamma, diag_vals(5), B_0(3), diag_vec(3)
+REAL(r8) :: chi, eta(2), nu, nu1, nu2, D_diff, gamma, diag_vals(5), B_0(3), diag_vec(3)
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights,psi_weights,by_weights, T_res, &
                               n_res, psi_res, by_res, vtmp, velx_res, vely_res, velz_res
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
-REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights, T_eta_weights
+REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights, T_eta_weights, n_eta_weights
+REAL(r8) :: convect_fac !< Zeroes the convective derivative term below when parent_sim%drop_convection=.TRUE.
+REAL(r8) :: pres_fac !< Enables the pressure-conserving density diffusion term in the temperature equation when parent_sim%evolve_pressure=.TRUE.
 quad=>oft_blagrange%quad
 NULLIFY(n_weights, vel_weights, T_weights, psi_weights, by_weights, &
 n_res, velx_res, vely_res, velz_res, T_res, psi_res, by_res)
@@ -802,12 +829,16 @@ CALL self%parent_sim%psi_vac%get_local(psi_vac_weights)
 B_0 = self%parent_sim%B_0
 cyl_flag = self%parent_sim%cyl_flag
 incomp = self%parent_sim%incomp
+use_kappa = ALLOCATED(self%parent_sim%kappa)
+convect_fac = MERGE(0.d0, 1.d0, self%parent_sim%drop_convection)
+pres_fac = MERGE(1.d0, 0.d0, self%parent_sim%evolve_pressure)
 !---When T is evolved, Spitzer eta is evaluated from the frozen temperature
 !   snapshot rather than the current iterate (see xmhd_2d_freeze_eta_temp)
-NULLIFY(T_eta_weights)
+NULLIFY(T_eta_weights, n_eta_weights)
 eta_lag = self%parent_sim%use_spitzer .AND. (.NOT.incomp) &
           .AND. (.NOT.ASSOCIATED(self%parent_sim%T_func)) .AND. self%parent_sim%T_eta_valid
 IF(eta_lag)CALL self%parent_sim%T_eta%get_local(T_eta_weights)
+IF(eta_lag)CALL self%parent_sim%n_eta%get_local(n_eta_weights)
 
 !---Zero result and get storage array
 CALL b%set(0.d0)
@@ -825,16 +856,17 @@ BLOCK
 LOGICAL :: curved
 INTEGER(i4) :: k,m,jr
 INTEGER(i4), ALLOCATABLE, DIMENSION(:) :: cell_dofs, cell_dofs_p
-REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dpsi_0(3),dby(3),T_eta_val
-REAL(r8) :: dvel(3,3),div_vel,jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),coords(3)
+REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dpsi_0(3),dby(3),T_eta_val,n_eta_val
+REAL(r8) :: dvel(3,3),div_vel,jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),coords(3),kappa_T(3,3)
+REAL(r8) :: sink_term
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals,basis_vals_p,T_weights_loc,n_weights_loc,psi_weights_loc,by_weights_loc
-REAL(r8), ALLOCATABLE, DIMENSION(:) :: T_eta_loc
+REAL(r8), ALLOCATABLE, DIMENSION(:) :: T_eta_loc, n_eta_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grads_p, res_loc
 !$omp parallel private(k,m,jr,curved,coords,cell_dofs,cell_dofs_p,basis_vals,basis_grads, basis_vals_p, basis_grads_p, T_weights_loc, &
 !$omp n_weights_loc,psi_weights_loc, by_weights_loc,vel_weights_loc,res_loc,jac_mat, &
-!$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dpsi_0,dby,dvel,div_vel,btmp, tmp1, &
-!$omp T_eta_loc,T_eta_val, &
-!$omp chi, m_i, eta, nu, gamma, D_diff) reduction(+:diag_vals)
+!$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dpsi_0,dby,dvel,div_vel,btmp, tmp1, kappa_T, &
+!$omp T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, &
+!$omp chi, m_i, eta, nu, nu1, nu2, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 ALLOCATE(n_weights_loc(oft_blagrange%nce),&
         psi_weights_loc(oft_blagrange%nce), by_weights_loc(oft_blagrange%nce),&
@@ -844,7 +876,7 @@ IF (incomp) THEN
 ELSE
   ALLOCATE(T_weights_loc(oft_blagrange%nce))
 END IF
-IF (eta_lag) ALLOCATE(T_eta_loc(oft_blagrange%nce))
+IF (eta_lag) ALLOCATE(T_eta_loc(oft_blagrange%nce), n_eta_loc(oft_blagrange%nce))
 ALLOCATE(cell_dofs(oft_blagrange%nce), res_loc(oft_blagrange%nce,7))
 IF (incomp) ALLOCATE(basis_vals_p(oft_blagrange_p%nce), basis_grads_p(3,oft_blagrange_p%nce), cell_dofs_p(oft_blagrange_p%nce))
 !$omp do ordered
@@ -864,12 +896,15 @@ DO i=1,mesh%nc
   psi_weights_loc = psi_weights(cell_dofs) + psi_vac_weights(cell_dofs)
   by_weights_loc = by_weights(cell_dofs)
   IF (eta_lag) T_eta_loc = T_eta_weights(cell_dofs)
+  IF (eta_lag) n_eta_loc = n_eta_weights(cell_dofs)
 
   !Set material properties
   chi = self%parent_sim%chi(mesh%reg(i))
   m_i = self%parent_sim%m_i(mesh%reg(i))
   eta = self%parent_sim%eta(mesh%reg(i), :)
   nu = self%parent_sim%nu(mesh%reg(i))
+  nu1 = nu/(1.d0+self%parent_sim%nu2_ratio) !< Shear viscosity (grad^2 term)
+  nu2 = nu1*self%parent_sim%nu2_ratio !< Bulk viscosity (grad(div) term), 0 by default
   gamma = self%parent_sim%gamma(mesh%reg(i))
   D_diff = self%parent_sim%D_diff(mesh%reg(i))
   !---------------------------------------------------------------------------
@@ -936,17 +971,27 @@ DO i=1,mesh%nc
     IF ((.NOT.incomp) .AND. ASSOCIATED(self%parent_sim%T_func)) THEN
       CALL self%parent_sim%T_func(coords, n, dn, psi, dpsi, by, dby, T, dT)
     END IF
+    !---Temperature sink term dT/dt = -(T-T_sink)/tau_sink, active where
+    !   sink_func returns true at this point. Disabled unless tau_sink has
+    !   been set to a positive value.
+    sink_term = 0.d0
+    IF ((.NOT.incomp) .AND. (self%parent_sim%tau_sink>0.d0) .AND. ASSOCIATED(self%parent_sim%sink_func)) THEN
+      IF (self%parent_sim%sink_func(coords, psi)) THEN
+        sink_term = (T-self%parent_sim%T_sink)/(self%parent_sim%tau_sink*(gamma-1.d0))
+      END IF
+    END IF
     !---Spitzer resistivity: override the region eta with a T-dependent value.
     !   When T is evolved, eta uses the frozen snapshot (eta_lag) so that it is
     !   the same coefficient in the RHS and LHS passes of a timestep; otherwise
     !   it uses the temperature above (the closure value when T_func is set).
     IF ((.NOT.incomp) .AND. self%parent_sim%use_spitzer) THEN
       IF (eta_lag) THEN
-        T_eta_val = 0.d0
+        T_eta_val = 0.d0; n_eta_val = 0.d0
         DO jr=1,oft_blagrange%nce
           T_eta_val = T_eta_val + T_eta_loc(jr)*basis_vals(jr)
+          n_eta_val = n_eta_val + n_eta_loc(jr)*basis_vals(jr)
         END DO
-        CALL spitzer_eta(n, T_eta_val, eta)
+        CALL spitzer_eta(n_eta_val*self%parent_sim%den_scale, T_eta_val, eta)
       ELSE
         CALL spitzer_eta(n, T, eta)
       END IF
@@ -957,6 +1002,8 @@ DO i=1,mesh%nc
       div_vel = dvel(1,1) +vel(1)/(coords(1)+gs_epsilon) + dvel(3,3)
       btmp = cross_product(dpsi/(coords(1)+gs_epsilon), [0.d0,1.d0,0.d0]) + by*[0.d0,1.d0,0.d0]/(coords(1)+gs_epsilon) + B_0
     END IF
+    IF (use_kappa) chi = self%parent_sim%kappa(mesh%reg(i))/n !< Fixed conductivity kappa=chi*n
+    kappa_T = chi_tensor(chi, self%parent_sim%chi_par_mult, self%parent_sim%chi_aniso, btmp)
     IF(cyl_flag)THEN
       diag_vals(1) = diag_vals(1) + DOT_PRODUCT(btmp,btmp)*int_factor*coords(1)
       diag_vals(2) = diag_vals(2) + 0.5d0*m_i*n*DOT_PRODUCT(vel,vel)*int_factor*coords(1)
@@ -991,16 +1038,22 @@ DO i=1,mesh%nc
           res_loc(jr,5) = res_loc(jr, 5) &
             + basis_vals(jr)*T*int_factor*coords(1)/(gamma-1) &
             + self%dt*basis_vals(jr)*DOT_PRODUCT(vel, dT)*int_factor*coords(1)/(gamma-1) &
-            + self%dt*basis_vals(jr)*T*div_vel*int_factor*coords(1) & 
-            + self%dt*chi*DOT_PRODUCT(dT, basis_grads(:,jr))*int_factor*coords(1) &
-            - self%dt*chi*basis_vals(jr)*DOT_PRODUCT(dn, dT)*int_factor*coords(1)/n 
+            + self%dt*basis_vals(jr)*T*div_vel*int_factor*coords(1) &
+            + self%dt*DOT_PRODUCT(MATMUL(kappa_T,dT), basis_grads(:,jr))*int_factor*coords(1) &
+            - self%dt*basis_vals(jr)*DOT_PRODUCT(dn, MATMUL(kappa_T,dT))*int_factor*coords(1)/n &
+            + self%dt*basis_vals(jr)*sink_term*int_factor*coords(1) &
+            - pres_fac*self%dt*D_diff*T*DOT_PRODUCT(dn,basis_grads(:,jr))*int_factor*coords(1)/(n*(gamma-1)) & ! -(T/n)*D*lap(n), grad(phi) part
+            - pres_fac*self%dt*D_diff*basis_vals(jr)*(DOT_PRODUCT(dT,dn)/n - T*DOT_PRODUCT(dn,dn)/n**2)*int_factor*coords(1)/(gamma-1) ! grad(T/n) part
         ELSE
           res_loc(jr,5) = res_loc(jr, 5) &
             + basis_vals(jr)*T*int_factor/(gamma-1) &
             + self%dt*basis_vals(jr)*DOT_PRODUCT(vel, dT)*int_factor/(gamma-1) &
-            + self%dt*basis_vals(jr)*T*div_vel*int_factor & 
-            + self%dt*chi*DOT_PRODUCT(dT, basis_grads(:,jr))*int_factor &
-            - self%dt*chi*basis_vals(jr)*DOT_PRODUCT(dn, dT)*int_factor/n 
+            + self%dt*basis_vals(jr)*T*div_vel*int_factor &
+            + self%dt*DOT_PRODUCT(MATMUL(kappa_T,dT), basis_grads(:,jr))*int_factor &
+            - self%dt*basis_vals(jr)*DOT_PRODUCT(dn, MATMUL(kappa_T,dT))*int_factor/n &
+            + self%dt*basis_vals(jr)*sink_term*int_factor &
+            - pres_fac*self%dt*D_diff*T*DOT_PRODUCT(dn,basis_grads(:,jr))*int_factor/(n*(gamma-1)) & ! -(T/n)*D*lap(n), grad(phi) part
+            - pres_fac*self%dt*D_diff*basis_vals(jr)*(DOT_PRODUCT(dT,dn)/n - T*DOT_PRODUCT(dn,dn)/n**2)*int_factor/(gamma-1) ! grad(T/n) part
         END IF
       END DO
     END IF
@@ -1040,18 +1093,27 @@ DO i=1,mesh%nc
         END IF
         DO k=1,3
           res_loc(jr,k+1) = res_loc(jr, k+1) &
-            + basis_vals(jr)*self%dt*DOT_PRODUCT(vel,dvel(k,:))*int_factor*coords(1) &
-            + nu*self%dt*DOT_PRODUCT(basis_grads(:,jr),dvel(k,:))*int_factor*coords(1) &
-            - nu*basis_vals(jr)*self%dt*DOT_PRODUCT(dn,dvel(k,:))*int_factor*coords(1)/n
+            + convect_fac*basis_vals(jr)*self%dt*DOT_PRODUCT(vel,dvel(k,:))*int_factor*coords(1) &
+            + nu1*self%dt*DOT_PRODUCT(basis_grads(:,jr),dvel(k,:))*int_factor*coords(1) &
+            - nu1*basis_vals(jr)*self%dt*DOT_PRODUCT(dn,dvel(k,:))*int_factor*coords(1)/n
         END DO
+        !---Bulk viscosity: -nu2*grad(div(v)), density-weighted conservative form (0 by default).
+        !   No phi/y component: div(v) has no phi-dependence (axisymmetric).
+        res_loc(jr,2) = res_loc(jr,2) &
+          + nu2*self%dt*basis_grads(1,jr)*div_vel*int_factor*coords(1) &
+          - nu2*basis_vals(jr)*self%dt*div_vel*dn(1)*int_factor*coords(1)/n &
+          + nu2*self%dt*basis_vals(jr)*div_vel*int_factor
+        res_loc(jr,4) = res_loc(jr,4) &
+          + nu2*self%dt*basis_grads(3,jr)*div_vel*int_factor*coords(1) &
+          - nu2*basis_vals(jr)*self%dt*div_vel*dn(3)*int_factor*coords(1)/n
         res_loc(jr,2) = res_loc(jr,2) &
         + self%dt*basis_vals(jr)*(btmp(2)**2-btmp(1)**2-btmp(3)**2)*int_factor/(2.d0*mu0*m_i*n) &
-        + self%dt*basis_vals(jr)*nu*vel(1)*int_factor/(coords(1)+gs_epsilon)  &
-        - self%dt*basis_vals(jr)*vel(2)**2*int_factor
+        + self%dt*basis_vals(jr)*nu1*vel(1)*int_factor/(coords(1)+gs_epsilon)  &
+        - convect_fac*self%dt*basis_vals(jr)*vel(2)**2*int_factor
         res_loc(jr,3) = res_loc(jr,3) &
         - self%dt*basis_vals(jr)*btmp(1)*btmp(2)*int_factor/(mu0*m_i*n) & !!nonzero
-        + self%dt*basis_vals(jr)*nu*vel(2)*int_factor/(coords(1)+gs_epsilon) &
-        + self%dt*basis_vals(jr)*vel(1)*vel(2)*int_factor
+        + self%dt*basis_vals(jr)*nu1*vel(2)*int_factor/(coords(1)+gs_epsilon) &
+        + convect_fac*self%dt*basis_vals(jr)*vel(1)*vel(2)*int_factor
       ELSE
         res_loc(jr, 2:4) = res_loc(jr, 2:4) &
           + basis_vals(jr)*vel*int_factor&
@@ -1069,10 +1131,17 @@ DO i=1,mesh%nc
         END IF
         DO k=1,3
           res_loc(jr,k+1) = res_loc(jr, k+1) &
-            + basis_vals(jr)*self%dt*DOT_PRODUCT(vel,dvel(k,:))*int_factor &
-            + nu*self%dt*DOT_PRODUCT(basis_grads(:,jr),dvel(k,:))*int_factor &
-            - nu*basis_vals(jr)*self%dt*DOT_PRODUCT(dn,dvel(k,:))*int_factor/n
+            + convect_fac*basis_vals(jr)*self%dt*DOT_PRODUCT(vel,dvel(k,:))*int_factor &
+            + nu1*self%dt*DOT_PRODUCT(basis_grads(:,jr),dvel(k,:))*int_factor &
+            - nu1*basis_vals(jr)*self%dt*DOT_PRODUCT(dn,dvel(k,:))*int_factor/n
         END DO
+        !---Bulk viscosity: -nu2*grad(div(v)), density-weighted conservative form (0 by default).
+        res_loc(jr,2) = res_loc(jr,2) &
+          + nu2*self%dt*basis_grads(1,jr)*div_vel*int_factor &
+          - nu2*basis_vals(jr)*self%dt*div_vel*dn(1)*int_factor/n
+        res_loc(jr,4) = res_loc(jr,4) &
+          + nu2*self%dt*basis_grads(3,jr)*div_vel*int_factor &
+          - nu2*basis_vals(jr)*self%dt*div_vel*dn(3)*int_factor/n
       END IF
       !---Psi
       tmp1 = cross_product(B_0,vel)
@@ -1095,6 +1164,7 @@ DO i=1,mesh%nc
         res_loc(jr,7) = res_loc(jr,7) &
         + basis_vals(jr)*by*int_factor/(coords(1)+gs_epsilon) &
         + self%dt*basis_vals(jr)*tmp1(2)*int_factor/(coords(1)+gs_epsilon) &
+        - self%dt*basis_vals(jr)*vel(2)*dpsi(3)*int_factor/(coords(1)+gs_epsilon)**2 & ! v_phi*grad(1/R) part of R^2*B_p.grad(v_phi/R)
         + self%dt*basis_vals(jr)*dvel(1,1)*by*int_factor/(coords(1)+gs_epsilon) &
         + self%dt*basis_vals(jr)*dvel(3,3)*by*int_factor/(coords(1)+gs_epsilon) &
         + self%dt*basis_vals(jr)*DOT_PRODUCT(vel, dby)*int_factor/(coords(1)+gs_epsilon) &
@@ -1146,7 +1216,7 @@ END DO
 !---Cleanup thread-local storage
 DEALLOCATE(basis_vals,basis_grads, n_weights_loc,T_weights_loc,&
           vel_weights_loc, psi_weights_loc, by_weights_loc,cell_dofs, res_loc)
-IF (eta_lag) DEALLOCATE(T_eta_loc)
+IF (eta_lag) DEALLOCATE(T_eta_loc, n_eta_loc)
 IF (incomp) DEALLOCATE(basis_vals_p, basis_grads_p, cell_dofs_p)
 !$omp end parallel
 END BLOCK
@@ -1177,54 +1247,132 @@ DEALLOCATE(n_res,velx_res,vely_res, velz_res, T_res, psi_res, by_res, &
         n_weights,vel_weights, T_weights, psi_weights, by_weights)
 DEALLOCATE(psi_vac_weights)
 IF(ASSOCIATED(T_eta_weights))DEALLOCATE(T_eta_weights)
+IF(ASSOCIATED(n_eta_weights))DEALLOCATE(n_eta_weights)
 END SUBROUTINE nlfun_apply
 !---------------------------------------------------------------------------
 !> Spitzer resistivity as a function of density and temperature. Returns the
 !! in-plane (perpendicular) and out-of-plane (parallel) resistivity in units
 !! of mu0 (i.e. magnetic diffusivity, m^2/s), matching the stored eta convention.
 !---------------------------------------------------------------------------
+! subroutine spitzer_eta(n, T, eta, deta_dT)
+! real(r8), intent(in) :: n       !< Physical number density [m^-3]
+! real(r8), intent(in) :: T       !< Temperature [eV]
+! real(r8), intent(out) :: eta(2) !< [in-plane, out-of-plane] resistivity in units of mu0
+! real(r8), intent(out), optional :: deta_dT(2) !< d(eta)/dT [in-plane, out-of-plane], units of mu0 per eV
+! real(r8), parameter :: Zi = 1.d0      ! ion charge number
+! real(r8), parameter :: T_floor = 1.d0 ! temperature floor [eV] to bound eta
+! real(r8) :: Tuse, n_cm3, lnLam, lnLam_raw, eta_par, eta_perp, dlnLam_dT, deta_par_dT
+! Tuse = MAX(T, T_floor)
+! n_cm3 = MAX(n, 1.d0)*1.d-6
+! !---NRL electron-ion Coulomb logarithm (T > 10 Z^2 eV), n in cm^-3, T in eV
+! lnLam_raw = 24.d0 - LOG(SQRT(n_cm3)/Tuse)
+! lnLam = MAX(lnLam_raw, 1.d0)
+! !---Spitzer resistivity [Ohm*m] (T in eV, Z=1): parallel and perpendicular
+! eta_par = 5.2d-5*Zi*lnLam/Tuse**1.5d0
+! eta_perp = 1.96d0*eta_par
+! lnLam_raw = 24.d0 - LOG(SQRT(n_cm3)/T_floor)
+! lnLam = MAX(lnLam_raw, 1.d0)
+! ! write(*,*) 'vac eta: ', 5.2d-5*Zi*lnLam/T_floor**1.5d0/mu0
+! ! write(*,*) eta_par
+! !---Store as magnetic diffusivity (eta_physical/mu0), matching the eta convention
+! eta(1) = eta_perp/mu0 ! in-plane (perpendicular)
+! eta(2) = eta_par/mu0  ! out-of-plane (parallel ~ toroidal)
+! !---Temperature derivative d(eta)/dT (for the resistivity Jacobian). Respect the
+! !   floors: d(eta)/dT = 0 where T is pinned to T_floor, and dlnLam/dT = 0 where
+! !   the Coulomb log is floored.
+! IF(PRESENT(deta_dT))THEN
+!   IF(T <= T_floor)THEN
+!     deta_dT = 0.d0
+!   ELSE
+!     dlnLam_dT = 0.d0
+!     IF(lnLam_raw > 1.d0) dlnLam_dT = 1.d0/Tuse
+!     deta_par_dT = 5.2d-5*Zi*(dlnLam_dT/Tuse**1.5d0 - 1.5d0*lnLam/Tuse**2.5d0)
+!     deta_dT(2) = deta_par_dT/mu0
+!     deta_dT(1) = 1.96d0*deta_par_dT/mu0
+!   END IF
+! END IF
+! !eta = 1.d-8 ! NOTE: eta temporarily hardcoded to a constant; deta_dT above is the true Spitzer derivative
+! end subroutine spitzer_eta
+
+!---------------------------------------------------------------------------
+!> Resistivity matched to M3D-C1 (iresfunc=4, "Spitzer resistivity with
+!! offset") as a function of temperature. Returns the in-plane and
+!! out-of-plane resistivity in units of mu0 (i.e. magnetic diffusivity,
+!! m^2/s), matching the stored eta convention.
+!!
+!! eta = 1.03e-4*Zi*lnLam/(T - T_off)**1.5  [Ohm*m], capped at eta_cap
+!!
+!! M3D-C1 uses one isotropic eta with the perpendicular Spitzer coefficient,
+!! a fixed Coulomb log (lambda_coulomb = 17), T_off = eta_te_offset = 7.5 eV,
+!! and a cap of eta_max = eta_vac = 1 (normalized) = 1.94 Ohm*m. Density is
+!! not used (fixed lnLam) but is kept in the interface.
+!---------------------------------------------------------------------------
 subroutine spitzer_eta(n, T, eta, deta_dT)
-real(r8), intent(in) :: n       !< Physical number density [m^-3]
+real(r8), intent(in) :: n       !< Physical number density [m^-3] (unused)
 real(r8), intent(in) :: T       !< Temperature [eV]
 real(r8), intent(out) :: eta(2) !< [in-plane, out-of-plane] resistivity in units of mu0
 real(r8), intent(out), optional :: deta_dT(2) !< d(eta)/dT [in-plane, out-of-plane], units of mu0 per eV
-real(r8), parameter :: Zi = 1.d0      ! ion charge number
-real(r8), parameter :: T_floor = 4.d0 ! temperature floor [eV] to bound eta
-real(r8) :: Tuse, n_cm3, lnLam, lnLam_raw, eta_par, eta_perp, dlnLam_dT, deta_par_dT
-Tuse = MAX(T, T_floor)
-n_cm3 = MAX(n, 1.d0)*1.d-6
-!---NRL electron-ion Coulomb logarithm (T > 10 Z^2 eV), n in cm^-3, T in eV
-lnLam_raw = 24.d0 - LOG(SQRT(n_cm3)/Tuse)
-lnLam = MAX(lnLam_raw, 1.d0)
-!---Spitzer resistivity [Ohm*m] (T in eV, Z=1): parallel and perpendicular
-eta_par = 5.2d-5*Zi*lnLam/Tuse**1.5d0
-eta_perp = 1.96d0*eta_par
-lnLam_raw = 24.d0 - LOG(SQRT(n_cm3)/T_floor)
-lnLam = MAX(lnLam_raw, 1.d0)
-! write(*,*) 'vac eta: ', 5.2d-5*Zi*lnLam/T_floor**1.5d0/mu0
-! write(*,*) eta_par
-!---Store as magnetic diffusivity (eta_physical/mu0), matching the eta convention
-eta(1) = eta_perp/mu0 ! in-plane (perpendicular)
-eta(2) = eta_par/mu0  ! out-of-plane (parallel ~ toroidal)
-!---Temperature derivative d(eta)/dT (for the resistivity Jacobian). Respect the
-!   floors: d(eta)/dT = 0 where T is pinned to T_floor, and dlnLam/dT = 0 where
-!   the Coulomb log is floored.
-IF(PRESENT(deta_dT))THEN
-  IF(T <= T_floor)THEN
-    deta_dT = 0.d0
+real(r8), parameter :: Zi = 1.d0         ! ion charge number
+real(r8), parameter :: lnLam = 17.d0     ! M3D-C1 lambda_coulomb (default)
+real(r8), parameter :: T_off = 7.5d0     ! M3D-C1 eta_te_offset [eV]
+real(r8), parameter :: eta_cap = 1.0d-2  ! M3D-C1 eta_max = eta_vac [Ohm*m]
+real(r8), parameter :: C_sp = 1.03d-4*Zi*lnLam ! perpendicular Spitzer coefficient [Ohm*m*eV^1.5]
+real(r8) :: dT, eta_phys, deta_phys_dT
+LOGICAL :: capped
+!---Offset Spitzer, capped at eta_cap (cap is reached for T < T_off + ~0.01 eV)
+dT = T - T_off
+capped = .TRUE.
+eta_phys = eta_cap
+IF(dT > 0.d0)THEN
+  eta_phys = C_sp/dT**1.5d0
+  IF(eta_phys < eta_cap)THEN
+    capped = .FALSE.
   ELSE
-    dlnLam_dT = 0.d0
-    IF(lnLam_raw > 1.d0) dlnLam_dT = 1.d0/Tuse
-    deta_par_dT = 5.2d-5*Zi*(dlnLam_dT/Tuse**1.5d0 - 1.5d0*lnLam/Tuse**2.5d0)
-    deta_dT(2) = deta_par_dT/mu0
-    deta_dT(1) = 1.96d0*deta_par_dT/mu0
+    eta_phys = eta_cap
   END IF
 END IF
-!eta = 1.d-8 ! NOTE: eta temporarily hardcoded to a constant; deta_dT above is the true Spitzer derivative
+!---Isotropic, stored as magnetic diffusivity (eta_physical/mu0)
+eta(1) = eta_phys/mu0 ! in-plane
+eta(2) = eta_phys/mu0 ! out-of-plane (toroidal)
+!---Temperature derivative d(eta)/dT (for the resistivity Jacobian); zero where capped
+IF(PRESENT(deta_dT))THEN
+  IF(capped)THEN
+    deta_dT = 0.d0
+  ELSE
+    deta_phys_dT = -1.5d0*eta_phys/dT
+    deta_dT(1) = deta_phys_dT/mu0
+    deta_dT(2) = deta_phys_dT/mu0
+  END IF
+END IF
 end subroutine spitzer_eta
 !---------------------------------------------------------------------------
-!> Freeze the temperature used to evaluate the Spitzer resistivity, taking the
-!! snapshot from the temperature (field 5) of `u`.
+!> Anisotropic thermal diffusivity tensor chi_perp*I + (chi_par-chi_perp)*bb^T,
+!! where b is the local unit vector along the magnetic field B. Reduces to the
+!! isotropic tensor chi_perp*I when aniso=.FALSE. or B is (near) zero.
+!---------------------------------------------------------------------------
+PURE FUNCTION chi_tensor(chi_perp, chi_par_mult, aniso, B) RESULT(kappa)
+REAL(r8), INTENT(in) :: chi_perp     !< Cross-field (perpendicular) thermal diffusivity
+REAL(r8), INTENT(in) :: chi_par_mult !< Ratio of field-aligned to cross-field thermal diffusivity
+LOGICAL, INTENT(in) :: aniso         !< Enable anisotropic conduction
+REAL(r8), INTENT(in) :: B(3)         !< Local magnetic field vector
+REAL(r8) :: kappa(3,3)
+REAL(r8) :: bhat(3), Bmag
+INTEGER(i4) :: k
+kappa = 0.d0
+DO k=1,3
+  kappa(k,k) = chi_perp
+END DO
+IF (.NOT.aniso) RETURN
+Bmag = SQRT(DOT_PRODUCT(B,B))
+IF (Bmag < 1.d-10) RETURN
+bhat = B/Bmag
+DO k=1,3
+  kappa(:,k) = kappa(:,k) + chi_perp*(chi_par_mult-1.d0)*bhat*bhat(k)
+END DO
+END FUNCTION chi_tensor
+!---------------------------------------------------------------------------
+!> Freeze the temperature and density used to evaluate the Spitzer resistivity,
+!! taking the snapshots from the temperature (field 5) and density (field 1) of `u`.
 !!
 !! Call this once per timestep, on the solution at the start of the step and
 !! before the RHS and Jacobian are built. The poloidal-flux equation is written
@@ -1239,20 +1387,30 @@ end subroutine spitzer_eta
 !! resistive coefficient is then lagged by one step, which is first-order in dt
 !! like the rest of the time advance.
 !!
+!! The density must be frozen along with the temperature: eta depends on n
+!! through the Coulomb logarithm, and n evolves (diffusion, compression), so
+!! an unfrozen n gives the same spurious psi jump, psi*d(eta)/eta. Because it
+!! scales with the absolute psi rather than with eta, it can far exceed the
+!! physical resistive change.
+!!
 !! Only used when Spitzer resistivity is active and T is evolved (with the
 !! T_func closure, eta follows the prescribed T and no snapshot is needed).
 !---------------------------------------------------------------------------
 subroutine xmhd_2d_freeze_eta_temp(self,u)
 class(oft_xmhd_2d_sim), intent(inout) :: self !< Simulation object
-class(oft_vector), intent(inout) :: u !< Solution whose temperature (field 5) is captured
+class(oft_vector), intent(inout) :: u !< Solution whose temperature (field 5) and density (field 1) are captured
 real(r8), pointer, dimension(:) :: t_vals
 DEBUG_STACK_PUSH
 IF(self%use_spitzer.AND.(.NOT.self%incomp).AND.(.NOT.ASSOCIATED(self%T_func)))THEN
-  IF(.NOT.ASSOCIATED(self%T_eta))CALL oft_abort("Temperature snapshot not allocated", &
-                                                "xmhd_2d_freeze_eta_temp",__FILE__)
+  IF(.NOT.ASSOCIATED(self%T_eta).OR.(.NOT.ASSOCIATED(self%n_eta))) &
+    CALL oft_abort("Temperature/density snapshot not allocated","xmhd_2d_freeze_eta_temp",__FILE__)
   NULLIFY(t_vals)
   CALL u%get_local(t_vals,5)
   CALL self%T_eta%restore_local(t_vals)
+  DEALLOCATE(t_vals)
+  NULLIFY(t_vals)
+  CALL u%get_local(t_vals,1)
+  CALL self%n_eta%restore_local(t_vals)
   DEALLOCATE(t_vals)
   self%T_eta_valid=.TRUE.
 END IF
@@ -1264,14 +1422,16 @@ end subroutine xmhd_2d_freeze_eta_temp
 subroutine build_approx_jacobian(self,a)
 class(oft_xmhd_2d_sim), intent(inout) :: self
 class(oft_vector), intent(inout) :: a !< Solution for computing jacobian
-LOGICAL :: cyl_flag, linear, incomp, eta_lag
+LOGICAL :: cyl_flag, linear, incomp, eta_lag, use_kappa
 INTEGER(i4) :: i
 REAL(r8) :: k_boltz=elec_charge
 REAL(r8) :: m_i = proton_mass
-REAL(r8) :: chi, eta(2), nu, D_diff, gamma, B_0(3), diag_vals(7), dt_fac
+REAL(r8) :: chi, eta(2), nu, nu1, nu2, D_diff, gamma, B_0(3), diag_vals(7), dt_fac
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights, psi_weights, by_weights, vtmp
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
-REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights, T_eta_weights
+REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights, T_eta_weights, n_eta_weights
+REAL(r8) :: convect_fac !< Zeroes the convective derivative term's Jacobian contributions below when drop_convection=.TRUE.
+REAL(r8) :: pres_fac !< Enables the Jacobian of the pressure-conserving density diffusion term when evolve_pressure=.TRUE.
 integer(KIND=omp_lock_kind), allocatable, dimension(:) :: tlocks
 class(oft_vector), pointer :: tmp
 type(oft_quad_type), pointer :: quad
@@ -1301,11 +1461,15 @@ cyl_flag = self%cyl_flag
 linear = self%linear
 incomp = self%incomp
 dt_fac = self%jac_dt
+use_kappa = ALLOCATED(self%kappa)
+convect_fac = MERGE(0.d0, 1.d0, self%drop_convection)
+pres_fac = MERGE(1.d0, 0.d0, self%evolve_pressure)
 !---Match the resistivity used by nlfun_apply (frozen snapshot when T is evolved)
-NULLIFY(T_eta_weights)
+NULLIFY(T_eta_weights, n_eta_weights)
 eta_lag = self%use_spitzer .AND. (.NOT.incomp) .AND. (.NOT.ASSOCIATED(self%T_func)) &
           .AND. self%T_eta_valid
 IF(eta_lag)CALL self%T_eta%get_local(T_eta_weights)
+IF(eta_lag)CALL self%n_eta%get_local(n_eta_weights)
 !--Setup thread locks
 ALLOCATE(tlocks(self%fe_rep%nfields))
 DO i=1,self%fe_rep%nfields
@@ -1317,17 +1481,18 @@ LOGICAL :: curved
 INTEGER(i4) :: k, l, m, ik, jr, jc
 INTEGER(i4), POINTER, DIMENSION(:) :: cell_dofs, cell_dofs_p
 REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dby(3),dvel(3,3),div_vel
-REAL(r8) :: jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),tmp2(3),tmp3(3),coords(3)
-REAL(r8) :: dT_dpsi, deta_dT(2), r_geo, d6_eta, d7_eta, T_eta_val
+REAL(r8) :: jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),tmp2(3),tmp3(3),coords(3),kappa_T(3,3)
+REAL(r8) :: dT_dpsi, deta_dT(2), r_geo, d6_eta, d7_eta, T_eta_val, n_eta_val
+REAL(r8) :: sink_term, dsink_dT
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals, basis_vals_p,n_weights_loc,T_weights_loc
-REAL(r8), ALLOCATABLE, DIMENSION(:) :: psi_weights_loc,by_weights_loc,res_loc,T_eta_loc
+REAL(r8), ALLOCATABLE, DIMENSION(:) :: psi_weights_loc,by_weights_loc,res_loc,T_eta_loc,n_eta_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grads_p
 TYPE(oft_1d_int), ALLOCATABLE, DIMENSION(:) :: iloc
 type(oft_local_mat), allocatable, dimension(:,:) :: jac_loc
 !$omp parallel private(ik, k, l, m,jr,jc,curved,coords,cell_dofs,cell_dofs_p,basis_vals,basis_vals_p,basis_grads,basis_grads_p,T_weights_loc, &
 !$omp n_weights_loc,psi_weights_loc, by_weights_loc,vel_weights_loc,res_loc,jac_mat, &
-!$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dby,dvel,div_vel,btmp,tmp1,tmp2,tmp3, iloc, jac_loc, &
-!$omp dT_dpsi,deta_dT,r_geo,d6_eta,d7_eta,T_eta_loc,T_eta_val, &
+!$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dby,dvel,div_vel,btmp,tmp1,tmp2,tmp3,kappa_T, iloc, jac_loc, &
+!$omp dT_dpsi,deta_dT,r_geo,d6_eta,d7_eta,T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, dsink_dT, &
 !$omp chi, m_i, eta, nu, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 IF (incomp) ALLOCATE(basis_vals_p(oft_blagrange_p%nce),basis_grads_p(3,oft_blagrange_p%nce))
@@ -1341,7 +1506,7 @@ ELSE
 END IF
 ALLOCATE(cell_dofs(oft_blagrange%nce))
 IF (incomp) ALLOCATE(cell_dofs_p(oft_blagrange_p%nce))
-IF (eta_lag) ALLOCATE(T_eta_loc(oft_blagrange%nce))
+IF (eta_lag) ALLOCATE(T_eta_loc(oft_blagrange%nce), n_eta_loc(oft_blagrange%nce))
 ALLOCATE(jac_loc(self%fe_rep%nfields,self%fe_rep%nfields))
 ALLOCATE(iloc(self%fe_rep%nfields))
 DO ik=1,self%fe_rep%nfields
@@ -1366,12 +1531,15 @@ DO i=1,mesh%nc
   psi_weights_loc = psi_weights(cell_dofs) + psi_vac_weights(cell_dofs)
   by_weights_loc = by_weights(cell_dofs)
   IF (eta_lag) T_eta_loc = T_eta_weights(cell_dofs)
+  IF (eta_lag) n_eta_loc = n_eta_weights(cell_dofs)
 
   !Set material properties
   chi = self%chi(mesh%reg(i))
   m_i = self%m_i(mesh%reg(i))
   eta = self%eta(mesh%reg(i), :)
   nu = self%nu(mesh%reg(i))
+  nu1 = nu/(1.d0+self%nu2_ratio)
+  nu2 = nu1*self%nu2_ratio
   gamma = self%gamma(mesh%reg(i))
   D_diff = self%D_diff(mesh%reg(i))
 
@@ -1437,14 +1605,23 @@ DO i=1,mesh%nc
     IF ((.NOT.incomp) .AND. ASSOCIATED(self%T_func)) THEN
       CALL self%T_func(coords, n, dn, psi, dpsi, by, dby, T, dT, dT_dpsi=dT_dpsi)
     END IF
+    !---Temperature sink term, matching nlfun_apply (see there for details)
+    sink_term = 0.d0; dsink_dT = 0.d0
+    IF ((.NOT.incomp) .AND. (self%tau_sink>0.d0) .AND. ASSOCIATED(self%sink_func)) THEN
+      IF (self%sink_func(coords, psi)) THEN
+        sink_term = (T-self%T_sink)/(self%tau_sink*(gamma-1.d0))
+        dsink_dT = 1.d0/(self%tau_sink*(gamma-1.d0))
+      END IF
+    END IF
     IF ((.NOT.incomp) .AND. self%use_spitzer) THEN
       IF (eta_lag) THEN
         !---eta is frozen over the step, so it contributes no Jacobian sensitivity
-        T_eta_val = 0.d0
+        T_eta_val = 0.d0; n_eta_val = 0.d0
         DO jr=1,oft_blagrange%nce
           T_eta_val = T_eta_val + T_eta_loc(jr)*basis_vals(jr)
+          n_eta_val = n_eta_val + n_eta_loc(jr)*basis_vals(jr)
         END DO
-        CALL spitzer_eta(n, T_eta_val, eta)
+        CALL spitzer_eta(n_eta_val*self%den_scale, T_eta_val, eta)
       ELSE
         CALL spitzer_eta(n, T, eta, deta_dT=deta_dT)
       END IF
@@ -1456,6 +1633,8 @@ DO i=1,mesh%nc
       div_vel = dvel(1,1) +vel(1)/(coords(1)+gs_epsilon) + dvel(3,3)
       btmp = cross_product(dpsi/(coords(1)+gs_epsilon), [0.d0,1.d0,0.d0]) + by*[0.d0,1.d0,0.d0]/(coords(1)+gs_epsilon) + B_0
     END IF
+    IF (use_kappa) chi = self%kappa(mesh%reg(i))/n !< Fixed conductivity kappa=chi*n
+    kappa_T = chi_tensor(chi, self%chi_par_mult, self%chi_aniso, btmp)
     diag_vals = diag_vals + [n, vel(1), vel(2), vel(3), T, psi, by]*int_factor
     !---Compute local matrix contributions
     ! p, vel
@@ -1547,17 +1726,19 @@ DO i=1,mesh%nc
             + dt_fac*basis_vals(jc)*basis_grads(l,jr)*DOT_PRODUCT(btmp, btmp)*int_factor*coords(1)/(2.d0*mu0*m_i*n**2.d0) &
             + dt_fac*basis_vals(jr)*basis_grads(l,jc)*DOT_PRODUCT(btmp, btmp)*int_factor*coords(1)/(2.d0*mu0*m_i*n**2.d0) &
             - dt_fac*basis_vals(jr)*basis_vals(jc)*dn(l)*DOT_PRODUCT(btmp, btmp)*int_factor*coords(1)/(mu0*m_i*n**3.d0) &
-            ! velocity dissipation terms
-            - dt_fac*nu*basis_vals(jc)*DOT_PRODUCT(basis_grads(:,jr), dvel(l, :))*int_factor*coords(1)/n &
-            - dt_fac*nu*basis_vals(jr)*DOT_PRODUCT(basis_grads(:,jc), dvel(l, :))*int_factor*coords(1)/n &
-            + dt_fac*nu*basis_vals(jr)*2.d0*basis_vals(jc)*DOT_PRODUCT(dn, dvel(l, :))*int_factor*coords(1)/n**2
+            ! velocity dissipation terms (from -nu1*phi*(grad(n).grad(v_l))/n; the nu1*grad(phi).grad(v_l)
+            ! term is independent of n)
+            - dt_fac*nu1*basis_vals(jr)*DOT_PRODUCT(basis_grads(:,jc), dvel(l, :))*int_factor*coords(1)/n &
+            + dt_fac*nu1*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(dn, dvel(l, :))*int_factor*coords(1)/n**2 &
+            ! bulk viscosity (grad(div v)) n-dependence; l=2 (phi) vanishes automatically
+            - dt_fac*nu2*basis_vals(jr)*basis_grads(l,jc)*div_vel*int_factor*coords(1)/n &
+            + dt_fac*nu2*basis_vals(jr)*basis_vals(jc)*div_vel*dn(l)*int_factor*coords(1)/n**2
           END DO
+          ! hoop terms (the nu1*v/R terms are independent of n)
           jac_loc(2,1)%m(jr,jc) = jac_loc(2,1)%m(jr,jc) &
-          - dt_fac*basis_vals(jr)*basis_vals(jc)*(btmp(2)**2-btmp(1)**2-btmp(3)**2)*int_factor/(mu0*m_i*n**2*(coords(1)+gs_epsilon)) &
-          - dt_fac*basis_vals(jr)*basis_vals(jc)*nu*vel(1)*int_factor/(n*(coords(1)+gs_epsilon))
+          - dt_fac*basis_vals(jr)*basis_vals(jc)*(btmp(2)**2-btmp(1)**2-btmp(3)**2)*int_factor/(2.d0*mu0*m_i*n**2)
           jac_loc(3,1)%m(jr,jc) = jac_loc(3,1)%m(jr,jc) &
-          + dt_fac*basis_vals(jr)*basis_vals(jc)*(btmp(1)*btmp(2))*int_factor/(mu0*m_i*n**2*(coords(1)+gs_epsilon)) &
-          - dt_fac*basis_vals(jr)*basis_vals(jc)*nu*vel(2)*int_factor/(n*(coords(1)+gs_epsilon))
+          + dt_fac*basis_vals(jr)*basis_vals(jc)*(btmp(1)*btmp(2))*int_factor/(mu0*m_i*n**2)
         ELSE
           IF(linear)THEN
             DO l=1,3
@@ -1581,10 +1762,13 @@ DO i=1,mesh%nc
               + dt_fac*basis_vals(jc)*basis_grads(l,jr)*DOT_PRODUCT(btmp, btmp)*int_factor/(2.d0*mu0*m_i*n**2.d0) &
               + dt_fac*basis_vals(jr)*basis_grads(l,jc)*DOT_PRODUCT(btmp, btmp)*int_factor/(2.d0*mu0*m_i*n**2.d0) &
               - dt_fac*basis_vals(jr)*basis_vals(jc)*dn(l)*DOT_PRODUCT(btmp, btmp)*int_factor/(mu0*m_i*n**3.d0) &
-              ! velocity dissipation terms
-              - dt_fac*nu*basis_vals(jc)*DOT_PRODUCT(basis_grads(:,jr), dvel(l, :))*int_factor/n &
-              - dt_fac*nu*basis_vals(jr)*DOT_PRODUCT(basis_grads(:,jc), dvel(l, :))*int_factor/n &
-              + dt_fac*nu*basis_vals(jr)*2.d0*basis_vals(jc)*DOT_PRODUCT(dn, dvel(l, :))*int_factor/n**2
+              ! velocity dissipation terms (from -nu1*phi*(grad(n).grad(v_l))/n; the nu1*grad(phi).grad(v_l)
+              ! term is independent of n)
+              - dt_fac*nu1*basis_vals(jr)*DOT_PRODUCT(basis_grads(:,jc), dvel(l, :))*int_factor/n &
+              + dt_fac*nu1*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(dn, dvel(l, :))*int_factor/n**2 &
+              ! bulk viscosity (grad(div v)) n-dependence; l=2 (phi) vanishes automatically
+              - dt_fac*nu2*basis_vals(jr)*basis_grads(l,jc)*div_vel*int_factor/n &
+              + dt_fac*nu2*basis_vals(jr)*basis_vals(jc)*div_vel*dn(l)*int_factor/n**2
             END DO
           END IF
         END IF
@@ -1593,33 +1777,52 @@ DO i=1,mesh%nc
           DO k=1,3
             jac_loc(k+1,k+1)%m(jr,jc)= jac_loc(k+1,k+1)%m(jr,jc) &
               + basis_vals(jr)*basis_vals(jc)*int_factor*coords(1) &
-              + dt_fac*basis_vals(jr)*DOT_PRODUCT(vel, basis_grads(:,jc))*int_factor*coords(1) &
-              + dt_fac*nu*DOT_PRODUCT(basis_grads(:,jr), basis_grads(:,jc))*int_factor*coords(1) &
-              - dt_fac*nu*basis_vals(jr)*DOT_PRODUCT(dn, basis_grads(:,jc))*int_factor*coords(1)/n
+              + convect_fac*dt_fac*basis_vals(jr)*DOT_PRODUCT(vel, basis_grads(:,jc))*int_factor*coords(1) &
+              + dt_fac*nu1*DOT_PRODUCT(basis_grads(:,jr), basis_grads(:,jc))*int_factor*coords(1) &
+              - dt_fac*nu1*basis_vals(jr)*DOT_PRODUCT(dn, basis_grads(:,jc))*int_factor*coords(1)/n
             DO l=1,3
               jac_loc(k+1,l+1)%m(jr,jc)= jac_loc(k+1,l+1)%m(jr,jc) &
-              + dt_fac*basis_vals(jr)*basis_vals(jc)*dvel(k, l)*int_factor*coords(1)
+              + convect_fac*dt_fac*basis_vals(jr)*basis_vals(jc)*dvel(k, l)*int_factor*coords(1) &
+              ! bulk viscosity (grad(div v)): d(div v)/d(vel_l), plain part; k=2/l=2 (phi) vanish automatically
+              + dt_fac*nu2*basis_grads(k,jr)*basis_grads(l,jc)*int_factor*coords(1) &
+              - dt_fac*nu2*basis_vals(jr)*dn(k)*basis_grads(l,jc)*int_factor*coords(1)/n
             END DO
           END DO
           jac_loc(2,2)%m(jr,jc)= jac_loc(2,2)%m(jr,jc) &
-          + dt_fac*nu*basis_vals(jr)*basis_vals(jc)*int_factor/(coords(1)+gs_epsilon)
+          + dt_fac*nu1*basis_vals(jr)*basis_vals(jc)*int_factor/(coords(1)+gs_epsilon) &
+          ! bulk viscosity: extra 1/R piece of d(div v)/d(vel_R) (from vel(1)/R term in div_vel)
+          + dt_fac*nu2*basis_vals(jc)*basis_grads(1,jr)*int_factor*coords(1)/(coords(1)+gs_epsilon) &
+          - dt_fac*nu2*basis_vals(jc)*basis_vals(jr)*dn(1)*int_factor*coords(1)/(n*(coords(1)+gs_epsilon)) &
+          ! bulk viscosity: d(R-only IBP correction)/d(vel_R)
+          + dt_fac*nu2*basis_vals(jr)*basis_grads(1,jc)*int_factor &
+          + dt_fac*nu2*basis_vals(jr)*basis_vals(jc)*int_factor/(coords(1)+gs_epsilon)
           jac_loc(2,3)%m(jr,jc)= jac_loc(2,3)%m(jr,jc) &
-          -dt_fac*basis_vals(jr)*2.d0*vel(2)*basis_vals(jc)*int_factor
+          -convect_fac*dt_fac*basis_vals(jr)*2.d0*vel(2)*basis_vals(jc)*int_factor
+          jac_loc(2,4)%m(jr,jc)= jac_loc(2,4)%m(jr,jc) &
+          ! bulk viscosity: d(R-only IBP correction)/d(vel_Z)
+          + dt_fac*nu2*basis_vals(jr)*basis_grads(3,jc)*int_factor
           jac_loc(3,2)%m(jr,jc)= jac_loc(3,2)%m(jr,jc) &
-          + dt_fac*basis_vals(jr)*basis_vals(jc)*vel(2)*int_factor
+          + convect_fac*dt_fac*basis_vals(jr)*basis_vals(jc)*vel(2)*int_factor
           jac_loc(3,3)%m(jr,jc)= jac_loc(3,3)%m(jr,jc) &
-          + dt_fac*basis_vals(jr)*basis_vals(jc)*vel(1)*int_factor &
-          + dt_fac*nu*basis_vals(jr)*basis_vals(jc)*int_factor/(coords(1)+gs_epsilon)
+          + convect_fac*dt_fac*basis_vals(jr)*basis_vals(jc)*vel(1)*int_factor &
+          + dt_fac*nu1*basis_vals(jr)*basis_vals(jc)*int_factor/(coords(1)+gs_epsilon)
+          jac_loc(4,2)%m(jr,jc)= jac_loc(4,2)%m(jr,jc) &
+          ! bulk viscosity: extra 1/R piece of d(div v)/d(vel_R), Z-momentum row
+          + dt_fac*nu2*basis_vals(jc)*basis_grads(3,jr)*int_factor*coords(1)/(coords(1)+gs_epsilon) &
+          - dt_fac*nu2*basis_vals(jc)*basis_vals(jr)*dn(3)*int_factor*coords(1)/(n*(coords(1)+gs_epsilon))
         ELSE
           DO k=1,3
             jac_loc(k+1,k+1)%m(jr,jc)= jac_loc(k+1,k+1)%m(jr,jc) &
               + basis_vals(jr)*basis_vals(jc)*int_factor &
-              + dt_fac*basis_vals(jr)*DOT_PRODUCT(vel, basis_grads(:,jc))*int_factor &
-              + dt_fac*nu*DOT_PRODUCT(basis_grads(:,jr), basis_grads(:,jc))*int_factor &
-              - dt_fac*nu*basis_vals(jr)*DOT_PRODUCT(dn, basis_grads(:,jc))*int_factor/n
+              + convect_fac*dt_fac*basis_vals(jr)*DOT_PRODUCT(vel, basis_grads(:,jc))*int_factor &
+              + dt_fac*nu1*DOT_PRODUCT(basis_grads(:,jr), basis_grads(:,jc))*int_factor &
+              - dt_fac*nu1*basis_vals(jr)*DOT_PRODUCT(dn, basis_grads(:,jc))*int_factor/n
             DO l=1,3
               jac_loc(k+1,l+1)%m(jr,jc)= jac_loc(k+1,l+1)%m(jr,jc) &
-              + dt_fac*basis_vals(jr)*basis_vals(jc)*dvel(k, l)*int_factor
+              + convect_fac*dt_fac*basis_vals(jr)*basis_vals(jc)*dvel(k, l)*int_factor &
+              ! bulk viscosity (grad(div v)); k=2/l=2 (phi) vanish automatically
+              + dt_fac*nu2*basis_grads(k,jr)*basis_grads(l,jc)*int_factor &
+              - dt_fac*nu2*basis_vals(jr)*dn(k)*basis_grads(l,jc)*int_factor/n
             END DO
           END DO
         END IF
@@ -1699,21 +1902,51 @@ DO i=1,mesh%nc
         IF (.NOT. incomp) THEN
           ! T, n
           IF (cyl_flag) THEN
-            jac_loc(5, 1)%m(jr,jc) = jac_loc(5, 1)%m(jr, jc) &  
-              - dt_fac*chi*basis_vals(jr)*DOT_PRODUCT(basis_grads(:, jc), dT)*int_factor*coords(1)/n & ! grad(delta_n) 
-              + dt_fac*chi*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(dn, dT)*int_factor*coords(1)/(n**2) ! delta_n 
+            jac_loc(5, 1)%m(jr,jc) = jac_loc(5, 1)%m(jr, jc) &
+              - dt_fac*basis_vals(jr)*DOT_PRODUCT(basis_grads(:, jc), MATMUL(kappa_T,dT))*int_factor*coords(1)/n & ! grad(delta_n)
+              + dt_fac*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(dn, MATMUL(kappa_T,dT))*int_factor*coords(1)/(n**2) ! delta_n
           ELSE
             IF (linear) THEN
-              jac_loc(5, 1)%m(jr,jc) = jac_loc(5, 1)%m(jr, jc) &  
+              jac_loc(5, 1)%m(jr,jc) = jac_loc(5, 1)%m(jr, jc) &
               + dt_fac*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(vel, dT)*int_factor/(n*(gamma-1))&
               + dt_fac*basis_vals(jr)*basis_vals(jc)*k_boltz*T*div_vel*int_factor/n &
-              - dt_fac*basis_vals(jc)*chi*DOT_PRODUCT(basis_grads(:, jr), dT)*int_factor/n &
-              - dt_fac*basis_vals(jr)*chi*basis_vals(jc)*DOT_PRODUCT(dn,dT)*int_factor/(n**2) 
+              - dt_fac*basis_vals(jc)*DOT_PRODUCT(basis_grads(:, jr), MATMUL(kappa_T,dT))*int_factor/n &
+              - dt_fac*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(dn, MATMUL(kappa_T,dT))*int_factor/(n**2)
             ELSE
-              jac_loc(5, 1)%m(jr,jc) = jac_loc(5, 1)%m(jr, jc) &  
-              - dt_fac*chi*basis_vals(jr)*DOT_PRODUCT(basis_grads(:, jc), dT)*int_factor/n & ! grad(delta_n) 
-              + dt_fac*chi*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(dn, dT)*int_factor/(n**2) ! delta_n 
+              jac_loc(5, 1)%m(jr,jc) = jac_loc(5, 1)%m(jr, jc) &
+              - dt_fac*basis_vals(jr)*DOT_PRODUCT(basis_grads(:, jc), MATMUL(kappa_T,dT))*int_factor/n & ! grad(delta_n)
+              + dt_fac*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(dn, MATMUL(kappa_T,dT))*int_factor/(n**2) ! delta_n
             END IF
+          END IF
+          ! T, n: dependence of chi=kappa/n on n when kappa is fixed
+          IF (use_kappa) THEN
+            IF (cyl_flag) THEN
+              jac_loc(5, 1)%m(jr,jc) = jac_loc(5, 1)%m(jr, jc) &
+                - dt_fac*basis_vals(jc)*DOT_PRODUCT(basis_grads(:, jr), MATMUL(kappa_T,dT))*int_factor*coords(1)/n &
+                + dt_fac*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(dn, MATMUL(kappa_T,dT))*int_factor*coords(1)/(n**2)
+            ELSE
+              jac_loc(5, 1)%m(jr,jc) = jac_loc(5, 1)%m(jr, jc) &
+                - dt_fac*basis_vals(jc)*DOT_PRODUCT(basis_grads(:, jr), MATMUL(kappa_T,dT))*int_factor/n &
+                + dt_fac*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(dn, MATMUL(kappa_T,dT))*int_factor/(n**2)
+            END IF
+          END IF
+          ! T, n: pressure-conserving density diffusion term (evolve_pressure)
+          IF (cyl_flag) THEN
+            jac_loc(5, 1)%m(jr,jc) = jac_loc(5, 1)%m(jr, jc) &
+              - pres_fac*dt_fac*D_diff*T*DOT_PRODUCT(basis_grads(:,jc),basis_grads(:,jr))*int_factor*coords(1)/(n*(gamma-1)) &
+              + pres_fac*dt_fac*D_diff*T*basis_vals(jc)*DOT_PRODUCT(dn,basis_grads(:,jr))*int_factor*coords(1)/(n**2*(gamma-1)) &
+              - pres_fac*dt_fac*D_diff*basis_vals(jr)*DOT_PRODUCT(dT,basis_grads(:,jc))*int_factor*coords(1)/(n*(gamma-1)) &
+              + pres_fac*dt_fac*D_diff*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(dT,dn)*int_factor*coords(1)/(n**2*(gamma-1)) &
+              + pres_fac*dt_fac*D_diff*basis_vals(jr)*2.d0*T*DOT_PRODUCT(dn,basis_grads(:,jc))*int_factor*coords(1)/(n**2*(gamma-1)) &
+              - pres_fac*dt_fac*D_diff*basis_vals(jr)*basis_vals(jc)*2.d0*T*DOT_PRODUCT(dn,dn)*int_factor*coords(1)/(n**3*(gamma-1))
+          ELSE
+            jac_loc(5, 1)%m(jr,jc) = jac_loc(5, 1)%m(jr, jc) &
+              - pres_fac*dt_fac*D_diff*T*DOT_PRODUCT(basis_grads(:,jc),basis_grads(:,jr))*int_factor/(n*(gamma-1)) &
+              + pres_fac*dt_fac*D_diff*T*basis_vals(jc)*DOT_PRODUCT(dn,basis_grads(:,jr))*int_factor/(n**2*(gamma-1)) &
+              - pres_fac*dt_fac*D_diff*basis_vals(jr)*DOT_PRODUCT(dT,basis_grads(:,jc))*int_factor/(n*(gamma-1)) &
+              + pres_fac*dt_fac*D_diff*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(dT,dn)*int_factor/(n**2*(gamma-1)) &
+              + pres_fac*dt_fac*D_diff*basis_vals(jr)*2.d0*T*DOT_PRODUCT(dn,basis_grads(:,jc))*int_factor/(n**2*(gamma-1)) &
+              - pres_fac*dt_fac*D_diff*basis_vals(jr)*basis_vals(jc)*2.d0*T*DOT_PRODUCT(dn,dn)*int_factor/(n**3*(gamma-1))
           END IF
           ! T, vel
           IF (cyl_flag) THEN
@@ -1737,15 +1970,23 @@ DO i=1,mesh%nc
             + basis_vals(jr) * basis_vals(jc)*int_factor*coords(1)/(gamma-1) &! delta_T
             + basis_vals(jr) * dt_fac*DOT_PRODUCT(vel, basis_grads(:, jc))*int_factor*coords(1)/(gamma-1) & ! nabla(dT)
             + basis_vals(jr) * dt_fac*basis_vals(jc)*div_vel*int_factor*coords(1) & ! dT != nabla(dT)
-            + dt_fac * chi * DOT_PRODUCT(basis_grads(:, jc),basis_grads(:, jr))*int_factor*coords(1) & ! dT_Chi
-            - dt_fac*basis_vals(jr)*chi*DOT_PRODUCT(dn, basis_grads(:, jc))*int_factor*coords(1)/n 
+            + dt_fac * DOT_PRODUCT(MATMUL(kappa_T,basis_grads(:, jc)),basis_grads(:, jr))*int_factor*coords(1) & ! dT_Chi
+            - dt_fac*basis_vals(jr)*DOT_PRODUCT(dn, MATMUL(kappa_T,basis_grads(:, jc)))*int_factor*coords(1)/n &
+            + basis_vals(jr) * dt_fac*basis_vals(jc)*dsink_dT*int_factor*coords(1) & ! d(sink_term)/dT
+            - pres_fac*dt_fac*D_diff*basis_vals(jc)*DOT_PRODUCT(dn,basis_grads(:,jr))*int_factor*coords(1)/(n*(gamma-1)) & ! evolve_pressure
+            - pres_fac*dt_fac*D_diff*basis_vals(jr)*DOT_PRODUCT(basis_grads(:,jc),dn)*int_factor*coords(1)/(n*(gamma-1)) &
+            + pres_fac*dt_fac*D_diff*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(dn,dn)*int_factor*coords(1)/(n**2*(gamma-1))
           ELSE
-            jac_loc(5, 5)%m(jr,jc) = jac_loc(5,5)%m(jr, jc) &  
+            jac_loc(5, 5)%m(jr,jc) = jac_loc(5,5)%m(jr, jc) &
             + basis_vals(jr) * basis_vals(jc)*int_factor/(gamma-1) &! delta_T
             + basis_vals(jr) * dt_fac*DOT_PRODUCT(vel, basis_grads(:, jc))*int_factor/(gamma-1) & ! nabla(dT)
             + basis_vals(jr) * dt_fac*basis_vals(jc)*div_vel*int_factor & ! dT != nabla(dT)
-            + dt_fac * chi * DOT_PRODUCT(basis_grads(:, jc),basis_grads(:, jr))*int_factor & ! dT_Chi
-            - dt_fac*basis_vals(jr)*chi*DOT_PRODUCT(dn, basis_grads(:, jc))*int_factor/n 
+            + dt_fac * DOT_PRODUCT(MATMUL(kappa_T,basis_grads(:, jc)),basis_grads(:, jr))*int_factor & ! dT_Chi
+            - dt_fac*basis_vals(jr)*DOT_PRODUCT(dn, MATMUL(kappa_T,basis_grads(:, jc)))*int_factor/n &
+            + basis_vals(jr) * dt_fac*basis_vals(jc)*dsink_dT*int_factor & ! d(sink_term)/dT
+            - pres_fac*dt_fac*D_diff*basis_vals(jc)*DOT_PRODUCT(dn,basis_grads(:,jr))*int_factor/(n*(gamma-1)) & ! evolve_pressure
+            - pres_fac*dt_fac*D_diff*basis_vals(jr)*DOT_PRODUCT(basis_grads(:,jc),dn)*int_factor/(n*(gamma-1)) &
+            + pres_fac*dt_fac*D_diff*basis_vals(jr)*basis_vals(jc)*DOT_PRODUCT(dn,dn)*int_factor/(n**2*(gamma-1))
           END IF
         END IF
         ! Induction
@@ -1792,9 +2033,10 @@ DO i=1,mesh%nc
             + basis_vals(jr)*dt_fac*by*basis_grads(l,jc)*int_factor/(coords(1)+gs_epsilon)
           END DO
           jac_loc(7,2)%m(jr,jc) = jac_loc(7, 2)%m(jr,jc) &
-          + basis_vals(jr)*dt_fac*by*basis_vals(jc)*int_factor/(coords(1)+gs_epsilon)**2
+          - basis_vals(jr)*dt_fac*by*basis_vals(jc)*int_factor/(coords(1)+gs_epsilon)**2
           jac_loc(7,3)%m(jr,jc) = jac_loc(7, 3)%m(jr,jc) &
-          + basis_vals(jr)*dt_fac*tmp2(2)*int_factor/(coords(1)+gs_epsilon)
+          + basis_vals(jr)*dt_fac*tmp2(2)*int_factor/(coords(1)+gs_epsilon) &
+          - basis_vals(jr)*dt_fac*basis_vals(jc)*dpsi(3)*int_factor/(coords(1)+gs_epsilon)**2
         ELSE
           DO l=1,3
             jac_loc(7,l+1)%m(jr,jc) = jac_loc(7, l+1)%m(jr,jc) &
@@ -1810,7 +2052,8 @@ DO i=1,mesh%nc
         tmp2 = cross_product(basis_grads(:,jc),dvel(2,:))
         IF(cyl_flag)THEN
           jac_loc(7, 6)%m(jr,jc) = jac_loc(7, 6)%m(jr,jc) &
-          + basis_vals(jr)*dt_fac*tmp2(2)*int_factor/(coords(1)+gs_epsilon)
+          + basis_vals(jr)*dt_fac*tmp2(2)*int_factor/(coords(1)+gs_epsilon) &
+          - basis_vals(jr)*dt_fac*vel(2)*basis_grads(3,jc)*int_factor/(coords(1)+gs_epsilon)**2
         ELSE
           jac_loc(7, 6)%m(jr,jc) = jac_loc(7, 6)%m(jr,jc) &
           + basis_vals(jr)*dt_fac*tmp2(2)*int_factor
@@ -1884,7 +2127,7 @@ END DO
 CALL self%fe_rep%mat_destroy_local(jac_loc)
 DEALLOCATE(basis_vals,basis_grads,T_weights_loc,vel_weights_loc, &
           n_weights_loc, psi_weights_loc, by_weights_loc, cell_dofs,jac_loc,iloc)
-IF (eta_lag) DEALLOCATE(T_eta_loc)
+IF (eta_lag) DEALLOCATE(T_eta_loc, n_eta_loc)
 IF (incomp) DEALLOCATE(basis_vals_p, basis_grads_p, cell_dofs_p)
 !$omp end parallel
 END BLOCK
@@ -1913,6 +2156,7 @@ DEALLOCATE(tmp,n_weights,vel_weights, T_weights, &
           by_weights, psi_weights)
 DEALLOCATE(psi_vac_weights)
 IF(ASSOCIATED(T_eta_weights))DEALLOCATE(T_eta_weights)
+IF(ASSOCIATED(n_eta_weights))DEALLOCATE(n_eta_weights)
 end subroutine build_approx_jacobian
 
 !---------------------------------------------------------------------------
@@ -2007,11 +2251,13 @@ CALL self%fe_rep%vec_create(self%u0)
 !---Create vacuum poloidal flux offset for the psi field (initialized to zero)
 CALL oft_blagrange%vec_create(self%psi_vac)
 CALL self%psi_vac%set(0.d0)
-!---Create the temperature snapshot used for Spitzer resistivity when T is evolved
+!---Create the temperature/density snapshots used for Spitzer resistivity when T is evolved
 !   (marked invalid until xmhd_2d_freeze_eta_temp is called with a solution)
 IF(.NOT.self%incomp)THEN
   CALL oft_blagrange%vec_create(self%T_eta)
   CALL self%T_eta%set(0.d0)
+  CALL oft_blagrange%vec_create(self%n_eta)
+  CALL self%n_eta%set(0.d0)
   self%T_eta_valid=.FALSE.
 END IF
 !---Create Jacobian matrix

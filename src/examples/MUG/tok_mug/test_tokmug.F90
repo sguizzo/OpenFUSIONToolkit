@@ -45,16 +45,20 @@ INTEGER(i4) :: ndims, nl_its, l_its, nretry
 INTEGER(i4) :: npoints
 integer(i4), allocatable, dimension(:) :: dim_sizes
 INTEGER(i4), POINTER, DIMENSION(:) :: cell_dofs
-REAL(r8) :: dt = 0.04336664911469267 
+REAL(r8) :: dt = 0.04336664911469267
 REAL(r8) :: t = 0.d0
+REAL(r8) :: pulse_frac !< Trapezoid ramp/flattop/ramp-down fraction in [0,1] applied to pulse_amp
+INTEGER(i4) :: pulse_phase = -1, pulse_phase_prev = -1 !< Current/previous pulse-schedule phase (0=pre, 1=ramp-up, 2=flattop, 3=ramp-down, 4=post); used to apply the phase's target dt only on entry, so a dt reduced by step() due to a solver-failure retry is not clobbered on later iterations of the same phase
 REAL (r8):: ip_ratio_target = 0.205
 REAL (r8):: ip_target = 7.87E6
-REAL(r8), allocatable, dimension(:) :: psi_eq, psi_pert, psi_total, eta_reg,curr_reg, areas, dens_reg, visc_reg, voltages
+REAL(r8), allocatable, dimension(:) :: psi_eq, psi_pert, psi_total, eta_reg,curr_reg, areas, dens_reg, kappa_reg,visc_reg, voltages
 REAL(r8), allocatable, dimension(:) :: coil_step !< Coil currents passed to each step (baseline, then pulsed)
 REAL(r8), allocatable, dimension(:) :: coil_base !< Fixed baseline coil currents (step overwrites equil%coil_currs)
 INTEGER(i4) :: nstep_total = 5000 !< Number of time steps (dt*nstep should approach the wall time ~ms)
-INTEGER(i4) :: pulse_start = 2!< Step at which the coil pulse turns on (let the system settle first)
-INTEGER(i4) :: pulse_end = 12 !< Step at which the coil pulse turns off (let the system settle first)
+REAL(r8) :: t_pulse_start = 5.d-4 !< Time at which the coil pulse ramp-up begins (let the system settle first) [s]
+REAL(r8) :: t_ramp_dur = 5.d-4 !< Duration of the ramp-up (and ramp-down) leg of the pulse [s] (0.5 ms each: 1 ms of ramp + 1 ms flattop = 2 ms pulse)
+REAL(r8) :: t_flat_dur = 1.d-3 !< Duration of the flattop [s]
+REAL(r8) :: pulse_amp = 5.d5*mu0 !< Peak coil-pair perturbation amplitude at the top of the flattop
 LOGICAL :: do_pulse = .TRUE. !< Run WITH the coil pulse (.TRUE.) or a no-pulse baseline (.FALSE.) for common-mode subtraction
 REAL(r8) :: lin_tol = 1.d-11
 REAL(r8) :: nl_tol = 1.d-9
@@ -62,7 +66,7 @@ REAL (r8):: coords(3), psi(1), q(1)
 LOGICAL :: pm=.FALSE.
 LOGICAL :: success
 LOGICAL, allocatable, dimension(:) :: mhd_flag
-CHARACTER(LEN=25) :: filename_eq = 'eq_o3.h5' !< Name of input file for mesh, fix later for variable length
+CHARACTER(LEN=25) :: filename_eq = 'fnsf_eq_nolim.h5' !< Name of input file for mesh, fix later for variable length
 CHARACTER(LEN=25) :: filename_pert= 'paper_pert_0115.h5' !< Name of input file for mesh, fix later for variable length
 CHARACTER(LEN=25) :: tmp_str
 TYPE(oft_mugtok_td):: b_sim 
@@ -99,33 +103,25 @@ machine%save_visit = .FALSE.
 machine%ncoil_regs = 7
 machine%ncoils = 7
 ALLOCATE(machine%coil_regions(machine%ncoil_regs))
-machine%coil_regions(1)%id = 9
+machine%coil_regions(1)%id = 4
 machine%coil_regions(1)%area = 1.8
-machine%coil_regions(2)%id = 10
+machine%coil_regions(2)%id = 5
 machine%coil_regions(2)%area = 0.25
-machine%coil_regions(3)%id = 11
+machine%coil_regions(3)%id = 6
 machine%coil_regions(3)%area = 0.25
-machine%coil_regions(4)%id = 12
+machine%coil_regions(4)%id = 7
 machine%coil_regions(4)%area = 0.25
-machine%coil_regions(5)%id = 13
+machine%coil_regions(5)%id = 8
 machine%coil_regions(5)%area = 0.25
-machine%coil_regions(6)%id = 14
+machine%coil_regions(6)%id = 9
 machine%coil_regions(6)%area = 0.25
-machine%coil_regions(7)%id = 15
+machine%coil_regions(7)%id = 10
 machine%coil_regions(7)%area = 0.25
 
-machine%ncond_regs = 5
+machine%ncond_regs = 1
 ALLOCATE(machine%cond_regions(machine%ncond_regs))
-machine%cond_regions(1)%id = 4
-machine%cond_regions(1)%eta = 6.9d-7*1000.d0/mu0
-machine%cond_regions(2)%id = 5
-machine%cond_regions(2)%eta = 1.14d-6*1000.d0/mu0
-machine%cond_regions(3)%id = 6
-machine%cond_regions(3)%eta = 1.14d-6*1000.d0/mu0
-machine%cond_regions(4)%id = 7
-machine%cond_regions(4)%eta = 6.9d-7*1000.d0/mu0
-machine%cond_regions(5)%id = 8
-machine%cond_regions(5)%eta = 6.9d-7*1000.d0/mu0
+machine%cond_regions(1)%id = 3
+machine%cond_regions(1)%eta = 1.2d-6/mu0
 
 
 CALL gs_setup_walls(machine)
@@ -133,7 +129,7 @@ CALL gs_setup_walls(machine)
 ALLOCATE(machine%coil_nturns(machine%fe_rep%mesh%nreg,machine%ncoils))
 machine%coil_nturns = 0
 DO j=1, machine%ncoils
-  machine%coil_nturns(j + 8, j) = 1
+  machine%coil_nturns(j + 3, j) = 1
 END DO
 
 machine%free = .TRUE.
@@ -204,8 +200,8 @@ equil%ip_ratio_target=ip_ratio_target
 ! equil%p_scale = 0.28658184156588085
 ! equil%ffp_scale = 2.596639717247778
 ! ORDER 3
-equil%p_scale = 0.2866168882023207
-equil%ffp_scale = 2.5969479398703386
+equil%p_scale = 0.28660481621440204
+equil%ffp_scale = 2.5968545236582443
 tmp_str = 'tokamaker_f.prof'
 CALL gs_profile_load(tmp_str,equil%I)
 tmp_str = 'tokamaker_p.prof'
@@ -216,8 +212,7 @@ equil%P%plasma_bounds=equil%plasma_bounds
 equil%vcontrol_val = 0.d0
 
 ALLOCATE(equil%coil_currs(machine%ncoil_regs))
-equil%coil_currs = [-10004540.249054534, 8131096.462417697, 8130193.40495448, -2752265.1799410507, -2755148.7923723585, -1429157.477860515,  -1424955.0239338675]*mu0
-equil%coil_currs = [-10004577.39633093, 8099063.653129182, 8099246.217039664, -2754682.325483237, -2754900.2110607256, -1425245.0543276411, -1424994.322781849]*mu0
+equil%coil_currs = [-10004572.166210812, 8102295.430136438, 8102218.253968936, -2754318.6222443744, -2754274.734674027, -1425079.7558536823, -1425194.4951736322]*mu0
 ALLOCATE(areas(machine%ncoil_regs))
 areas = [1.8,0.25, 0.25, 0.25, 0.25, 0.25, 0.25 ]
 ! equil%coil_currs = equil%coil_currs/areas
@@ -243,7 +238,13 @@ dens_reg(1) = 2.d0*proton_mass ! plasma ion mass [kg]
 ! the startup transient from an imperfect equilibrium settles quickly.
 ALLOCATE(visc_reg(machine%mesh%nreg))
 visc_reg = -1.d0
-visc_reg(1) = 1.d4
+visc_reg(1) = 5.d1
+
+
+! Thermal conductivity kappa=chi*n [1/(m s)]: chi=1.d-1 m^2/s at n=n_scale
+ALLOCATE(kappa_reg(machine%mesh%nreg))
+kappa_reg = -1.d0
+kappa_reg(1) = 1.d-1*b_sim%n_scale
 
 ! Evolve the plasma (region 1) with compressible MHD; all other regions
 ! (conductors, vacuum) are handled by TokaMaker
@@ -264,30 +265,66 @@ b_sim%use_full_lu = .TRUE.
 ! has no effect, because setup defines field 6 as (total equilibrium flux - coil
 ! vacuum flux), so any coil change is exactly cancelled in the initial total flux.
 ! To drive the plasma, the coils must be pulsed DURING the step loop (below).
-CALL b_sim%setup_mhd(equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg)
+CALL b_sim%setup_mhd(equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg, kappa_reg=kappa_reg, mass_scale=100000.d0)
+
+! TEMPORARY: disable the temperature sink (setup_mhd sets tau_sink=1.d-3, T_sink=5 eV
+! for DOFs left behind as the plasma boundary recedes); tau_sink<=0 turns it off. Remove
+! this line to restore the sink.
+b_sim%mug%tau_sink = -1.d0
 
 ! Capture a FIXED baseline: step() overwrites equil%coil_currs each step with the
 ! prescribed values, so we cannot use it as the unperturbed reference in the loop.
 ALLOCATE(coil_base(machine%ncoil_regs), coil_step(machine%ncoil_regs))
-coil_step = equil%coil_currs
+coil_base = equil%coil_currs
+coil_step = coil_base
 ! DO i=1,nstep_total
-!   ! Start from the fixed baseline each step, then (if do_pulse) pulse a pair of PF
-!   ! coils on from step `pulse_start` onward. Because field 6 is carried over between
-!   ! steps (not re-derived), this changes the TOTAL flux and drives a real response.
-!   ! For a clean signal, run once with do_pulse=.TRUE. and once with .FALSE. from the
-!   ! same setup and subtract: the equilibrium-imbalance transient is common-mode and
-!   ! cancels, leaving only the coil-driven motion.
-!   ! coil_step = coil_base
-!   IF(do_pulse .AND. i>=pulse_start .AND. i<=pulse_end)THEN
-!     coil_step(2) = coil_step(2) + 1.d5*mu0/10.0d0
-!     coil_step(3) = coil_step(3) - 1.d5*mu0/10.0d0
-!     dt = 4.d-5
-!   ELSE
-!     dt = 4.d-5
+!   ! Start from the fixed baseline each step, then (if do_pulse) apply a trapezoid
+!   ! ramp-up / flattop / ramp-down perturbation to a pair of PF coils, timed off the
+!   ! simulation clock `t` (not the step index), so the pulse shape is independent of
+!   ! dt. Because field 6 is carried over between steps (not re-derived), this changes
+!   ! the TOTAL flux and drives a real response. For a clean signal, run once with
+!   ! do_pulse=.TRUE. and once with .FALSE. from the same setup and subtract: the
+!   ! equilibrium-imbalance transient is common-mode and cancels, leaving only the
+!   ! coil-driven motion.
+!   pulse_frac = 0.d0
+!   IF(do_pulse)THEN
+!     IF(t < t_pulse_start)THEN
+!       pulse_frac = 0.d0
+!       pulse_phase = 0
+!       IF (t > 0.d0) dt = 5.d-5
+!     ELSE IF(t < t_pulse_start+t_ramp_dur)THEN
+!       pulse_frac = (t-t_pulse_start)/t_ramp_dur                    ! ramp-up
+!       pulse_phase = 1
+!     ELSE IF(t < t_pulse_start+t_ramp_dur+t_flat_dur)THEN
+!       pulse_frac = 1.d0                                            ! flattop
+!       pulse_phase = 2
+!     ELSE IF(t < t_pulse_start+2.d0*t_ramp_dur+t_flat_dur)THEN
+!       pulse_frac = 1.d0 - (t-(t_pulse_start+t_ramp_dur+t_flat_dur))/t_ramp_dur ! ramp-down
+!       pulse_phase = 3
+!     ELSE
+!       pulse_frac = 0.d0
+!       pulse_phase = 4
+!     END IF
+!     ! Only (re-)apply the phase's target dt when first entering that phase. On later
+!     ! iterations of the same phase, leave `dt` alone: step() writes back whatever dt it
+!     ! actually used (possibly halved by a solver-failure retry), and re-imposing the
+!     ! phase's nominal dt here every iteration would silently discard that reduction.
+!     IF(pulse_phase /= pulse_phase_prev)THEN
+!       IF(pulse_phase==1 .OR. pulse_phase==2 .OR. pulse_phase==3)THEN
+!         dt = 5.d-5
+!       ELSE
+!         dt = 1.d-3
+!       END IF
+!       pulse_phase_prev = pulse_phase
+!     END IF
 !   END IF
+!   coil_step = coil_base
+!   coil_step(2) = coil_base(2) + pulse_frac*pulse_amp
+!   coil_step(3) = coil_base(3) - pulse_frac*pulse_amp
 !   write(*,*) "Step: ", i, "  t = ", t
 !   write(*,*) "Coil currents: ", coil_step(1:3)
 !   write(*,*) "opoint: ", b_sim%tkmr%gs_equil%o_point
+!   write(*,*) "diverted: ", b_sim%tkmr%gs_equil%diverted
 !   CALL b_sim%step(coil_step, t, dt, nl_its, l_its, nretry)
 !   ! IF (MOD(i,25)==0 ) THEN
 !   !   CALL b_sim%plot()

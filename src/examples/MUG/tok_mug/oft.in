@@ -13,5 +13,5 @@
 /
 
 &native_mesh_options
-  filename="eq_o3.h5"
+  filename="fnsf_eq_nolim.h5"
 /

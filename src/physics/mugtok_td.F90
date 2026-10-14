@@ -52,15 +52,28 @@ CLASS(oft_solver), POINTER :: pre => NULL() !< Preconditioner for the approximat
 TYPE(oft_nksolver) :: nksolver !< Newton-Krylov solver for time-advance
 TYPE(oft_fem_comp_type), POINTER :: fe_rep => NULL() !< Finite element representation for solution fields (without coil currents)
 LOGICAL :: pm = .TRUE.
+LOGICAL :: nl_debug = .FALSE. !< Print per-field Newton diagnostics each nonlinear iteration ! NLDEBUG
 LOGICAL :: save_rst = .FALSE. !< If true, write restart files ('mugtok_NNNNN.rst') for plotting
 INTEGER(i4) :: rst_freq = 1 !< Restart-file output frequency (in steps)
 INTEGER(i4) :: rst_count = 0 !< Completed-step counter (used as the restart-file index)
 LOGICAL, ALLOCATABLE, DIMENSION(:) :: plasma_flag !< True for DOFs in or on the border of region 1 (the plasma)
+REAL(r8) :: psi_limiting = 0.d0 !< Edge (LCFS) poloidal flux captured the first time the plasma is limited (not diverted); set once and never overwritten thereafter. See mugtok_update_psi_limiting/mugtok_apply_sink
+LOGICAL :: psi_limiting_set = .FALSE. !< True once `psi_limiting` has been captured
 INTEGER(i4) :: F0_node = 0 !< Index of the first plasma_flag=.TRUE. DOF, used to evolve F0 (0 if none)
 REAL(r8) :: f_scale_prev = 1.d0 !< FF' scale (tkmr%f_scale) from previous timestep
 CLASS(flux_func), POINTER :: I_prev => NULL() !< FF' profile (gs_equil%I) from previous timestep
 LOGICAL :: mhd_plasma = .FALSE. !< True when the plasma (region 1) is evolved with MHD (set by setup_mhd)
+INTEGER(i4) :: pre_freq = 1 !< Rebuild the approximate Jacobian and refactor the preconditioner every pre_freq steps (always on a dt change, on request via pre_force_update, and before halving dt after a Newton failure with a stale preconditioner)
+INTEGER(i4) :: pre_age = 0 !< Number of steps since the approximate Jacobian/preconditioner was last rebuilt
+LOGICAL :: pre_force_update = .TRUE. !< Force a Jacobian/preconditioner rebuild on the next step (set after changing physics coefficients, e.g. nu, m_i, kappa)
 LOGICAL :: use_full_lu = .FALSE. !< In MHD-plasma mode, use a complete LU of the coupled Jacobian instead of per-field block-Jacobi (better linear convergence in the stiff near-ideal regime, but much higher memory). Set before calling setup_mhd.
+CLASS(flux_func), POINTER :: n_prof => NULL() !< Normalized density profile nhat(psihat), evaluated via %fp (linterp values). If set before setup_mhd (together with T_prof), n and T are seeded from the profiles and n is evolved
+CLASS(flux_func), POINTER :: T_prof => NULL() !< Normalized temperature profile That(psihat), evaluated via %fp (linterp values). See n_prof
+REAL(r8) :: n_scale = 1.d20 !< Density scale [m^-3]: n = n_offset + n_scale*nhat inside the plasma (also used as mug%den_scale)
+REAL(r8) :: n_offset = 0.d0 !< Density offset [m^-3]: n = n_offset outside the plasma
+REAL(r8) :: T_scale = 1.d3 !< Temperature scale [eV]: T = T_offset + T_scale*That inside the plasma
+REAL(r8) :: T_offset = 0.d0 !< Temperature offset [eV]: T = T_offset outside the plasma
+LOGICAL :: evolve_n = .TRUE. !< When n_prof is set, evolve the density with the continuity equation; if false, n is held fixed at its profile-initialized values
 
 contains
     !> Setup time-dependent simulation (Grad-Shafranov plasma + MHD conductors)
@@ -71,6 +84,8 @@ contains
     procedure :: delete => delete_mugtok_td
     !> Take a timestep
     procedure :: step => step_mugtok_td
+    !> Restore the state from an rst file to resume a run
+    procedure :: restart => mugtok_rst_restore
     !> Plot from rst files
     procedure :: plot => mugtok_td_plot
 END TYPE oft_mugtok_td
@@ -90,6 +105,9 @@ contains
 end type oft_mugtok_td_mfop
 
 TYPE(oft_mugtok_td), POINTER :: current_sim => NULL() !<Current mug/tokamaker simulation object
+CLASS(oft_vector), POINTER :: dbg_uprev => NULL() !< Previous Newton iterate ! NLDEBUG
+CLASS(oft_vector), POINTER :: dbg_wrk => NULL() !< Work vector ! NLDEBUG
+INTEGER(i4) :: dbg_it = 0 !< Newton iteration counter for diagnostics ! NLDEBUG
 CLASS(oft_bmesh), POINTER, PUBLIC :: mesh => NULL() !< Pointer to FE mesh
 CLASS(oft_scalar_bfem), POINTER :: lag_rep => NULL()!< Pointer to single field FE representation 
 
@@ -190,6 +208,7 @@ mhd_sim%dt = dt
 mhd_sim%den_scale = 1.d0
 
 CALL mhd_sim%setup(mg_mesh, lag_rep%order, fe_rep_in =lag_rep)
+mhd_sim%sink_func => mugtok_apply_sink
 
 !------------------------------------------------------------------------------
 ! Set up plasma flag and F0 node
@@ -480,9 +499,9 @@ ALLOCATE(self%mfmat)
 CALL self%mfmat%setup(self%tmp,self%nlfun)
 
 ALLOCATE(self%mf_solver)
-self%mfmat%b0=1.d-4
+self%mfmat%b0=1.d-3
 self%mf_solver%A=>self%mfmat
-self%mf_solver%its=1000
+self%mf_solver%its=250
 self%mf_solver%nrits=40
 self%mf_solver%atol=lin_tol
 self%mf_solver%itplot=1
@@ -510,16 +529,20 @@ end subroutine mugtok_finalize_setup
 
 !---------------------------------------------------------------------------
 !> Setup a combined simulation in which the plasma (region 1) is evolved as a
-!! compressible MHD region rather than by Grad-Shafranov. Density is a flat,
-!! pinned field (1e19 m^-3). Temperature is initialized from the equilibrium
-!! pressure profile, T(psi)=P(psi)/(2*k*n), and then evolved with the MHD
+!! compressible MHD region rather than by Grad-Shafranov. By default density is
+!! a flat, pinned field (den_scale) and temperature is initialized from the
+!! equilibrium pressure profile, T(psi)=P(psi)/(2*k*n). If `n_prof` and `T_prof`
+!! are set before this call, n and T are instead initialized from those profiles
+!! (n = n_offset + n_scale*nhat, T = T_offset + T_scale*That inside the plasma,
+!! the offsets outside) and density is evolved with the continuity equation in
+!! the MHD regions (pinned outside), unless `evolve_n=.FALSE.` (n held fixed). Temperature is evolved with the MHD
 !! temperature equation in the MHD regions (pinned at their boundary and
 !! outside); set `evolve_T=.FALSE.` to instead hold T to the T(psi) closure
 !! evaluated pointwise inside MUG (see mugtok_T_of_psi / xmhd_2d T_func). The
 !! poloidal flux (psi) and toroidal field function (F=R*B_phi) evolve with full
 !! MHD; F is initialized from the equilibrium profile.
 !---------------------------------------------------------------------------
-subroutine setup_mugtok_mhd_td(self, equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg, toroidal_flow, mass_scale, use_spitzer, chi_reg, evolve_T)
+subroutine setup_mugtok_mhd_td(self, equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg, toroidal_flow, mass_scale, use_spitzer, kappa_reg, evolve_T, D_reg, evolve_pressure)
 CLASS(oft_mugtok_td), INTENT(inout), TARGET :: self !< Simulation object to be setup
 TYPE(gs_equil), INTENT(inout), TARGET :: equil !< Tokamaker equilibrium object
 REAL(8), INTENT(in) :: dt !< Desired timestep [s]
@@ -529,13 +552,15 @@ LOGICAL, INTENT(in) :: mhd_flag(:) !< True for regions where MHD should be used 
 REAL(8), INTENT(in) :: dens_reg(:) !< Ion mass [kg] in each region (used as m_i for the compressible model)
 REAL(8), INTENT(in) :: visc_reg(:) !< Viscosity [m^2/s] in each region
 REAL(8), INTENT(in), optional :: eta_reg(:,:) !< Electrical resistivity [in plane, out of plane], in units of mu0. Defaults to TokaMaker region resistivities
-LOGICAL, INTENT(in), optional :: toroidal_flow !< Allow toroidal (phi) flow in MHD regions
+LOGICAL, INTENT(in), optional :: toroidal_flow !< Allow toroidal (phi) flow in MHD regions (default .TRUE.)
 REAL(8), INTENT(in), optional :: mass_scale !< Factor by which the plasma (region 1) ion mass is inflated for numerical acceleration (default 100)
 LOGICAL, INTENT(in), optional :: use_spitzer !< Use Spitzer resistivity eta(n,T) in the MHD regions (default .TRUE.)
-REAL(8), INTENT(in), optional :: chi_reg(:) !< Thermal diffusivity [m^2/s] in each region, used when the temperature is evolved (defaults to 1 m^2/s in the MHD regions and 0 elsewhere)
+REAL(8), INTENT(in), optional :: kappa_reg(:) !< Thermal conductivity kappa=chi*n [1/(m s)] in each region, used when the temperature is evolved (defaults to 1 m^2/s * n_scale in the MHD regions and 0 elsewhere)
 LOGICAL, INTENT(in), optional :: evolve_T !< Evolve the temperature with the MHD temperature equation (default .TRUE.). If false, T is held to the T(psi) closure
+REAL(8), INTENT(in), optional :: D_reg(:) !< Density diffusivity [m^2/s] in each region, used when the density is evolved (defaults to 1e-6 m^2/s in the MHD regions and 0 elsewhere)
+LOGICAL, INTENT(in), optional :: evolve_pressure !< Add the -(T/n)*D*lap(n) term to the temperature equation so density diffusion conserves pressure (default .FALSE.; see oft_xmhd_2d_sim%evolve_pressure)
 CLASS(multigrid_mesh), POINTER :: mg_mesh
-LOGICAL :: tor_flow, spitzer, evolve_temp
+LOGICAL :: tor_flow, spitzer, evolve_temp, evolve_dens
 REAL(r8) :: mscale
 INTEGER(i4) :: i,j
 TYPE(oft_xmhd_2d_sim), POINTER :: mhd_sim
@@ -549,6 +574,14 @@ IF(.NOT.mhd_flag(1)) CALL oft_abort('setup_mhd requires mhd_flag(1)=.TRUE. (plas
                                     'setup_mugtok_mhd_td', __FILE__)
 self%mhd_plasma = .TRUE.
 current_sim => self
+!---n/T are seeded from profiles when both profiles are supplied, and density is
+!   then evolved unless evolve_n=.FALSE. (n held at its initial profile)
+IF(ASSOCIATED(self%n_prof) .NEQV. ASSOCIATED(self%T_prof)) CALL oft_abort('n_prof and T_prof must be set together', &
+                                                                        'setup_mugtok_mhd_td', __FILE__)
+evolve_dens = ASSOCIATED(self%n_prof) .AND. self%evolve_n
+!---n = n_offset outside the plasma, and the momentum/temperature equations divide by n
+IF(ASSOCIATED(self%n_prof) .AND. (self%n_offset <= 0.d0)) CALL oft_abort('n_offset must be > 0 when n_prof is set', &
+                                                             'setup_mugtok_mhd_td', __FILE__)
 
 !--Take mesh and single field FE reps from TokaMaker equilibrium
 mesh => equil%device%mesh
@@ -592,22 +625,39 @@ mscale = 400.d0
 IF (PRESENT(mass_scale)) mscale = mass_scale
 mhd_sim%m_i(1) = mhd_sim%m_i(1)*mscale
 mhd_sim%nu = visc_reg
+mhd_sim%nu2_ratio = 2.d0 !< Bulk (compressive) viscosity = 2x shear viscosity, to damp compressive noise
+mhd_sim%drop_convection = .TRUE. !< Drop the (v.grad)v convective term from the momentum equation
 mhd_sim%gamma = 5.d0/3.d0
-mhd_sim%D_diff = 0.d0 !unused: density is a flat, pinned field
-!---Thermal diffusivity for the evolved temperature. The default (1 m^2/s in the
+!---Density diffusivity: defaults to 1e-6 m^2/s in the MHD regions when density
+!   is evolved (unused when density is a flat, pinned field)
+mhd_sim%D_diff = 0.d0
+IF (PRESENT(D_reg)) THEN
+  mhd_sim%D_diff = D_reg
+ELSE IF (evolve_dens) THEN
+  WHERE (mhd_flag) mhd_sim%D_diff = 1.d-6
+END IF
+mhd_sim%evolve_pressure = .FALSE.
+IF (PRESENT(evolve_pressure)) mhd_sim%evolve_pressure = evolve_pressure
+!---Thermal conductivity kappa=chi*n for the evolved temperature (xmhd_2d then
+!   uses chi=kappa/n pointwise). The default (chi=1 m^2/s at n=n_scale in the
 !   MHD regions) gives a diffusion time L^2/chi ~ 1 s, long compared to the
 !   ms-scale transients of interest, so the initial T(psi) profile is retained
 !   while advection of T stays smooth on the mesh scale.
 evolve_temp = .TRUE.
 IF (PRESENT(evolve_T)) evolve_temp = evolve_T
-IF (PRESENT(chi_reg)) THEN
-  mhd_sim%chi = chi_reg
-ELSE IF (evolve_temp) THEN
-  mhd_sim%chi = 0.d0
-  WHERE (mhd_flag) mhd_sim%chi = 1.d0
-ELSE
-  mhd_sim%chi = 0.d0 !unused: temperature is prescribed via the T(psi) closure
+mhd_sim%chi = 0.d0 !unused: replaced by kappa, or T is prescribed via the T(psi) closure
+IF (evolve_temp) THEN
+  ALLOCATE(mhd_sim%kappa(mesh%nreg))
+  IF (PRESENT(kappa_reg)) THEN
+    mhd_sim%kappa = kappa_reg
+  ELSE
+    mhd_sim%kappa = 0.d0
+    WHERE (mhd_flag) mhd_sim%kappa = 1.d0*self%n_scale
+  END IF
 END IF
+!---Anisotropic thermal conduction: kappa(:) above is the cross-field conductivity,
+!   and field-aligned transport is faster by chi_par_mult (default 1e3)
+mhd_sim%chi_aniso = .TRUE.
 IF(PRESENT(eta_reg)) THEN
    mhd_sim%eta = eta_reg
 ELSE
@@ -621,15 +671,21 @@ spitzer = .TRUE.
 IF (PRESENT(use_spitzer)) spitzer = use_spitzer
 mhd_sim%use_spitzer = spitzer
 
-tor_flow = .FALSE.
+tor_flow = .TRUE. !Toroidal flow evolved in MHD regions by default
 IF (PRESENT(toroidal_flow)) tor_flow = toroidal_flow
 mhd_sim%cyl_flag = .TRUE.
 mhd_sim%incomp = .FALSE. !compressible model (so pressure = 2*k*n*T enters momentum)
 mhd_sim%dt = dt
-!Density field is kept flat at 1.0, so den_scale sets the physical number density
+!Density field is normalized by den_scale (flat at 1.0 when not evolved, so
+!den_scale is then the physical number density)
 mhd_sim%den_scale = 1.d20
+IF (ASSOCIATED(self%n_prof)) mhd_sim%den_scale = self%n_scale
 
 CALL mhd_sim%setup(mg_mesh, lag_rep%order, fe_rep_in=lag_rep)
+mhd_sim%sink_func => mugtok_apply_sink
+!---Temperature sink term for DOFs left behind as the plasma boundary recedes
+mhd_sim%tau_sink = 1.d-3 ! 1 ms relaxation timescale
+mhd_sim%T_sink = 5.d0 ! [eV]
 
 !---When the temperature is not evolved, it is a prescribed function of the local
 !   fields (T = T(psi)) evaluated pointwise in MUG instead of reconstructed from
@@ -638,8 +694,8 @@ CALL mhd_sim%setup(mg_mesh, lag_rep%order, fe_rep_in=lag_rep)
 IF (.NOT.evolve_temp) mhd_sim%T_func => mugtok_T_of_psi
 
 !------------------------------------------------------------------------------
-! Boundary conditions: n is prescribed (pinned); psi and F evolve; velocity and
-! (when evolved) temperature evolve in the MHD regions and are pinned elsewhere
+! Boundary conditions: psi and F evolve; velocity, (when evolved) temperature,
+! and (when evolved) density evolve in the MHD regions and are pinned elsewhere
 !------------------------------------------------------------------------------
 IF (ASSOCIATED(mhd_sim%n_bc)) NULLIFY(mhd_sim%n_bc)
 IF (ASSOCIATED(mhd_sim%velx_bc)) NULLIFY(mhd_sim%velx_bc)
@@ -659,8 +715,10 @@ ALLOCATE(mhd_sim%by_bc(mhd_sim%fe_rep%fields(7)%fe%ne))
 
 mhd_sim%psi_bc = .FALSE.
 mhd_sim%by_bc = .FALSE.
-mhd_sim%n_bc = .TRUE. !density prescribed (flat), not evolved
-!Temperature: evolved in the MHD regions, or prescribed everywhere via T(psi)
+mhd_sim%n_bc = .NOT.evolve_dens !density prescribed (flat, or fixed initial profile) unless evolved
+!Temperature: evolved (free) by default when evolved at all; pinned (Dirichlet)
+!below on any DOF touched by a non-MHD cell (including the MHD/non-MHD
+!interface), and everywhere when not evolved (T(psi) closure)
 mhd_sim%T_bc = .NOT.evolve_temp
 mhd_sim%velx_bc = .FALSE.
 mhd_sim%velz_bc = .FALSE.
@@ -669,8 +727,7 @@ IF (tor_flow) THEN
 ELSE
   mhd_sim%vely_bc = .TRUE.
 END IF
-!Pin velocity to zero outside the MHD regions, and (when evolved) hold the
-!temperature fixed there, which sets its boundary condition at the MHD boundary
+!Pin velocity, temperature and density to their boundary values outside the MHD regions
 ALLOCATE(cell_dofs(lag_rep%nce))
 DO i=1,mesh%nc
   IF(.NOT.mhd_flag(mesh%reg(i)))THEN
@@ -680,6 +737,7 @@ DO i=1,mesh%nc
       mhd_sim%vely_bc(cell_dofs(j)) = .TRUE.
       mhd_sim%velz_bc(cell_dofs(j)) = .TRUE.
       mhd_sim%T_bc(cell_dofs(j)) = .TRUE.
+      mhd_sim%n_bc(cell_dofs(j)) = .TRUE.
     END DO
   END IF
 END DO
@@ -713,7 +771,7 @@ END IF
 !------------------------------------------------------------------------------
 ! Set initial field values
 !------------------------------------------------------------------------------
-CALL self%u%set(1.d0, 1) !flat density (physical n = den_scale = 1e19)
+CALL self%u%set(1.d0, 1) !flat density (physical n = den_scale); overwritten below if n_prof is set
 CALL self%u%set(0.d0, 2)
 CALL self%u%set(0.d0, 3)
 CALL self%u%set(0.d0, 4)
@@ -793,6 +851,20 @@ END IF
 end subroutine mugtok_T_of_psi
 
 !---------------------------------------------------------------------------
+!> Test whether a point is inside the plasma (closed flux surface) region,
+!! i.e. psi is within the current plasma_bounds. Uses the module current_sim
+!! pointer to reach the equilibrium. Used by mugtok_seed_fields, the T(psi)
+!! closure, and mugtok_apply_sink.
+!---------------------------------------------------------------------------
+function mugtok_in_plasma(coords, psi) result(in_plasma)
+real(r8), intent(in) :: coords(3), psi
+logical :: in_plasma
+type(gs_equil), pointer :: eq
+eq => current_sim%tkmr%gs_equil
+in_plasma = gs_test_bounds(eq, coords(1:2)) .AND. (psi > eq%plasma_bounds(1))
+end function mugtok_in_plasma
+
+!---------------------------------------------------------------------------
 !> Update the equilibrium plasma bounds (and the P/I flux-function bounds)
 !! from the current total poloidal flux (field 6 + vacuum). Used so the T(psi)
 !! closure and the F/T seeding normalize psi consistently.
@@ -816,31 +888,45 @@ DEALLOCATE(psi6, pvac, eqpsi)
 end subroutine mugtok_refresh_bounds
 
 !---------------------------------------------------------------------------
-!> Seed the toroidal field function F (field 7) and the temperature (field 5) on
-!! the plasma-region DOFs from the equilibrium profiles, T = P(psi)/(2*k*n).
-!! When the temperature is evolved this is its initial condition (and, on the
-!! DOFs pinned outside the MHD regions, its boundary value); otherwise it is
-!! carried for diagnostics only. Assumes mugtok_refresh_bounds has set eq%psi to
-!! the total flux.
+!> Seed the toroidal field function F (field 7), the temperature (field 5) and,
+!! when `n_prof`/`T_prof` are set, the density (field 1) on the plasma-region
+!! DOFs from the equilibrium profiles. With profiles, inside the plasma
+!! n = n_offset + n_scale*nhat(psihat) and T = T_offset + T_scale*That(psihat),
+!! and n = n_offset, T = T_offset everywhere else (including the DOFs pinned
+!! outside the MHD regions). Without profiles, n is left flat and
+!! T = P(psi)/(2*k*n) inside the plasma (0 outside). When the temperature is
+!! evolved this is its initial condition (and, on the DOFs pinned outside the
+!! MHD regions, its boundary value); otherwise it is carried for diagnostics
+!! only. Assumes mugtok_refresh_bounds has set eq%psi to the total flux.
 !---------------------------------------------------------------------------
 subroutine mugtok_seed_fields(self)
 class(oft_mugtok_td), intent(inout) :: self !< Simulation object
 type(gs_equil), pointer :: eq
-real(r8), pointer, dimension(:) :: f_vals, t_vals, eqpsi
+real(r8), pointer, dimension(:) :: f_vals, t_vals, n_vals, eqpsi
 integer(i4), allocatable :: cell_dofs_l(:)
 real(r8) :: f_pos(3), coord(3), psi_dof, F0_val, f_scale_i, p_scale_i, k_b, n_phys, p_eq
-logical :: in_plasma
+logical :: in_plasma, use_prof
 integer(i4) :: ic, jd, gd
 eq => self%tkmr%gs_equil
 F0_val = eq%I%f_offset
 f_scale_i = self%tkmr%f_scale
 p_scale_i = eq%p_scale
 k_b = self%mug%k_boltz
-n_phys = self%mug%den_scale ! density field is flat at 1.0
-NULLIFY(f_vals, t_vals, eqpsi)
+n_phys = self%mug%den_scale ! density field is flat at 1.0 (without profiles)
+use_prof = ASSOCIATED(self%n_prof)
+NULLIFY(f_vals, t_vals, n_vals, eqpsi)
 CALL self%u%get_local(f_vals, 7)
 CALL self%u%get_local(t_vals, 5)
+CALL self%u%get_local(n_vals, 1)
 CALL eq%psi%get_local(eqpsi) ! total poloidal flux (set by mugtok_refresh_bounds)
+IF(use_prof)THEN
+  !---Normalize the n/T profiles with the current plasma bounds; offsets everywhere
+  !   by default (overwritten inside the plasma below)
+  self%n_prof%plasma_bounds = eq%plasma_bounds
+  self%T_prof%plasma_bounds = eq%plasma_bounds
+  n_vals = self%n_offset/self%mug%den_scale
+  t_vals = self%T_offset
+END IF
 ALLOCATE(cell_dofs_l(lag_rep%nce))
 DO ic=1,mesh%nc
   IF(mesh%reg(ic) /= 1) CYCLE ! plasma region only
@@ -858,14 +944,64 @@ DO ic=1,mesh%nc
       f_vals(gd) = F0_val
       p_eq = 0.d0
     END IF
-    t_vals(gd) = MAX(p_eq, 0.d0)/(2.d0*k_b*n_phys)
+    IF(use_prof)THEN
+      !---linterp profiles store the profile values as the derivative dofs, so
+      !   %fp returns the (normalized) profile value itself at psihat
+      IF(in_plasma)THEN
+        n_vals(gd) = (self%n_offset + self%n_scale*self%n_prof%fp(psi_dof))/self%mug%den_scale
+        t_vals(gd) = self%T_offset + self%T_scale*self%T_prof%fp(psi_dof)
+      END IF
+    ELSE
+      t_vals(gd) = MAX(p_eq, 0.d0)/(2.d0*k_b*n_phys)
+    END IF
   END DO
 END DO
 DEALLOCATE(cell_dofs_l)
 CALL self%u%restore_local(f_vals, 7)
 CALL self%u%restore_local(t_vals, 5)
-DEALLOCATE(f_vals, t_vals, eqpsi)
+CALL self%u%restore_local(n_vals, 1)
+DEALLOCATE(f_vals, t_vals, n_vals, eqpsi)
 end subroutine mugtok_seed_fields
+
+!---------------------------------------------------------------------------
+!> Capture the edge (LCFS) poloidal flux the first time the plasma is limited
+!! (not diverted). This reference value (`psi_limiting`) is stored permanently
+!! -- once captured it is never overwritten -- and is later used by
+!! `mugtok_apply_sink` to identify points that were part of the (once-limited)
+!! plasma but have since fallen outside the current plasma boundary. Called
+!! once per accepted timestep (not per nonlinear iteration): psi_limiting is a
+!! path-dependent history variable, so it must only be set from the converged
+!! state of a step, not from transient intermediate Newton iterates. Assumes
+!! eq%plasma_bounds/eq%diverted already reflect the current step (refreshed
+!! via mugtok_refresh_bounds during the nonlinear solve in `step_mugtok_td`).
+!---------------------------------------------------------------------------
+subroutine mugtok_update_psi_limiting(self)
+class(oft_mugtok_td), intent(inout) :: self !< Simulation object
+IF(self%psi_limiting_set) RETURN
+IF(self%tkmr%gs_equil%diverted) RETURN
+self%psi_limiting = self%tkmr%gs_equil%plasma_bounds(1)
+self%psi_limiting_set = .TRUE.
+end subroutine mugtok_update_psi_limiting
+
+!---------------------------------------------------------------------------
+!> Test whether the temperature sink term should be applied at a point.
+!! Matches the xmhd_2d_sink_func interface (uses the module current_sim
+!! pointer to reach the equilibrium). Never applies while the plasma is
+!! currently diverted. Otherwise applies where psi is within the historical
+!! (once-limited) plasma boundary `psi_limiting` but the point does not
+!! satisfy the current in-plasma test -- i.e. points left behind as a limited
+!! plasma boundary recedes.
+!---------------------------------------------------------------------------
+function mugtok_apply_sink(coords, psi) result(apply_sink)
+real(r8), intent(in) :: coords(3), psi
+logical :: apply_sink
+type(gs_equil), pointer :: eq
+eq => current_sim%tkmr%gs_equil
+apply_sink = .FALSE.
+IF(eq%diverted) RETURN
+IF(.NOT.current_sim%psi_limiting_set) RETURN
+IF(psi > current_sim%psi_limiting) apply_sink = .NOT.mugtok_in_plasma(coords, psi)
+end function mugtok_apply_sink
 
 
 !-----------------------------------------------------------------
@@ -891,22 +1027,27 @@ CALL xmhd_2d_freeze_eta_temp(self%mug, self%u)
 !Update plasma time advance operator
 CALL self%tkmr%update()
 
-!Update timestep if it has changed since setup, and build approximate jacobian for preconditioning
+!Update timestep if it has changed since setup (the vacuum operator used in the
+!residual depends on dt, so a dt change always forces a rebuild)
 IF(dt/=self%nlfun%dt)THEN
     dt=ABS(dt)
     self%nlfun%dt=dt
     self%mug%dt = dt
     self%tkmr%dt=dt
-    CALL self%tkmr%update()
-    CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
-ELSE
-    CALL self%tkmr%update()
-    CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
+    self%pre_force_update=.TRUE.
 END IF
+CALL self%tkmr%update()
 
-!Update preconditioner
-CALL self%pre%update(.TRUE.)
-CALL self%mf_solver%pre%update(.TRUE.)
+!Rebuild approximate jacobian and refactor preconditioner every pre_freq steps
+IF(self%pre_force_update .OR. self%pre_age>=MAX(1,self%pre_freq))THEN
+    CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
+    CALL self%pre%update(.TRUE.)
+    self%pre_age=0
+    self%pre_force_update=.FALSE.
+ELSE
+    WRITE(*,'(A,I4,A)')' Reusing preconditioner (age ',self%pre_age,' steps)'
+END IF
+self%pre_age=self%pre_age+1
 
 !Build RHS
 CALL self%tmp%add(0.d0,1.d0,self%u)
@@ -928,12 +1069,25 @@ DO j = 1,4
         CALL self%u%restore_local(currs_tmp,8)
     END IF
     !Run the nonlinear solver
+    dbg_it = 0 ! NLDEBUG
     CALL self%nksolver%apply(self%u,self%rhs)
     IF(self%nksolver%cits<0)THEN
         CALL self%u%add(0.d0,1.d0,self%tmp)
+        !---A stale preconditioner may be the cause: refresh it and retry at the same dt first
+        IF(self%pre_age>1)THEN
+            WRITE(*,*)'Newton failed with a stale preconditioner; rebuilding and retrying at same dt'
+            CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
+            CALL self%pre%update(.TRUE.)
+            self%pre_age=1
+            CYCLE
+        END IF
         self%nlfun%dt=self%nlfun%dt/2.d0
+        self%mug%dt=self%nlfun%dt
+        self%tkmr%dt=self%nlfun%dt
+        CALL self%tkmr%update()
         CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
         CALL self%pre%update(.TRUE.)
+        self%pre_age=1
         CALL apply_rhs_mugtok(self%nlfun,self%u,self%rhs)
         CYCLE
     ELSE
@@ -965,7 +1119,10 @@ DO i=1,self%tkmr%gs_device%ncoils
     CALL self%tkmr%gs_equil%psi%add(1.d0,self%tkmr%gs_equil%coil_currs(i),self%tkmr%gs_device%psi_coil(i)%f)
 END DO
 
-!---Optionally write a restart file for later plotting 
+!---Capture the historical limiting-flux reference used by the T sink term
+CALL mugtok_update_psi_limiting(self)
+
+!---Optionally write a restart file for later plotting
 self%rst_count = self%rst_count + 1
 IF(self%save_rst .AND. MOD(self%rst_count, self%rst_freq)==0)THEN
     CALL mugtok_rst_save(self, time)
@@ -1351,7 +1508,8 @@ ALLOCATE(cell_b_dofs(lag_rep%nce), basis_vals(lag_rep%nce), basis_grads(3,lag_re
 DO i=1,nlim
   cell = elist(2,i)
   ed = elist(1,i)
-  eta_p_loc = self%parent_sim%tkmr%eta_reg(mesh%reg(cell))
+  eta_p_loc = self%parent_sim%mug%eta(mesh%reg(cell),1) ! in-plane (poloidal) resistivity
+  IF(eta_p_loc <= 0.d0) eta_p_loc = eta_fallback
   CALL lag_rep%ncdofs(cell, cell_b_dofs)
   by_weights_loc = by_weights(cell_b_dofs)
   pts(:,1) = mesh%r(1:2, mesh%lc(mesh%cell_ed(1,ed),cell))
@@ -1754,6 +1912,57 @@ DEALLOCATE(mug_vec)
 end subroutine mugtok_rst_save
 
 !------------------------------------------------------------------------------
+!> Restore the solution (fields 1-7), time and timestep from the restart file
+!> 'mugtok_NNNNN.rst' written by mugtok_rst_save, to resume a run from that step.
+!> Call after setup/setup_mhd, with the same inputs (mesh, equilibrium, coil
+!> currents) as the original run. Subsequent restart files continue the numbering
+!> from rst_index. Not stored in the restart file, and so reset here from the
+!> restored state: psi_limiting (sink history), I_prev/f_scale_prev (FF' snapshot)
+!------------------------------------------------------------------------------
+subroutine mugtok_rst_restore(self, rst_index, t, dt)
+class(oft_mugtok_td), intent(inout) :: self
+integer(i4), intent(in) :: rst_index !< Index of the restart file to load
+real(r8), intent(out) :: t !< Time of the restored solution
+real(r8), intent(out) :: dt !< Timestep used for the step that produced the restored solution
+class(oft_vector), pointer :: mug_vec
+real(r8), pointer :: tmp(:), pvac(:)
+character(LEN=TDIFF_RST_LEN) :: rst_char
+character(LEN=OFT_PATH_SLEN) :: file_tmp
+integer(i4) :: i
+NULLIFY(mug_vec, tmp, pvac)
+WRITE(rst_char,'(I5.5)') rst_index
+file_tmp='mugtok_'//rst_char//'.rst'
+IF(.NOT.oft_file_exist(TRIM(file_tmp))) &
+  CALL oft_abort('Restart file "'//TRIM(file_tmp)//'" not found','mugtok_rst_restore',__FILE__)
+CALL self%mug%fe_rep%vec_create(mug_vec)
+CALL self%mug%rst_load(mug_vec, TRIM(file_tmp), 'U', t, dt)
+!---The saved field 6 is the total flux; remove the vacuum (coil) flux to recover
+!   the plasma flux (coil currents, and so psi_vac, are those set up from the equilibrium)
+CALL mug_vec%get_local(tmp, 6)
+CALL self%mug%psi_vac%get_local(pvac)
+tmp = tmp - pvac
+CALL mug_vec%restore_local(tmp, 6)
+DEALLOCATE(tmp, pvac)
+!---Copy fields (1-7) into the augmented solution vector (field 8, the coil currents, is kept)
+DO i=1,7
+  NULLIFY(tmp)
+  CALL mug_vec%get_local(tmp, i)
+  CALL self%u%restore_local(tmp, i)
+  DEALLOCATE(tmp)
+END DO
+CALL mug_vec%delete
+DEALLOCATE(mug_vec)
+!---Update equilibrium psi and plasma bounds from the restored flux; search for
+!   the O-point from scratch since the plasma may have moved far from its initial position
+self%tkmr%gs_equil%o_point(1) = -1.d0
+CALL mugtok_refresh_bounds(self, self%u)
+CALL mugtok_update_psi_limiting(self)
+CALL snapshot_f_profile(self)
+CALL xmhd_2d_freeze_eta_temp(self%mug, self%u)
+self%rst_count = rst_index
+end subroutine mugtok_rst_restore
+
+!------------------------------------------------------------------------------
 !> Plot saved restart states to XDMF/HDF5 output
 !! Runtime options are set in the main input file using the group
 !! `mugtok_plot_options`.
@@ -1770,8 +1979,12 @@ type(oft_lag_bginterp) :: grad_psi
 CLASS(oft_solver), POINTER :: lminv => NULL()
 class(oft_matrix), pointer :: lmop => NULL()
 real(r8), pointer :: plot_vals(:), plot_vec(:,:), pvac(:)
+real(r8), allocatable :: r_vals(:)
+integer(i4), allocatable :: cell_dofs_plot(:)
+real(r8) :: f_pos(3), coord(3)
 INTEGER(i4) :: ierr, io_unit, io_stat, nplotted
 INTEGER(i4) :: rst_start=0, rst_end=2000, rst_cur, rst_tmp
+INTEGER(i4) :: ic, jd, gd
 CHARACTER(LEN=OFT_PATH_SLEN) :: file_tmp
 CHARACTER(LEN=TDIFF_RST_LEN) :: rst_char
 LOGICAL :: rst_exist
@@ -1801,8 +2014,22 @@ CALL create_diag_pre(lminv%pre)
 ALLOCATE(plot_vec(3,v_lag%n))
 NULLIFY(plot_vals)
 CALL grad_psi%setup(lag_rep)
+!---Physical R coordinate of each Lagrange DOF (used for the poloidal current)
+ALLOCATE(r_vals(lag_rep%ne))
+ALLOCATE(cell_dofs_plot(lag_rep%nce))
+DO ic=1,mesh%nc
+  CALL lag_rep%ncdofs(ic, cell_dofs_plot)
+  DO jd=1,lag_rep%nce
+    gd = cell_dofs_plot(jd)
+    CALL oft_blag_npos(lag_rep, ic, jd, f_pos)
+    coord = mesh%log2phys(ic, f_pos)
+    r_vals(gd) = coord(1)
+  END DO
+END DO
+DEALLOCATE(cell_dofs_plot)
 !---------------------------------------------------------------------------
-! Pass 1: main fields (n, V, psi, B, and T if compressible) on the full-order mesh
+! Pass 1: main fields (n, V, psi, B, poloidal current, and T if compressible)
+! on the full-order mesh
 !---------------------------------------------------------------------------
 CALL xdmf_plot%setup("mugtok_td")
 CALL mesh%setup_io(xdmf_plot,lag_rep%order)
@@ -1871,6 +2098,24 @@ DO
   ELSE
     CALL mesh%save_vertex_vector(plot_vec,xdmf_plot,'B')
   END IF
+  !--- Poloidal current: grad(F) x phi_hat / R (F = field 7 = R*B_phi)
+  NULLIFY(plot_vals)
+  CALL u%get_local(plot_vals,7)
+  CALL grad_psi%u%restore_local(plot_vals)
+  CALL grad_psi%setup(lag_rep)
+  CALL oft_blag_vproject(lag_rep,grad_psi,ux,uy,uz)
+  CALL v_lag%set(0.d0)
+  CALL lminv%apply(v_lag,ux)
+  CALL ux%add(0.d0,1.d0,v_lag)
+  CALL v_lag%set(0.d0)
+  CALL lminv%apply(v_lag,uy)
+  CALL uy%add(0.d0,1.d0,v_lag)
+  CALL uy%get_local(plot_vals)
+  plot_vec(1,:)=-plot_vals/(r_vals+gs_epsilon)
+  CALL ux%get_local(plot_vals)
+  plot_vec(3,:)=plot_vals/(r_vals+gs_epsilon)
+  plot_vec(2,:)=0.d0
+  CALL mesh%save_vertex_vector(plot_vec,xdmf_plot,'Jpol')
   rst_cur=rst_cur+self%rst_freq
 END DO
 IF(nplotted==0.AND.oft_env%head_proc) &
@@ -1911,6 +2156,7 @@ CALL v_lag%delete
 DEALLOCATE(u,ux,uy,uz,v_lag)
 IF(ASSOCIATED(plot_vals))DEALLOCATE(plot_vals)
 IF(ASSOCIATED(plot_vec))DEALLOCATE(plot_vec)
+DEALLOCATE(r_vals)
 end subroutine mugtok_td_plot
 
 !---------------------------------------------------------------------------------
@@ -1987,7 +2233,66 @@ end subroutine
 SUBROUTINE mugtok_mfnk_update(a)
 CLASS(oft_vector), TARGET, INTENT(inout) :: a !< Current solution vector
 CALL current_sim%mfmat%update(a)
+IF(current_sim%nl_debug)CALL mugtok_nl_debug(current_sim,a) ! NLDEBUG
 END SUBROUTINE mugtok_mfnk_update
+!---------------------------------------------------------------------------------
+!> NLDEBUG: Print per-field norms of the iterate, the Newton residual F(u)-rhs and
+!! the update since the previous iterate, plus min(n) and min(T). Called once per
+!! Newton iteration (from mugtok_mfnk_update) with the accepted iterate.
+!---------------------------------------------------------------------------------
+SUBROUTINE mugtok_nl_debug(self,a)
+CLASS(oft_mugtok_td), INTENT(inout) :: self !< Simulation object
+CLASS(oft_vector), INTENT(inout) :: a !< Current Newton iterate
+CHARACTER(LEN=5), PARAMETER :: fnames(8) = ['n    ','v_R  ','v_phi','v_Z  ','T    ','psi  ','F    ','coils']
+REAL(r8), POINTER, DIMENSION(:) :: vals
+REAL(r8) :: nrm(3), nmin, tmin
+INTEGER(i4) :: k
+IF(.NOT.ASSOCIATED(dbg_wrk))THEN
+  CALL a%new(dbg_wrk)
+  CALL a%new(dbg_uprev)
+END IF
+IF(oft_env%head_proc)THEN
+  WRITE(*,'(A,I4,A)')'  NLDEBUG Newton it ',dbg_it,':  field      |u|           |F(u)-rhs|    |du|'
+END IF
+DO k=1,a%nblocks
+  nrm = -1.d0
+  CALL field_norm(a,k,nrm(1))
+  CALL dbg_wrk%add(0.d0,1.d0,self%mfmat%f0,-1.d0,self%rhs)
+  CALL field_norm(dbg_wrk,k,nrm(2))
+  IF(dbg_it>0)THEN
+    CALL dbg_wrk%add(0.d0,1.d0,a,-1.d0,dbg_uprev)
+    CALL field_norm(dbg_wrk,k,nrm(3))
+  END IF
+  IF(oft_env%head_proc)WRITE(*,'(4X,A,2X,A5,3ES14.6)')'NLDEBUG',fnames(k),nrm
+END DO
+NULLIFY(vals)
+CALL a%get_local(vals,1)
+nmin = -oft_mpi_max(-MINVAL(vals))
+DEALLOCATE(vals)
+CALL a%get_local(vals,5)
+tmin = -oft_mpi_max(-MINVAL(vals))
+DEALLOCATE(vals)
+IF(oft_env%head_proc)WRITE(*,'(4X,A,ES14.6,A,ES14.6)')'NLDEBUG min(n) [x den_scale] = ',nmin,'   min(T) [eV] = ',tmin
+CALL dbg_uprev%add(0.d0,1.d0,a)
+dbg_it = dbg_it + 1
+CONTAINS
+!---L2 norm of block k of v (other blocks zeroed in a copy)
+SUBROUTINE field_norm(v,k,res)
+CLASS(oft_vector), INTENT(inout) :: v
+INTEGER(i4), INTENT(in) :: k
+REAL(r8), INTENT(out) :: res
+CLASS(oft_vector), POINTER :: tmp
+INTEGER(i4) :: j
+CALL v%new(tmp)
+CALL tmp%add(0.d0,1.d0,v)
+DO j=1,v%nblocks
+  IF(j/=k)CALL tmp%set(0.d0,j)
+END DO
+res = SQRT(tmp%dot(tmp))
+CALL tmp%delete
+DEALLOCATE(tmp)
+END SUBROUTINE field_norm
+END SUBROUTINE mugtok_nl_debug
 
 
 END MODULE mugtok_td
