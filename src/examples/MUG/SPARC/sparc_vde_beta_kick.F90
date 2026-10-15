@@ -73,6 +73,8 @@ REAL(r8) :: mass_scale_post = 5000.d0 !< Plasma (region 1) ion mass enhancement 
 REAL(r8) :: m_i_plasma = 2.d0*proton_mass !< Physical (un-enhanced) plasma ion mass [kg]
 INTEGER(i4) :: rst_start = 0 !< If >0, resume from restart file 'mugtok_NNNNN.rst' with NNNNN=rst_start (set in oft.in group sparc_vde_options)
 REAL(r8) :: dt_rst = -1.d0 !< Timestep read from the restart file when resuming
+REAL(r8) :: dt_min_frac = 0.125d0 !< Stop the run (then plot) once step() retries have cut dt below dt_min_frac times the current phase's starting dt; <=0 disables (set in oft.in group sparc_vde_options)
+REAL(r8) :: dt_phase = 0.d0 !< Starting (nominal) dt of the current kick phase, the reference for dt_min_frac
 LOGICAL :: plot_only = .FALSE. !< If true, set up as usual, then only convert the mugtok_*.rst files in the current folder to XDMF output (no time stepping, no new restart files)
 INTEGER(i4) :: pre_freq = 1 !< Post-kick only: rebuild the approximate Jacobian/refactor the preconditioner every pre_freq steps (see oft_mugtok_td%pre_freq); pre-kick and kick phases always rebuild every step
 REAL(r8) :: kappa_par = 1.542d26 !< Parallel (field-aligned) thermal conductivity kappa=chi*n [1/(m s)], held fixed for the whole run by setting chi_par_mult=kappa_par/kappa(1) in each phase
@@ -94,7 +96,7 @@ CHARACTER(LEN=OFT_PATH_SLEN) :: filename_eq !< Equilibrium file (same as mesh fi
 CHARACTER(LEN=25) :: tmp_str
 TYPE(oft_mugtok_td):: b_sim 
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
-NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only
+NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -372,6 +374,7 @@ DO i=rst_start+1,nstep_total
       b_sim%mug%evolve_pressure = .TRUE.
       b_sim%pre_freq = pre_freq ! slower post-kick evolution: reuse the LU factorization
     END SELECT
+    dt_phase = dt ! reference for the dt_min_frac stop (the phase's nominal dt, even when resuming)
     ! When resuming, keep the dt actually in use when the restart file was written
     ! (possibly reduced by step() retries) rather than the phase's nominal dt
     IF(kick_phase_prev < 0 .AND. rst_start > 0) dt = dt_rst
@@ -385,6 +388,13 @@ DO i=rst_start+1,nstep_total
   write(*,*) "opoint: ", b_sim%tkmr%gs_equil%o_point
   write(*,*) "diverted: ", b_sim%tkmr%gs_equil%diverted
   CALL b_sim%step(coil_currs_fixed, t, dt, nl_its, l_its, nretry)
+  ! Stop once solver-failure retries have cut dt too far below this phase's starting dt
+  ! (convergence has broken down); the restart file for this step is already written
+  IF(dt_min_frac > 0.d0 .AND. dt < dt_min_frac*dt_phase*(1.d0-1.d-8))THEN
+    WRITE(*,'(A,ES12.4,A,ES12.4,A,I2,A,I7)')' Stopping: dt = ',dt,' is below dt_min_frac*phase dt = ', &
+      dt_min_frac*dt_phase,' (kick_phase',kick_phase,') at step ',i
+    EXIT
+  END IF
   ! IF (MOD(i,25)==0 ) THEN
   !   CALL b_sim%plot()
   ! END IF
