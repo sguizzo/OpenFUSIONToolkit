@@ -1970,7 +1970,7 @@ end subroutine mugtok_rst_restore
 !! |  Option    |  Description  | Type [dim] |
 !! |------------|---------------|------------|
 !! | `rst_start=0`      | First restart-file index to read | int |
-!! | `rst_end=2000`     | Last restart-file index to read | int |
+!! | `rst_end=99999`    | Last restart-file index to read (stops earlier at the first missing file) | int |
 !------------------------------------------------------------------------------
 subroutine mugtok_td_plot(self)
 class(oft_mugtok_td), intent(inout) :: self
@@ -1983,7 +1983,7 @@ real(r8), allocatable :: r_vals(:)
 integer(i4), allocatable :: cell_dofs_plot(:)
 real(r8) :: f_pos(3), coord(3)
 INTEGER(i4) :: ierr, io_unit, io_stat, nplotted
-INTEGER(i4) :: rst_start=0, rst_end=2000, rst_cur, rst_tmp
+INTEGER(i4) :: rst_start=0, rst_end=99999, rst_cur, rst_tmp
 INTEGER(i4) :: ic, jd, gd
 CHARACTER(LEN=OFT_PATH_SLEN) :: file_tmp
 CHARACTER(LEN=TDIFF_RST_LEN) :: rst_char

@@ -73,6 +73,7 @@ REAL(r8) :: mass_scale_post = 5000.d0 !< Plasma (region 1) ion mass enhancement 
 REAL(r8) :: m_i_plasma = 2.d0*proton_mass !< Physical (un-enhanced) plasma ion mass [kg]
 INTEGER(i4) :: rst_start = 0 !< If >0, resume from restart file 'mugtok_NNNNN.rst' with NNNNN=rst_start (set in oft.in group sparc_vde_options)
 REAL(r8) :: dt_rst = -1.d0 !< Timestep read from the restart file when resuming
+LOGICAL :: plot_only = .FALSE. !< If true, set up as usual, then only convert the mugtok_*.rst files in the current folder to XDMF output (no time stepping, no new restart files)
 INTEGER(i4) :: pre_freq = 1 !< Post-kick only: rebuild the approximate Jacobian/refactor the preconditioner every pre_freq steps (see oft_mugtok_td%pre_freq); pre-kick and kick phases always rebuild every step
 REAL(r8) :: kappa_par = 1.542d26 !< Parallel (field-aligned) thermal conductivity kappa=chi*n [1/(m s)], held fixed for the whole run by setting chi_par_mult=kappa_par/kappa(1) in each phase
 !---Initial density/temperature: offset + scale*profile inside the plasma (profiles from
@@ -93,7 +94,7 @@ CHARACTER(LEN=OFT_PATH_SLEN) :: filename_eq !< Equilibrium file (same as mesh fi
 CHARACTER(LEN=25) :: tmp_str
 TYPE(oft_mugtok_td):: b_sim 
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
-NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq
+NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -241,7 +242,7 @@ mhd_flag(1) = .TRUE.
 
 equil%device => machine
 b_sim%pm = pm               ! solver progress output (copied to oft_env%pm in setup_mhd)
-b_sim%save_rst = .TRUE.     ! optional; default off
+b_sim%save_rst = .NOT.plot_only ! optional; default off (off in plot-only mode so setup doesn't overwrite mugtok_00000.rst)
 b_sim%rst_freq = 1
 ! Use a complete LU of the coupled Jacobian (keeps the psi-velocity coupling that
 ! per-field block-Jacobi drops). Needed for good linear convergence in the stiff,
@@ -311,6 +312,13 @@ b_sim%mug%drop_convection = .FALSE.
 ! internally, so a separate fixed reference copy is needed to pass in every step.
 ALLOCATE(coil_currs_fixed(machine%ncoil_regs))
 coil_currs_fixed = equil%coil_currs
+
+! Plot-only mode: write XDMF output from the existing mugtok_*.rst files and stop
+! (range set by rst_start/rst_end in the mugtok_plot_options group)
+IF(plot_only)THEN
+  CALL b_sim%plot()
+  CALL oft_finalize()
+END IF
 
 ! Optionally resume a previous run from restart file 'mugtok_NNNNN.rst' (NNNNN=rst_start).
 ! The restart index equals the step count, so the loop continues from step rst_start+1.
