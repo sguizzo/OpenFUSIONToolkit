@@ -127,6 +127,7 @@ TYPE, public :: oft_xmhd_2d_sim
   LOGICAL :: chi_aniso = .FALSE. !< If true, use anisotropic thermal conduction: chi(:) is the cross-field diffusivity and the field-aligned diffusivity is chi(:)*chi_par_mult (default false: isotropic, using chi(:) in all directions)
   REAL(r8) :: chi_par_mult = 1.d5 !< Ratio of field-aligned to cross-field thermal diffusivity when chi_aniso=.TRUE.
   REAL(r8), ALLOCATABLE :: nu(:) !< kinematic viscosity [m^2/s], by region. This is the TOTAL viscosity nu1+nu2 (see nu2_ratio); the momentum equation uses nu1=nu/(1+nu2_ratio) as the shear (grad^2) coefficient and nu2=nu1*nu2_ratio as the bulk (grad(div)) coefficient
+  REAL(r8), ALLOCATABLE :: nu_n(:) !< Optional fixed dynamic viscosity, given as nu*n [1/(m s)], by region. If allocated, it is used in place of nu(:), with the (total) kinematic viscosity nu=nu_n/n evaluated pointwise, so the dynamic viscosity m_i*n*nu is uniform within a region (as with M3D-C1's amu/amuc); nu2_ratio splits it into shear and bulk parts as usual
   REAL(r8) :: nu2_ratio = 0.d0 !< Ratio nu2/nu1 of bulk (compressive) to shear kinematic viscosity. Adds a -nu2*grad(div(v)) bulk-viscosity term to the momentum equation, damping compressive motion independently of shear (nu1). Default 0 recovers the original pure-shear (grad^2) viscosity exactly, with nu1=nu(:)
   REAL(r8), ALLOCATABLE :: gamma(:) !< adiabatic index, by region, by region
   REAL(r8), ALLOCATABLE :: D_diff(:) !< diffusivity, by region
@@ -795,7 +796,7 @@ class(xmhd_2d_nlfun), intent(inout) :: self !< NL function object
 class(oft_vector), target, intent(inout) :: a !< Source field
 class(oft_vector), intent(inout) :: b !< Result of metric function
 type(oft_quad_type), pointer :: quad
-LOGICAL :: linear,cyl_flag, incomp, eta_lag, use_kappa
+LOGICAL :: linear,cyl_flag, incomp, eta_lag, use_kappa, use_nu_n
 INTEGER(i4) :: i,l
 REAL(r8) :: k_boltz = elec_charge
 REAL(r8) :: m_i=proton_mass
@@ -830,6 +831,7 @@ B_0 = self%parent_sim%B_0
 cyl_flag = self%parent_sim%cyl_flag
 incomp = self%parent_sim%incomp
 use_kappa = ALLOCATED(self%parent_sim%kappa)
+use_nu_n = ALLOCATED(self%parent_sim%nu_n)
 convect_fac = MERGE(0.d0, 1.d0, self%parent_sim%drop_convection)
 pres_fac = MERGE(1.d0, 0.d0, self%parent_sim%evolve_pressure)
 !---When T is evolved, Spitzer eta is evaluated from the frozen temperature
@@ -1003,6 +1005,11 @@ DO i=1,mesh%nc
       btmp = cross_product(dpsi/(coords(1)+gs_epsilon), [0.d0,1.d0,0.d0]) + by*[0.d0,1.d0,0.d0]/(coords(1)+gs_epsilon) + B_0
     END IF
     IF (use_kappa) chi = self%parent_sim%kappa(mesh%reg(i))/n !< Fixed conductivity kappa=chi*n
+    IF (use_nu_n) THEN !< Fixed dynamic viscosity: nu=nu_n/n
+      nu = self%parent_sim%nu_n(mesh%reg(i))/n
+      nu1 = nu/(1.d0+self%parent_sim%nu2_ratio)
+      nu2 = nu1*self%parent_sim%nu2_ratio
+    END IF
     kappa_T = chi_tensor(chi, self%parent_sim%chi_par_mult, self%parent_sim%chi_aniso, btmp)
     IF(cyl_flag)THEN
       diag_vals(1) = diag_vals(1) + DOT_PRODUCT(btmp,btmp)*int_factor*coords(1)
@@ -1422,7 +1429,7 @@ end subroutine xmhd_2d_freeze_eta_temp
 subroutine build_approx_jacobian(self,a)
 class(oft_xmhd_2d_sim), intent(inout) :: self
 class(oft_vector), intent(inout) :: a !< Solution for computing jacobian
-LOGICAL :: cyl_flag, linear, incomp, eta_lag, use_kappa
+LOGICAL :: cyl_flag, linear, incomp, eta_lag, use_kappa, use_nu_n
 INTEGER(i4) :: i
 REAL(r8) :: k_boltz=elec_charge
 REAL(r8) :: m_i = proton_mass
@@ -1462,6 +1469,7 @@ linear = self%linear
 incomp = self%incomp
 dt_fac = self%jac_dt
 use_kappa = ALLOCATED(self%kappa)
+use_nu_n = ALLOCATED(self%nu_n)
 convect_fac = MERGE(0.d0, 1.d0, self%drop_convection)
 pres_fac = MERGE(1.d0, 0.d0, self%evolve_pressure)
 !---Match the resistivity used by nlfun_apply (frozen snapshot when T is evolved)
@@ -1483,7 +1491,7 @@ INTEGER(i4), POINTER, DIMENSION(:) :: cell_dofs, cell_dofs_p
 REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dby(3),dvel(3,3),div_vel
 REAL(r8) :: jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),tmp2(3),tmp3(3),coords(3),kappa_T(3,3)
 REAL(r8) :: dT_dpsi, deta_dT(2), r_geo, d6_eta, d7_eta, T_eta_val, n_eta_val
-REAL(r8) :: sink_term, dsink_dT
+REAL(r8) :: sink_term, dsink_dT, visc_row(3)
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals, basis_vals_p,n_weights_loc,T_weights_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: psi_weights_loc,by_weights_loc,res_loc,T_eta_loc,n_eta_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grads_p
@@ -1493,7 +1501,7 @@ type(oft_local_mat), allocatable, dimension(:,:) :: jac_loc
 !$omp n_weights_loc,psi_weights_loc, by_weights_loc,vel_weights_loc,res_loc,jac_mat, &
 !$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dby,dvel,div_vel,btmp,tmp1,tmp2,tmp3,kappa_T, iloc, jac_loc, &
 !$omp dT_dpsi,deta_dT,r_geo,d6_eta,d7_eta,T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, dsink_dT, &
-!$omp chi, m_i, eta, nu, gamma, D_diff) reduction(+:diag_vals)
+!$omp chi, m_i, eta, nu, nu1, nu2, visc_row, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 IF (incomp) ALLOCATE(basis_vals_p(oft_blagrange_p%nce),basis_grads_p(3,oft_blagrange_p%nce))
 ALLOCATE(vel_weights_loc(3, oft_blagrange%nce),&
@@ -1634,6 +1642,11 @@ DO i=1,mesh%nc
       btmp = cross_product(dpsi/(coords(1)+gs_epsilon), [0.d0,1.d0,0.d0]) + by*[0.d0,1.d0,0.d0]/(coords(1)+gs_epsilon) + B_0
     END IF
     IF (use_kappa) chi = self%kappa(mesh%reg(i))/n !< Fixed conductivity kappa=chi*n
+    IF (use_nu_n) THEN !< Fixed dynamic viscosity: nu=nu_n/n
+      nu = self%nu_n(mesh%reg(i))/n
+      nu1 = nu/(1.d0+self%nu2_ratio)
+      nu2 = nu1*self%nu2_ratio
+    END IF
     kappa_T = chi_tensor(chi, self%chi_par_mult, self%chi_aniso, btmp)
     diag_vals = diag_vals + [n, vel(1), vel(2), vel(3), T, psi, by]*int_factor
     !---Compute local matrix contributions
@@ -1739,6 +1752,24 @@ DO i=1,mesh%nc
           - dt_fac*basis_vals(jr)*basis_vals(jc)*(btmp(2)**2-btmp(1)**2-btmp(3)**2)*int_factor/(2.d0*mu0*m_i*n**2)
           jac_loc(3,1)%m(jr,jc) = jac_loc(3,1)%m(jr,jc) &
           + dt_fac*basis_vals(jr)*basis_vals(jc)*(btmp(1)*btmp(2))*int_factor/(mu0*m_i*n**2)
+          ! fixed dynamic viscosity (nu=nu_n/n): d(nu)/dn = -nu/n scales the whole viscous residual,
+          ! including the nu1*v/R hoop terms
+          IF (use_nu_n) THEN
+            DO k=1,3
+              visc_row(k) = nu1*DOT_PRODUCT(basis_grads(:,jr),dvel(k,:))*coords(1) &
+                - nu1*basis_vals(jr)*DOT_PRODUCT(dn,dvel(k,:))*coords(1)/n
+            END DO
+            visc_row(1) = visc_row(1) + nu2*basis_grads(1,jr)*div_vel*coords(1) &
+              - nu2*basis_vals(jr)*div_vel*dn(1)*coords(1)/n + nu2*basis_vals(jr)*div_vel &
+              + nu1*basis_vals(jr)*vel(1)/(coords(1)+gs_epsilon)
+            visc_row(2) = visc_row(2) + nu1*basis_vals(jr)*vel(2)/(coords(1)+gs_epsilon)
+            visc_row(3) = visc_row(3) + nu2*basis_grads(3,jr)*div_vel*coords(1) &
+              - nu2*basis_vals(jr)*div_vel*dn(3)*coords(1)/n
+            DO k=1,3
+              jac_loc(k+1,1)%m(jr,jc) = jac_loc(k+1,1)%m(jr,jc) &
+              - dt_fac*basis_vals(jc)*visc_row(k)*int_factor/n
+            END DO
+          END IF
         ELSE
           IF(linear)THEN
             DO l=1,3
@@ -1770,6 +1801,19 @@ DO i=1,mesh%nc
               - dt_fac*nu2*basis_vals(jr)*basis_grads(l,jc)*div_vel*int_factor/n &
               + dt_fac*nu2*basis_vals(jr)*basis_vals(jc)*div_vel*dn(l)*int_factor/n**2
             END DO
+            ! fixed dynamic viscosity (nu=nu_n/n): d(nu)/dn = -nu/n scales the whole viscous residual
+            IF (use_nu_n) THEN
+              DO k=1,3
+                visc_row(k) = nu1*DOT_PRODUCT(basis_grads(:,jr),dvel(k,:)) &
+                  - nu1*basis_vals(jr)*DOT_PRODUCT(dn,dvel(k,:))/n
+              END DO
+              visc_row(1) = visc_row(1) + nu2*basis_grads(1,jr)*div_vel - nu2*basis_vals(jr)*div_vel*dn(1)/n
+              visc_row(3) = visc_row(3) + nu2*basis_grads(3,jr)*div_vel - nu2*basis_vals(jr)*div_vel*dn(3)/n
+              DO k=1,3
+                jac_loc(k+1,1)%m(jr,jc) = jac_loc(k+1,1)%m(jr,jc) &
+                - dt_fac*basis_vals(jc)*visc_row(k)*int_factor/n
+              END DO
+            END IF
           END IF
         END IF
         !--vel, vel

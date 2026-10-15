@@ -68,6 +68,10 @@ REAL(r8) :: kappa_kick = 1.542d22 !< DUMMY: perpendicular thermal conductivity k
 REAL(r8) :: kappa_base = 1.542d20 !< DUMMY: baseline (pre-/post-kick) perpendicular thermal conductivity kappa=chi*n [1/(m s)] in the plasma (sets kappa_reg(1) below)
 REAL(r8) :: visc_kick = 500.d0 !< Kinematic viscosity [m^2/s] in the plasma during the pre-kick and kick phases (sets visc_reg(1) below)
 REAL(r8) :: visc_post = 200.d0 !< Kinematic viscosity [m^2/s] in the plasma after the kick
+REAL(r8) :: visc_bulk_ratio = 2.d0 !< Ratio of bulk (compressional, grad(div v)) to shear viscosity (mug%nu2_ratio; setup_mhd's default is 2, 0 turns bulk viscosity off). visc_kick/visc_post are the TOTAL viscosity, so shear = visc/(1+visc_bulk_ratio) and bulk = shear*visc_bulk_ratio
+LOGICAL :: drop_convection = .FALSE. !< If true, drop the (v.grad)v convective term from the momentum equation (setup_mhd's default); this driver keeps it by default
+LOGICAL :: visc_dynamic = .FALSE. !< If true, the dynamic viscosity m_i*n*nu is uniform in the plasma (as with M3D-C1's amu/amuc): visc_kick/visc_post are then the kinematic viscosity at density visc_nref, and nu = visc*visc_nref/n pointwise
+REAL(r8) :: visc_nref = 1.d20 !< Reference density [m^-3] for visc_dynamic (M3D-C1: n0_norm)
 REAL(r8) :: mass_scale_kick = 5000.d0 !< Plasma (region 1) ion mass enhancement factor during the pre-kick and kick phases (passed to setup_mhd)
 REAL(r8) :: mass_scale_post = 5000.d0 !< Plasma (region 1) ion mass enhancement factor after the kick
 REAL(r8) :: m_i_plasma = 2.d0*proton_mass !< Physical (un-enhanced) plasma ion mass [kg]
@@ -96,7 +100,8 @@ CHARACTER(LEN=OFT_PATH_SLEN) :: filename_eq !< Equilibrium file (same as mesh fi
 CHARACTER(LEN=25) :: tmp_str
 TYPE(oft_mugtok_td):: b_sim 
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
-NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac
+NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
+  visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -306,9 +311,19 @@ WRITE(*,'(A,ES12.4,A,ES12.4)')' Axis pressure [Pa]: equilibrium = ',p_axis_eq,' 
 ! this line to restore the sink.
 b_sim%mug%tau_sink = -1.d0
 
-! Restore the (v.grad)v convective term in the momentum equation (setup_mhd drops it
-! by default via drop_convection=.TRUE.)
-b_sim%mug%drop_convection = .FALSE.
+! Keep the (v.grad)v convective term in the momentum equation unless drop_convection=T
+! (setup_mhd drops it by default)
+b_sim%mug%drop_convection = drop_convection
+
+! Viscosity: bulk/shear split, and optionally a uniform dynamic viscosity, nu = visc*visc_nref/n
+! (nu_n holds nu*n; region 1 is updated with nu(1) at each phase change below)
+b_sim%mug%nu2_ratio = visc_bulk_ratio
+IF(visc_dynamic)THEN
+  ALLOCATE(b_sim%mug%nu_n(SIZE(b_sim%mug%nu)))
+  b_sim%mug%nu_n = b_sim%mug%nu*visc_nref
+END IF
+WRITE(*,'(A,L2,A,ES12.4,A,F6.2)')' Viscosity: dynamic (uniform m_i*n*nu) =',visc_dynamic, &
+  '  n_ref [m^-3] =',visc_nref,'  bulk/shear ratio =',visc_bulk_ratio
 
 ! Coil currents are held fixed for the whole run; step() overwrites equil%coil_currs
 ! internally, so a separate fixed reference copy is needed to pass in every step.
@@ -374,6 +389,7 @@ DO i=rst_start+1,nstep_total
       b_sim%mug%evolve_pressure = .TRUE.
       b_sim%pre_freq = pre_freq ! slower post-kick evolution: reuse the LU factorization
     END SELECT
+    IF(visc_dynamic) b_sim%mug%nu_n(1) = b_sim%mug%nu(1)*visc_nref ! nu = nu(1)*visc_nref/n
     dt_phase = dt ! reference for the dt_min_frac stop (the phase's nominal dt, even when resuming)
     ! When resuming, keep the dt actually in use when the restart file was written
     ! (possibly reduced by step() retries) rather than the phase's nominal dt
