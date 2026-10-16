@@ -128,6 +128,9 @@ TYPE, public :: oft_xmhd_2d_sim
   REAL(r8) :: chi_par_mult = 1.d5 !< Ratio of field-aligned to cross-field thermal diffusivity when chi_aniso=.TRUE.
   REAL(r8), ALLOCATABLE :: nu(:) !< kinematic viscosity [m^2/s], by region. This is the TOTAL viscosity nu1+nu2 (see nu2_ratio); the momentum equation uses nu1=nu/(1+nu2_ratio) as the shear (grad^2) coefficient and nu2=nu1*nu2_ratio as the bulk (grad(div)) coefficient
   REAL(r8), ALLOCATABLE :: nu_n(:) !< Optional fixed dynamic viscosity, given as nu*n [1/(m s)], by region. If allocated, it is used in place of nu(:), with the (total) kinematic viscosity nu=nu_n/n evaluated pointwise, so the dynamic viscosity m_i*n*nu is uniform within a region (as with M3D-C1's amu/amuc); nu2_ratio splits it into shear and bulk parts as usual
+  REAL(r8) :: visc_sol_mult = 1.d0 !< Multiplier on the kinematic viscosity in cold (SOL) plasma: nu -> nu*(1+(visc_sol_mult-1)*f(T)) with f = (1-tanh((T-visc_sol_T0)/visc_sol_dT))/2, so f~1 for T << visc_sol_T0 and ~0 in the hot core. T is the frozen per-step snapshot when T is evolved with Spitzer eta (so the factor is constant over a step and adds no Jacobian terms), else the current T. 1 = off
+  REAL(r8) :: visc_sol_T0 = 50.d0 !< Temperature [eV] at the middle of the visc_sol_mult transition
+  REAL(r8) :: visc_sol_dT = 10.d0 !< Width [eV] of the visc_sol_mult tanh transition
   REAL(r8) :: nu2_ratio = 0.d0 !< Ratio nu2/nu1 of bulk (compressive) to shear kinematic viscosity. Adds a -nu2*grad(div(v)) bulk-viscosity term to the momentum equation, damping compressive motion independently of shear (nu1). Default 0 recovers the original pure-shear (grad^2) viscosity exactly, with nu1=nu(:)
   REAL(r8), ALLOCATABLE :: gamma(:) !< adiabatic index, by region, by region
   REAL(r8), ALLOCATABLE :: D_diff(:) !< diffusivity, by region
@@ -801,6 +804,7 @@ INTEGER(i4) :: i,l
 REAL(r8) :: k_boltz = elec_charge
 REAL(r8) :: m_i=proton_mass
 REAL(r8) :: chi, eta(2), nu, nu1, nu2, D_diff, gamma, diag_vals(5), B_0(3), diag_vec(3)
+REAL(r8) :: T_visc, visc_fac
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights,psi_weights,by_weights, T_res, &
                               n_res, psi_res, by_res, vtmp, velx_res, vely_res, velz_res
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
@@ -868,7 +872,7 @@ REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grad
 !$omp n_weights_loc,psi_weights_loc, by_weights_loc,vel_weights_loc,res_loc,jac_mat, &
 !$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dpsi_0,dby,dvel,div_vel,btmp, tmp1, kappa_T, &
 !$omp T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, &
-!$omp chi, m_i, eta, nu, nu1, nu2, gamma, D_diff) reduction(+:diag_vals)
+!$omp chi, m_i, eta, nu, nu1, nu2, T_visc, visc_fac, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 ALLOCATE(n_weights_loc(oft_blagrange%nce),&
         psi_weights_loc(oft_blagrange%nce), by_weights_loc(oft_blagrange%nce),&
@@ -1008,6 +1012,21 @@ DO i=1,mesh%nc
     IF (use_nu_n) THEN !< Fixed dynamic viscosity: nu=nu_n/n
       nu = self%parent_sim%nu_n(mesh%reg(i))/n
       nu1 = nu/(1.d0+self%parent_sim%nu2_ratio)
+      nu2 = nu1*self%parent_sim%nu2_ratio
+    END IF
+    IF (self%parent_sim%visc_sol_mult /= 1.d0) THEN !< Cold-plasma (SOL) viscosity boost
+      IF (eta_lag) THEN
+        T_visc = 0.d0
+        DO jr=1,oft_blagrange%nce
+          T_visc = T_visc + T_eta_loc(jr)*basis_vals(jr)
+        END DO
+      ELSE
+        T_visc = T
+      END IF
+      visc_fac = 1.d0 + (self%parent_sim%visc_sol_mult-1.d0)*0.5d0* &
+        (1.d0 - TANH((T_visc-self%parent_sim%visc_sol_T0)/self%parent_sim%visc_sol_dT))
+      IF (.NOT.use_nu_n) nu = self%parent_sim%nu(mesh%reg(i))
+      nu1 = nu*visc_fac/(1.d0+self%parent_sim%nu2_ratio)
       nu2 = nu1*self%parent_sim%nu2_ratio
     END IF
     kappa_T = chi_tensor(chi, self%parent_sim%chi_par_mult, self%parent_sim%chi_aniso, btmp)
@@ -1434,6 +1453,7 @@ INTEGER(i4) :: i
 REAL(r8) :: k_boltz=elec_charge
 REAL(r8) :: m_i = proton_mass
 REAL(r8) :: chi, eta(2), nu, nu1, nu2, D_diff, gamma, B_0(3), diag_vals(7), dt_fac
+REAL(r8) :: T_visc, visc_fac
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights, psi_weights, by_weights, vtmp
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
 REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights, T_eta_weights, n_eta_weights
@@ -1501,7 +1521,7 @@ type(oft_local_mat), allocatable, dimension(:,:) :: jac_loc
 !$omp n_weights_loc,psi_weights_loc, by_weights_loc,vel_weights_loc,res_loc,jac_mat, &
 !$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dby,dvel,div_vel,btmp,tmp1,tmp2,tmp3,kappa_T, iloc, jac_loc, &
 !$omp dT_dpsi,deta_dT,r_geo,d6_eta,d7_eta,T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, dsink_dT, &
-!$omp chi, m_i, eta, nu, nu1, nu2, visc_row, gamma, D_diff) reduction(+:diag_vals)
+!$omp chi, m_i, eta, nu, nu1, nu2, visc_row, T_visc, visc_fac, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 IF (incomp) ALLOCATE(basis_vals_p(oft_blagrange_p%nce),basis_grads_p(3,oft_blagrange_p%nce))
 ALLOCATE(vel_weights_loc(3, oft_blagrange%nce),&
@@ -1645,6 +1665,21 @@ DO i=1,mesh%nc
     IF (use_nu_n) THEN !< Fixed dynamic viscosity: nu=nu_n/n
       nu = self%nu_n(mesh%reg(i))/n
       nu1 = nu/(1.d0+self%nu2_ratio)
+      nu2 = nu1*self%nu2_ratio
+    END IF
+    IF (self%visc_sol_mult /= 1.d0) THEN !< Cold-plasma (SOL) viscosity boost, matching nlfun_apply
+      IF (eta_lag) THEN
+        T_visc = 0.d0
+        DO jr=1,oft_blagrange%nce
+          T_visc = T_visc + T_eta_loc(jr)*basis_vals(jr)
+        END DO
+      ELSE
+        T_visc = T
+      END IF
+      visc_fac = 1.d0 + (self%visc_sol_mult-1.d0)*0.5d0* &
+        (1.d0 - TANH((T_visc-self%visc_sol_T0)/self%visc_sol_dT))
+      IF (.NOT.use_nu_n) nu = self%nu(mesh%reg(i))
+      nu1 = nu*visc_fac/(1.d0+self%nu2_ratio)
       nu2 = nu1*self%nu2_ratio
     END IF
     kappa_T = chi_tensor(chi, self%chi_par_mult, self%chi_aniso, btmp)

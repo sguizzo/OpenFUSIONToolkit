@@ -69,6 +69,9 @@ REAL(r8) :: kappa_base = 1.542d20 !< DUMMY: baseline (pre-/post-kick) perpendicu
 REAL(r8) :: visc_kick = 500.d0 !< Kinematic viscosity [m^2/s] in the plasma during the pre-kick and kick phases (sets visc_reg(1) below)
 REAL(r8) :: visc_post = 200.d0 !< Kinematic viscosity [m^2/s] in the plasma after the kick
 REAL(r8) :: visc_bulk_ratio = 2.d0 !< Ratio of bulk (compressional, grad(div v)) to shear viscosity (mug%nu2_ratio; setup_mhd's default is 2, 0 turns bulk viscosity off). visc_kick/visc_post are the TOTAL viscosity, so shear = visc/(1+visc_bulk_ratio) and bulk = shear*visc_bulk_ratio
+REAL(r8) :: visc_sol_mult = 1.d0 !< Post-kick only: multiply the viscosity in cold (SOL) plasma by up to visc_sol_mult, nu -> nu*(1+(visc_sol_mult-1)*(1-tanh((T-visc_sol_T0)/visc_sol_dT))/2), leaving the hot core at visc_post; 1 = off (see xmhd_2d visc_sol_mult)
+REAL(r8) :: visc_sol_T0 = 50.d0 !< Middle of the visc_sol_mult transition [eV]
+REAL(r8) :: visc_sol_dT = 10.d0 !< Width of the visc_sol_mult transition [eV]
 LOGICAL :: drop_convection = .FALSE. !< If true, drop the (v.grad)v convective term from the momentum equation (setup_mhd's default); this driver keeps it by default
 LOGICAL :: visc_dynamic = .FALSE. !< If true, the dynamic viscosity m_i*n*nu is uniform in the plasma (as with M3D-C1's amu/amuc): visc_kick/visc_post are then the kinematic viscosity at density visc_nref, and nu = visc*visc_nref/n pointwise
 REAL(r8) :: visc_nref = 1.d20 !< Reference density [m^-3] for visc_dynamic (M3D-C1: n0_norm)
@@ -101,7 +104,7 @@ CHARACTER(LEN=25) :: tmp_str
 TYPE(oft_mugtok_td):: b_sim 
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
-  visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection
+  visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -324,6 +327,10 @@ IF(visc_dynamic)THEN
 END IF
 WRITE(*,'(A,L2,A,ES12.4,A,F6.2)')' Viscosity: dynamic (uniform m_i*n*nu) =',visc_dynamic, &
   '  n_ref [m^-3] =',visc_nref,'  bulk/shear ratio =',visc_bulk_ratio
+b_sim%mug%visc_sol_T0 = visc_sol_T0
+b_sim%mug%visc_sol_dT = visc_sol_dT
+WRITE(*,'(A,F8.2,A,F8.2,A,F8.2,A)')' Viscosity: post-kick SOL multiplier =',visc_sol_mult, &
+  '  below T0 =',visc_sol_T0,' eV (width',visc_sol_dT,' eV)'
 
 ! Coil currents are held fixed for the whole run; step() overwrites equil%coil_currs
 ! internally, so a separate fixed reference copy is needed to pass in every step.
@@ -368,6 +375,7 @@ DO i=rst_start+1,nstep_total
       b_sim%mug%kappa(1) = kappa_base
       b_sim%mug%chi_par_mult = kappa_par/b_sim%mug%kappa(1) ! keep kappa_par fixed
       b_sim%mug%nu(1) = visc_kick
+      b_sim%mug%visc_sol_mult = 1.d0
       b_sim%mug%m_i(1) = m_i_plasma*mass_scale_kick
       b_sim%mug%evolve_pressure = .FALSE.
       b_sim%pre_freq = 1 ! state changes too fast to reuse the preconditioner
@@ -376,6 +384,7 @@ DO i=rst_start+1,nstep_total
       b_sim%mug%kappa(1) = kappa_kick
       b_sim%mug%chi_par_mult = kappa_par/b_sim%mug%kappa(1) ! keep kappa_par fixed
       b_sim%mug%nu(1) = visc_kick
+      b_sim%mug%visc_sol_mult = 1.d0
       b_sim%mug%m_i(1) = m_i_plasma*mass_scale_kick
       b_sim%mug%evolve_pressure = .FALSE.
       b_sim%pre_freq = 1 ! state changes too fast to reuse the preconditioner
@@ -385,6 +394,7 @@ DO i=rst_start+1,nstep_total
       b_sim%mug%kappa(1) = kappa_base
       b_sim%mug%chi_par_mult = kappa_par/b_sim%mug%kappa(1) ! keep kappa_par fixed
       b_sim%mug%nu(1) = visc_post ! relax viscosity once the kick transient is over
+      b_sim%mug%visc_sol_mult = visc_sol_mult
       b_sim%mug%m_i(1) = m_i_plasma*mass_scale_post ! switch to the post-kick mass enhancement
       b_sim%mug%evolve_pressure = .TRUE.
       b_sim%pre_freq = pre_freq ! slower post-kick evolution: reuse the LU factorization
