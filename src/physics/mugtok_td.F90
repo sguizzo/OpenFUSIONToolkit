@@ -66,6 +66,7 @@ LOGICAL :: mhd_plasma = .FALSE. !< True when the plasma (region 1) is evolved wi
 INTEGER(i4) :: pre_freq = 1 !< Rebuild the approximate Jacobian and refactor the preconditioner every pre_freq steps (always on a dt change, on request via pre_force_update, and before halving dt after a Newton failure with a stale preconditioner)
 INTEGER(i4) :: pre_age = 0 !< Number of steps since the approximate Jacobian/preconditioner was last rebuilt
 LOGICAL :: pre_force_update = .TRUE. !< Force a Jacobian/preconditioner rebuild on the next step (set after changing physics coefficients, e.g. nu, m_i, kappa)
+REAL(r8) :: T_clip = -1.d0 !< If > 0, hard temperature floor [eV]: after each accepted step, T DOFs (field 5) below T_clip are set to T_clip. Not energy conserving and outside the Newton solve; off by default
 LOGICAL :: use_full_lu = .FALSE. !< In MHD-plasma mode, use a complete LU of the coupled Jacobian instead of per-field block-Jacobi (better linear convergence in the stiff near-ideal regime, but much higher memory). Set before calling setup_mhd.
 CLASS(flux_func), POINTER :: n_prof => NULL() !< Normalized density profile nhat(psihat), evaluated via %fp (linterp values). If set before setup_mhd (together with T_prof), n and T are seeded from the profiles and n is evolved
 CLASS(flux_func), POINTER :: T_prof => NULL() !< Normalized temperature profile That(psihat), evaluated via %fp (linterp values). See n_prof
@@ -1012,7 +1013,7 @@ CLASS(oft_mugtok_td), target, intent(inout) :: self !< Simulation object
 REAL(r8), INTENT(in) :: coil_currents(:) !< Prescribed I-coil currents for this step (size ncoils)
 REAL(8), INTENT(inout) :: time,dt !< Current time and desired timestep size [s]
 INTEGER(4), INTENT(out) :: nl_its,lin_its,nretry !< Number of nonlinear and linear iterations, and number of retries
-INTEGER(4) :: i,j
+INTEGER(4) :: i,j,nclip
 REAL(r8), pointer :: tmp_arr(:), currs_tmp(:)
 CLASS(oft_vector), pointer :: tmp_vec
 CLASS(oft_native_matrix), POINTER :: P => NULL()
@@ -1100,6 +1101,19 @@ time=time+self%nlfun%dt
 dt=self%nlfun%dt
 nl_its=self%nksolver%nlits
 lin_its=self%nksolver%lits
+
+!---Optional hard temperature floor on the accepted state
+IF(self%T_clip>0.d0)THEN
+    NULLIFY(tmp_arr)
+    CALL self%u%get_local(tmp_arr,5)
+    nclip=COUNT(tmp_arr<self%T_clip)
+    IF(nclip>0)THEN
+        WRITE(*,'(A,I8,A,ES11.3,A,F6.2,A)')' T_clip: ',nclip,' T DOFs (min',MINVAL(tmp_arr),' eV) raised to',self%T_clip,' eV'
+        tmp_arr=MAX(tmp_arr,self%T_clip)
+        CALL self%u%restore_local(tmp_arr,5)
+    END IF
+    DEALLOCATE(tmp_arr)
+END IF
 
 !Update equilibrium object to use the coil currents (field 8) 
 !and psi (field 6 + coil vaccum flux) from the converged solution vector 
