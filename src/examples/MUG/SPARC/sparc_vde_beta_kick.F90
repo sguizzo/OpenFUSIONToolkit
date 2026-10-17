@@ -95,6 +95,7 @@ REAL(r8) :: T_offset = 7.8d0 !< Temperature offset [eV]
 REAL(r8) :: p_axis_eq, p_axis_nT !< Equilibrium vs. 2*k*n*T pressure on axis [Pa] (diagnostic)
 REAL(r8) :: lin_tol = 1.d-7 !< Absolute tolerance of the linear (GMRES) solve (set in oft.in group sparc_vde_options)
 REAL(r8) :: nl_tol = 1.d-6 !< Absolute tolerance on the Newton residual |F| (set in oft.in group sparc_vde_options). Newton stalls at a round-off floor that rises at lower mass_scale (~5e-7 at mass_scale 1000, ~1-3e-6 at 100 for dt 0.5 ms); if nl_tol is below that floor every step fails and is retried with dt halved
+REAL(r8) :: mf_b0 = 1.d-3 !< Relative finite-difference step of the matrix-free Jacobian-vector product (oft_mf_matrix%b0; mugtok_td sets 1e-3, other OFT solvers 1e-5)
 REAL (r8):: coords(3), psi(1), q(1)
 LOGICAL :: pm=.TRUE.
 LOGICAL :: success
@@ -104,7 +105,7 @@ CHARACTER(LEN=25) :: tmp_str
 TYPE(oft_mugtok_td):: b_sim 
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
-  visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol
+  visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol,mf_b0
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -330,6 +331,8 @@ b_sim%mug%visc_sol_dT = visc_sol_dT
 WRITE(*,'(A,F8.2,A,F8.2,A,F8.2,A)')' Viscosity: post-kick SOL multiplier =',visc_sol_mult, &
   '  below T0 =',visc_sol_T0,' eV (width',visc_sol_dT,' eV)'
 WRITE(*,'(A,ES10.2,A,ES10.2)')' Solver tolerances: nl_tol (|F|) =',nl_tol,'  lin_tol =',lin_tol
+b_sim%mfmat%b0 = mf_b0
+WRITE(*,'(A,ES10.2)')' Matrix-free Jacobian: finite-difference step mf_b0 =',mf_b0
 
 ! Coil currents are held fixed for the whole run; step() overwrites equil%coil_currs
 ! internally, so a separate fixed reference copy is needed to pass in every step.
