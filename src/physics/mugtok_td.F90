@@ -1021,6 +1021,9 @@ CLASS(oft_matrix), pointer :: pre
 
 current_sim=>self
 
+!Flux normalization for a psi-keyed SOL viscosity (xmhd_2d visc_sol_on_psi): [LCFS, axis] of the current state
+self%mug%psi_norm_bounds = self%tkmr%gs_equil%plasma_bounds
+
 !Freeze the temperature used for the Spitzer resistivity at the start of the step,
 !so that eta is the same coefficient in the RHS and LHS residual passes below
 CALL xmhd_2d_freeze_eta_temp(self%mug, self%u)
