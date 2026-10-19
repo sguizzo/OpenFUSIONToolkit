@@ -86,6 +86,7 @@ INTEGER(i4) :: rst_start = 0 !< If >0, resume from restart file 'mugtok_NNNNN.rs
 REAL(r8) :: dt_rst = -1.d0 !< Timestep read from the restart file when resuming
 REAL(r8) :: dt_min_frac = 0.125d0 !< Stop the run (then plot) once step() retries have cut dt below dt_min_frac times the current phase's starting dt; <=0 disables (set in oft.in group sparc_vde_options)
 REAL(r8) :: dt_phase = 0.d0 !< Starting (nominal) dt of the current kick phase, the reference for dt_min_frac
+REAL(r8) :: dt_post = 5.d-4 !< Nominal post-kick timestep [s] (kick_phase 2); also the cap for dt_grow_steps and the reference for dt_min_frac. A restart still starts at the restart file's dt and reaches dt_post only through dt_grow_steps
 INTEGER(i4) :: dt_grow_steps = 0 !< If > 0: after this many consecutive steps with no retry, double dt again (capped at the phase's nominal dt), so a dt halved by step() retries can recover; 0 = never (dt stays reduced)
 LOGICAL :: newton_backtrack = .FALSE. !< Turn on backtracking (step halving while |F| grows) in the Newton solver; mugtok_td switches it off by default
 LOGICAL :: resid_dump = .FALSE. !< Write the Newton residual of failed Newton attempts to the XDMF group mugtok_resid (oft_mugtok_td%resid_dump; at most 8)
@@ -118,7 +119,7 @@ TYPE(oft_mugtok_td):: b_sim
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol,mf_b0,T_clip, &
-  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,lu_package,dt_grow_steps,newton_backtrack,resid_dump, &
+  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   T_floor,tau_floor
 !------------------------------------------------------------------------------
 ! Initialize enviroment
@@ -357,6 +358,7 @@ b_sim%mug%T_floor = T_floor
 b_sim%mug%tau_floor = tau_floor
 WRITE(*,'(A,F8.2,A,ES10.2,A)')' Implicit temperature floor T_floor =',T_floor,' eV, tau_floor =',tau_floor,' s (T_floor <= 0: off)'
 WRITE(*,'(A,I4,A)')' dt recovery: double dt after',dt_grow_steps,' clean steps (0: off)'
+WRITE(*,'(A,ES12.4,A)')' Post-kick nominal dt (dt_post) =',dt_post,' s'
 b_sim%nksolver%backtrack = newton_backtrack
 WRITE(*,'(A,L2)')' Newton backtracking:',newton_backtrack
 b_sim%resid_dump = resid_dump
@@ -428,7 +430,7 @@ DO i=rst_start+1,nstep_total
       b_sim%pre_freq = 1 ! state changes too fast to reuse the preconditioner
     CASE(2) ! post-kick: restore kappa_perp, continue evolving the VDE, and make
             ! density diffusion pressure-conserving (-(T/n)*D*lap(n) in the T equation)
-      dt = 5.d-4
+      dt = dt_post
       b_sim%mug%kappa(1) = kappa_base
       b_sim%mug%chi_par_mult = kappa_par/b_sim%mug%kappa(1) ! keep kappa_par fixed
       b_sim%mug%nu(1) = visc_post ! relax viscosity once the kick transient is over
