@@ -105,6 +105,8 @@ REAL(r8) :: lin_tol = 1.d-7 !< Absolute tolerance of the linear (GMRES) solve (s
 REAL(r8) :: nl_tol = 1.d-6 !< Absolute tolerance on the Newton residual |F| (set in oft.in group sparc_vde_options). Newton stalls at a round-off floor that rises at lower mass_scale (~5e-7 at mass_scale 1000, ~1-3e-6 at 100 for dt 0.5 ms); if nl_tol is below that floor every step fails and is retried with dt halved
 REAL(r8) :: mf_b0 = 1.d-3 !< Relative finite-difference step of the matrix-free Jacobian-vector product (oft_mf_matrix%b0; mugtok_td sets 1e-3, other OFT solvers 1e-5)
 REAL(r8) :: T_clip = -1.d0 !< Hard temperature floor [eV] on the accepted state after every step (oft_mugtok_td%T_clip); <= 0 disables
+REAL(r8) :: T_floor = -1.d0 !< Implicit temperature floor [eV] inside the residual (xmhd_2d T_floor): heating -(T-T_floor)/tau_floor where T < T_floor; <= 0 disables
+REAL(r8) :: tau_floor = 5.d-5 !< Relaxation time [s] of the implicit temperature floor (xmhd_2d tau_floor)
 CHARACTER(LEN=7) :: lu_package = '' !< If set, LU package of the full-LU preconditioner ('mumps', 'umfpack', 'super', ...); empty = OFT's build default (UMFPACK if built, else MUMPS, else SuperLU)
 REAL (r8):: coords(3), psi(1), q(1)
 LOGICAL :: pm=.TRUE.
@@ -116,7 +118,8 @@ TYPE(oft_mugtok_td):: b_sim
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol,mf_b0,T_clip, &
-  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,lu_package,dt_grow_steps,newton_backtrack,resid_dump
+  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,lu_package,dt_grow_steps,newton_backtrack,resid_dump, &
+  T_floor,tau_floor
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -350,6 +353,9 @@ b_sim%mfmat%b0 = mf_b0
 WRITE(*,'(A,ES10.2)')' Matrix-free Jacobian: finite-difference step mf_b0 =',mf_b0
 b_sim%T_clip = T_clip
 WRITE(*,'(A,F8.2,A)')' Hard temperature floor T_clip =',T_clip,' eV (<= 0: off)'
+b_sim%mug%T_floor = T_floor
+b_sim%mug%tau_floor = tau_floor
+WRITE(*,'(A,F8.2,A,ES10.2,A)')' Implicit temperature floor T_floor =',T_floor,' eV, tau_floor =',tau_floor,' s (T_floor <= 0: off)'
 WRITE(*,'(A,I4,A)')' dt recovery: double dt after',dt_grow_steps,' clean steps (0: off)'
 b_sim%nksolver%backtrack = newton_backtrack
 WRITE(*,'(A,L2)')' Newton backtracking:',newton_backtrack

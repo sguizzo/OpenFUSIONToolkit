@@ -144,6 +144,8 @@ TYPE, public :: oft_xmhd_2d_sim
   PROCEDURE(xmhd_2d_sink_func), POINTER, NOPASS :: sink_func => NULL() !< Optional closure testing whether the temperature sink term should be applied at a point; evaluated pointwise at each quadrature point (compressible only)
   REAL(r8) :: T_sink = -1.d0 !< Temperature the sink term relaxes towards where `sink_func` returns true, dT/dt = -(T-T_sink)/tau_sink. Only meaningful when `tau_sink>0`
   REAL(r8) :: tau_sink = -1.d0 !< Relaxation timescale for the temperature sink term. The sink term is disabled unless explicitly set to a positive value
+  REAL(r8) :: T_floor = -1.d0 !< Implicit temperature floor [eV]: where T < T_floor (at a quadrature point) the temperature equation gets the heating term dT/dt = -(T-T_floor)/tau_floor, with its Jacobian, so the floor acts inside the Newton solve rather than as a clip. Applied everywhere (no sink_func test); compressible, evolved T only
+  REAL(r8) :: tau_floor = -1.d0 !< Relaxation timescale for the implicit temperature floor; the floor is disabled unless both T_floor and tau_floor are positive
   LOGICAL :: use_spitzer = .FALSE. !< If true (compressible only), override the region eta with Spitzer resistivity eta(n,T) at each quadrature point
   CLASS(oft_vector), POINTER :: T_eta => NULL() !< Snapshot of the temperature field used to evaluate the Spitzer resistivity when T is evolved. Frozen once per timestep by `xmhd_2d_freeze_eta_temp` so that eta is identical in the RHS (dt=0) and LHS (dt>0) evaluations of the residual; see that routine for why this matters
   CLASS(oft_vector), POINTER :: n_eta => NULL() !< Snapshot of the (normalized) density field used with `T_eta` for the Spitzer resistivity; frozen alongside it by `xmhd_2d_freeze_eta_temp`
@@ -990,6 +992,13 @@ DO i=1,mesh%nc
         sink_term = (T-self%parent_sim%T_sink)/(self%parent_sim%tau_sink*(gamma-1.d0))
       END IF
     END IF
+    !---Implicit temperature floor: dT/dt = -(T-T_floor)/tau_floor where T < T_floor
+    !   (one-sided, added to sink_term so it enters the residual the same way)
+    IF ((.NOT.incomp) .AND. (.NOT.ASSOCIATED(self%parent_sim%T_func)) .AND. &
+        (self%parent_sim%tau_floor>0.d0) .AND. (self%parent_sim%T_floor>0.d0)) THEN
+      IF (T<self%parent_sim%T_floor) sink_term = sink_term &
+        + (T-self%parent_sim%T_floor)/(self%parent_sim%tau_floor*(gamma-1.d0))
+    END IF
     !---Spitzer resistivity: override the region eta with a T-dependent value.
     !   When T is evolved, eta uses the frozen snapshot (eta_lag) so that it is
     !   the same coefficient in the RHS and LHS passes of a timestep; otherwise
@@ -1650,6 +1659,14 @@ DO i=1,mesh%nc
       IF (self%sink_func(coords, psi)) THEN
         sink_term = (T-self%T_sink)/(self%tau_sink*(gamma-1.d0))
         dsink_dT = 1.d0/(self%tau_sink*(gamma-1.d0))
+      END IF
+    END IF
+    !---Implicit temperature floor, matching nlfun_apply
+    IF ((.NOT.incomp) .AND. (.NOT.ASSOCIATED(self%T_func)) .AND. &
+        (self%tau_floor>0.d0) .AND. (self%T_floor>0.d0)) THEN
+      IF (T<self%T_floor) THEN
+        sink_term = sink_term + (T-self%T_floor)/(self%tau_floor*(gamma-1.d0))
+        dsink_dT = dsink_dT + 1.d0/(self%tau_floor*(gamma-1.d0))
       END IF
     END IF
     IF ((.NOT.incomp) .AND. self%use_spitzer) THEN
