@@ -21,6 +21,7 @@ USE oft_gs_util, ONLY: gs_profile_load
 USE oft_lag_basis, ONLY: oft_lag_setup,oft_scalar_bfem, oft_blag_eval, oft_blag_geval, oft_2D_lagrange_cast
 USE fem_base, ONLY: oft_ml_fem_type
 USE mugtok_td
+USE oft_lu, ONLY: oft_lusolver
 
 IMPLICIT NONE
 INTEGER(i4) :: io_unit,ierr, i, j
@@ -100,6 +101,7 @@ REAL(r8) :: lin_tol = 1.d-7 !< Absolute tolerance of the linear (GMRES) solve (s
 REAL(r8) :: nl_tol = 1.d-6 !< Absolute tolerance on the Newton residual |F| (set in oft.in group sparc_vde_options). Newton stalls at a round-off floor that rises at lower mass_scale (~5e-7 at mass_scale 1000, ~1-3e-6 at 100 for dt 0.5 ms); if nl_tol is below that floor every step fails and is retried with dt halved
 REAL(r8) :: mf_b0 = 1.d-3 !< Relative finite-difference step of the matrix-free Jacobian-vector product (oft_mf_matrix%b0; mugtok_td sets 1e-3, other OFT solvers 1e-5)
 REAL(r8) :: T_clip = -1.d0 !< Hard temperature floor [eV] on the accepted state after every step (oft_mugtok_td%T_clip); <= 0 disables
+CHARACTER(LEN=7) :: lu_package = '' !< If set, LU package of the full-LU preconditioner ('mumps', 'umfpack', 'super', ...); empty = OFT's build default (UMFPACK if built, else MUMPS, else SuperLU)
 REAL (r8):: coords(3), psi(1), q(1)
 LOGICAL :: pm=.TRUE.
 LOGICAL :: success
@@ -110,7 +112,7 @@ TYPE(oft_mugtok_td):: b_sim
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol,mf_b0,T_clip, &
-  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN
+  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,lu_package
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -344,6 +346,14 @@ b_sim%mfmat%b0 = mf_b0
 WRITE(*,'(A,ES10.2)')' Matrix-free Jacobian: finite-difference step mf_b0 =',mf_b0
 b_sim%T_clip = T_clip
 WRITE(*,'(A,F8.2,A)')' Hard temperature floor T_clip =',T_clip,' eV (<= 0: off)'
+SELECT TYPE(lu_pre => b_sim%pre)
+  TYPE IS(oft_lusolver)
+    IF(LEN_TRIM(lu_package)>0)lu_pre%package = lu_package
+    WRITE(*,'(2A)')' Preconditioner: full LU, package ',TRIM(lu_pre%package)
+  CLASS DEFAULT
+    IF(LEN_TRIM(lu_package)>0)CALL oft_abort('lu_package needs the full-LU preconditioner (use_full_lu)','sparc_vde_beta_kick',__FILE__)
+    WRITE(*,'(A)')' Preconditioner: not a single LU (block-Jacobi)'
+END SELECT
 
 ! Coil currents are held fixed for the whole run; step() overwrites equil%coil_currs
 ! internally, so a separate fixed reference copy is needed to pass in every step.
