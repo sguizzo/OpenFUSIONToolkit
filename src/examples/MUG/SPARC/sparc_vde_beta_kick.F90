@@ -88,6 +88,7 @@ REAL(r8) :: dt_min_frac = 0.125d0 !< Stop the run (then plot) once step() retrie
 REAL(r8) :: dt_phase = 0.d0 !< Starting (nominal) dt of the current kick phase, the reference for dt_min_frac
 INTEGER(i4) :: dt_grow_steps = 0 !< If > 0: after this many consecutive steps with no retry, double dt again (capped at the phase's nominal dt), so a dt halved by step() retries can recover; 0 = never (dt stays reduced)
 LOGICAL :: newton_backtrack = .FALSE. !< Turn on backtracking (step halving while |F| grows) in the Newton solver; mugtok_td switches it off by default
+LOGICAL :: resid_dump = .FALSE. !< Write the Newton residual of failed Newton attempts to the XDMF group mugtok_resid (oft_mugtok_td%resid_dump; at most 8)
 INTEGER(i4) :: n_clean = 0 !< Consecutive steps without a retry (for dt_grow_steps)
 LOGICAL :: plot_only = .FALSE. !< If true, set up as usual, then only convert the mugtok_*.rst files in the current folder to XDMF output (no time stepping, no new restart files)
 INTEGER(i4) :: pre_freq = 1 !< Post-kick only: rebuild the approximate Jacobian/refactor the preconditioner every pre_freq steps (see oft_mugtok_td%pre_freq); pre-kick and kick phases always rebuild every step
@@ -115,7 +116,7 @@ TYPE(oft_mugtok_td):: b_sim
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol,mf_b0,T_clip, &
-  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,lu_package,dt_grow_steps,newton_backtrack
+  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,lu_package,dt_grow_steps,newton_backtrack,resid_dump
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -352,6 +353,8 @@ WRITE(*,'(A,F8.2,A)')' Hard temperature floor T_clip =',T_clip,' eV (<= 0: off)'
 WRITE(*,'(A,I4,A)')' dt recovery: double dt after',dt_grow_steps,' clean steps (0: off)'
 b_sim%nksolver%backtrack = newton_backtrack
 WRITE(*,'(A,L2)')' Newton backtracking:',newton_backtrack
+b_sim%resid_dump = resid_dump
+WRITE(*,'(A,L2)')' Residual dump on Newton failure:',resid_dump
 SELECT TYPE(lu_pre => b_sim%pre)
   TYPE IS(oft_lusolver)
     IF(LEN_TRIM(lu_package)>0)lu_pre%package = lu_package

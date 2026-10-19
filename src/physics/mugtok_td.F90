@@ -67,6 +67,10 @@ INTEGER(i4) :: pre_freq = 1 !< Rebuild the approximate Jacobian and refactor the
 INTEGER(i4) :: pre_age = 0 !< Number of steps since the approximate Jacobian/preconditioner was last rebuilt
 LOGICAL :: pre_force_update = .TRUE. !< Force a Jacobian/preconditioner rebuild on the next step (set after changing physics coefficients, e.g. nu, m_i, kappa)
 REAL(r8) :: T_clip = -1.d0 !< If > 0, hard temperature floor [eV]: after each accepted step, T DOFs (field 5) below T_clip are set to T_clip. Not energy conserving and outside the Newton solve; off by default
+LOGICAL :: resid_dump = .FALSE. !< If true, write the Newton residual F(u)-rhs of each failed Newton attempt (fields 1-7, plus the iterate's V and T) as a time step of the XDMF group "mugtok_resid" in resid_dump/oft_xdmf.*.h5 (at most 8 per run)
+INTEGER(i4) :: n_resid_dumps = 0 !< Residual dumps written so far
+LOGICAL :: resid_xdmf_ready = .FALSE. !< mugtok_resid XDMF output initialized
+TYPE(xdmf_plot_file) :: resid_xdmf !< XDMF output for the residual dumps
 LOGICAL :: use_full_lu = .FALSE. !< In MHD-plasma mode, use a complete LU of the coupled Jacobian instead of per-field block-Jacobi (better linear convergence in the stiff near-ideal regime, but much higher memory). Set before calling setup_mhd.
 CLASS(flux_func), POINTER :: n_prof => NULL() !< Normalized density profile nhat(psihat), evaluated via %fp (linterp values). If set before setup_mhd (together with T_prof), n and T are seeded from the profiles and n is evolved
 CLASS(flux_func), POINTER :: T_prof => NULL() !< Normalized temperature profile That(psihat), evaluated via %fp (linterp values). See n_prof
@@ -1076,6 +1080,7 @@ DO j = 1,4
     dbg_it = 0 ! NLDEBUG
     CALL self%nksolver%apply(self%u,self%rhs)
     IF(self%nksolver%cits<0)THEN
+        IF(self%resid_dump)CALL mugtok_dump_residual(self, time)
         CALL self%u%add(0.d0,1.d0,self%tmp)
         !---A stale preconditioner may be the cause: refresh it and retry at the same dt first
         IF(self%pre_age>1)THEN
@@ -2246,6 +2251,48 @@ END IF
 DEBUG_STACK_POP
 end subroutine
 
+!---------------------------------------------------------------------------------
+!> Write the Newton residual F(u)-rhs at the current (failed) iterate self%u, field by field, plus
+!! the iterate's V_R, V_Z and T, as one time step of the XDMF group "mugtok_resid" in resid_dump/. Fields whose
+!! DOF count differs from the plotting basis are skipped. At most 8 dumps per run.
+!---------------------------------------------------------------------------------
+SUBROUTINE mugtok_dump_residual(self, time)
+CLASS(oft_mugtok_td), INTENT(inout) :: self
+REAL(r8), INTENT(in) :: time
+CLASS(oft_vector), POINTER :: wrk
+REAL(r8), POINTER :: vals(:)
+CHARACTER(LEN=6), PARAMETER :: rnames(7) = ['R_n   ','R_VR  ','R_Vphi','R_VZ  ','R_T   ','R_psi ','R_F   ']
+CHARACTER(LEN=2), PARAMETER :: unames(3) = ['VR','VZ','T ']
+INTEGER(i4), PARAMETER :: ufields(3) = [2,4,5]
+INTEGER(i4) :: k
+REAL(r8) :: fnorm
+IF(self%n_resid_dumps >= 8)RETURN
+IF(.NOT.self%resid_xdmf_ready)THEN
+  CALL self%resid_xdmf%setup("mugtok_resid","resid_dump/") ! own file: the end-of-run plot truncates ./oft_xdmf.*.h5
+  CALL mesh%setup_io(self%resid_xdmf,lag_rep%order)
+  self%resid_xdmf_ready = .TRUE.
+END IF
+NULLIFY(wrk, vals)
+CALL self%u%new(wrk)
+CALL self%nlfun%apply(self%u,wrk)
+CALL wrk%add(1.d0,-1.d0,self%rhs)
+fnorm = SQRT(wrk%dot(wrk))
+CALL self%resid_xdmf%add_timestep(time + 1.d-9*REAL(self%n_resid_dumps,8))
+DO k=1,7
+  CALL wrk%get_local(vals,k)
+  IF(SIZE(vals) == lag_rep%ne)CALL mesh%save_vertex_scalar(vals,self%resid_xdmf,TRIM(rnames(k)))
+  DEALLOCATE(vals)
+END DO
+DO k=1,3
+  CALL self%u%get_local(vals,ufields(k))
+  IF(SIZE(vals) == lag_rep%ne)CALL mesh%save_vertex_scalar(vals,self%resid_xdmf,TRIM(unames(k)))
+  DEALLOCATE(vals)
+END DO
+CALL wrk%delete()
+DEALLOCATE(wrk)
+self%n_resid_dumps = self%n_resid_dumps + 1
+WRITE(*,'(A,I3,A,ES12.4,A,ES12.4)')' Residual dump',self%n_resid_dumps,' (mugtok_resid): t =',time,'  |F| =',fnorm
+END SUBROUTINE mugtok_dump_residual
 !---------------------------
 ! Update matrix-free operatior 
 !---------------------------
