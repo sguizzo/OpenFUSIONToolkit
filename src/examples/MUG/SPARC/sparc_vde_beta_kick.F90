@@ -86,6 +86,8 @@ INTEGER(i4) :: rst_start = 0 !< If >0, resume from restart file 'mugtok_NNNNN.rs
 REAL(r8) :: dt_rst = -1.d0 !< Timestep read from the restart file when resuming
 REAL(r8) :: dt_min_frac = 0.125d0 !< Stop the run (then plot) once step() retries have cut dt below dt_min_frac times the current phase's starting dt; <=0 disables (set in oft.in group sparc_vde_options)
 REAL(r8) :: dt_phase = 0.d0 !< Starting (nominal) dt of the current kick phase, the reference for dt_min_frac
+INTEGER(i4) :: dt_grow_steps = 0 !< If > 0: after this many consecutive steps with no retry, double dt again (capped at the phase's nominal dt), so a dt halved by step() retries can recover; 0 = never (dt stays reduced)
+INTEGER(i4) :: n_clean = 0 !< Consecutive steps without a retry (for dt_grow_steps)
 LOGICAL :: plot_only = .FALSE. !< If true, set up as usual, then only convert the mugtok_*.rst files in the current folder to XDMF output (no time stepping, no new restart files)
 INTEGER(i4) :: pre_freq = 1 !< Post-kick only: rebuild the approximate Jacobian/refactor the preconditioner every pre_freq steps (see oft_mugtok_td%pre_freq); pre-kick and kick phases always rebuild every step
 REAL(r8) :: kappa_par = 1.542d26 !< Parallel (field-aligned) thermal conductivity kappa=chi*n [1/(m s)], held fixed for the whole run by setting chi_par_mult=kappa_par/kappa(1) in each phase
@@ -112,7 +114,7 @@ TYPE(oft_mugtok_td):: b_sim
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol,mf_b0,T_clip, &
-  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,lu_package
+  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,lu_package,dt_grow_steps
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -346,6 +348,7 @@ b_sim%mfmat%b0 = mf_b0
 WRITE(*,'(A,ES10.2)')' Matrix-free Jacobian: finite-difference step mf_b0 =',mf_b0
 b_sim%T_clip = T_clip
 WRITE(*,'(A,F8.2,A)')' Hard temperature floor T_clip =',T_clip,' eV (<= 0: off)'
+WRITE(*,'(A,I4,A)')' dt recovery: double dt after',dt_grow_steps,' clean steps (0: off)'
 SELECT TYPE(lu_pre => b_sim%pre)
   TYPE IS(oft_lusolver)
     IF(LEN_TRIM(lu_package)>0)lu_pre%package = lu_package
@@ -428,6 +431,7 @@ DO i=rst_start+1,nstep_total
     ! (possibly reduced by step() retries) rather than the phase's nominal dt
     IF(kick_phase_prev < 0 .AND. rst_start > 0) dt = dt_rst
     kick_phase_prev = kick_phase
+    n_clean = 0
     b_sim%pre_force_update = .TRUE. ! nu/m_i/kappa changed: rebuild the preconditioner
   END IF
   write(*,*) "Step: ", i, "  t = ", t, "  kick_phase = ", kick_phase, "  kappa(1) = ", b_sim%mug%kappa(1), &
@@ -443,6 +447,17 @@ DO i=rst_start+1,nstep_total
     WRITE(*,'(A,ES12.4,A,ES12.4,A,I2,A,I7)')' Stopping: dt = ',dt,' is below dt_min_frac*phase dt = ', &
       dt_min_frac*dt_phase,' (kick_phase',kick_phase,') at step ',i
     EXIT
+  END IF
+  ! Let a dt reduced by retries grow back toward the phase's nominal dt after dt_grow_steps clean steps
+  IF(nretry == 0)THEN
+    n_clean = n_clean + 1
+  ELSE
+    n_clean = 0
+  END IF
+  IF(dt_grow_steps > 0 .AND. n_clean >= dt_grow_steps .AND. dt < dt_phase*(1.d0-1.d-8))THEN
+    dt = MIN(2.d0*dt, dt_phase)
+    n_clean = 0
+    WRITE(*,'(A,ES12.4,A,I4,A)')' dt grown to ',dt,' after ',dt_grow_steps,' clean steps'
   END IF
   ! IF (MOD(i,25)==0 ) THEN
   !   CALL b_sim%plot()

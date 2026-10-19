@@ -1099,7 +1099,9 @@ DO j = 1,4
     END IF
 END DO
 
-!Advance time and return iteration counts
+!Advance time and return iteration counts (nretry = extra Newton attempts this step: stale-preconditioner
+!retries and dt halvings; j is 5 if all four attempts failed)
+nretry=j-1
 time=time+self%nlfun%dt
 dt=self%nlfun%dt
 nl_its=self%nksolver%nlits
