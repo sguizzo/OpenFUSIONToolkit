@@ -93,7 +93,7 @@ LOGICAL :: resid_dump = .FALSE. !< Write the Newton residual of failed Newton at
 INTEGER(i4) :: n_clean = 0 !< Consecutive steps without a retry (for dt_grow_steps)
 LOGICAL :: plot_only = .FALSE. !< If true, set up as usual, then only convert the mugtok_*.rst files in the current folder to XDMF output (no time stepping, no new restart files)
 INTEGER(i4) :: pre_freq = 1 !< Post-kick only: rebuild the approximate Jacobian/refactor the preconditioner every pre_freq steps (see oft_mugtok_td%pre_freq); pre-kick and kick phases always rebuild every step
-REAL(r8) :: kappa_par = 1.542d26 !< Parallel (field-aligned) thermal conductivity kappa=chi*n [1/(m s)], held fixed for the whole run by setting chi_par_mult=kappa_par/kappa(1) in each phase
+REAL(r8) :: kappa_par = 1.542d26 !< Parallel (field-aligned) thermal conductivity kappa=chi*n [1/(m s)], held fixed for the whole run by setting chi_par_mult=kappa_par/kappa(1) in each phase (set in oft.in group sparc_vde_options; applied at the phase setup, so also on a restart)
 !---Initial density/temperature: offset + scale*profile inside the plasma (profiles from
 !   tokamaker_n.prof/tokamaker_t.prof, normalized to 1 on axis), offset outside.
 !   n_scale is computed below so that 2*k*n*T on axis matches the equilibrium axis pressure
@@ -120,7 +120,7 @@ CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
-  T_floor,tau_floor
+  T_floor,tau_floor,kappa_par
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -359,6 +359,7 @@ b_sim%mug%tau_floor = tau_floor
 WRITE(*,'(A,F8.2,A,ES10.2,A)')' Implicit temperature floor T_floor =',T_floor,' eV, tau_floor =',tau_floor,' s (T_floor <= 0: off)'
 WRITE(*,'(A,I4,A)')' dt recovery: double dt after',dt_grow_steps,' clean steps (0: off)'
 WRITE(*,'(A,ES12.4,A)')' Post-kick nominal dt (dt_post) =',dt_post,' s'
+WRITE(*,'(A,ES12.4,A,ES12.4)')' Parallel conductivity kappa_par =',kappa_par,' 1/(m s); post-kick kappa_par/kappa_perp =',kappa_par/kappa_base
 b_sim%nksolver%backtrack = newton_backtrack
 WRITE(*,'(A,L2)')' Newton backtracking:',newton_backtrack
 b_sim%resid_dump = resid_dump
