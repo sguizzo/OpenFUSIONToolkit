@@ -1,5 +1,6 @@
 oft_add_exe(sparc_vde.F90 )
 oft_add_exe(sparc_vde_beta_kick.F90 )
+oft_add_exe(sparc_vde_tq2.F90 )
 install(FILES oft.in DESTINATION examples/MUG/tok_mug COMPONENT examples)
 configure_file( oft.in ${CMAKE_CURRENT_BINARY_DIR} COPYONLY)
 install(FILES sparc_mug_2cm.h5 DESTINATION examples/MUG/tok_mug COMPONENT examples)
