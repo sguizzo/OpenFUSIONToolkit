@@ -23,7 +23,7 @@ USE mhd_utils, ONLY: mu0
 USE oft_gs, ONLY: gs_epsilon, gs_equil, gs_factory, gs_update_bounds, gs_test_bounds, flux_func, build_dels
 USE oft_gs_td, ONLY: oft_tmaker_td_mfop, build_vac_op, apply_rhs
 USE oft_mesh_local_util, ONLY: mesh_local_findedge
-USE xmhd_2d, ONLY: oft_xmhd_2d_sim, build_approx_jacobian, xmhd_2d_freeze_eta_temp
+USE xmhd_2d, ONLY: oft_xmhd_2d_sim, build_approx_jacobian, xmhd_2d_freeze_eta_temp, xmhd_2d_floor_update
 USE oft_stitching, ONLY: seam_list
 IMPLICIT NONE
 #include "local.h"
@@ -1057,6 +1057,9 @@ ELSE
 END IF
 self%pre_age=self%pre_age+1
 
+!Per-cell temperature-floor source for this step (xmhd_2d T_floor; no-op when off)
+CALL xmhd_2d_floor_update(self%mug, .FALSE.)
+
 !Build RHS
 CALL self%tmp%add(0.d0,1.d0,self%u)
 CALL apply_rhs_mugtok(self%nlfun,self%u,self%rhs)
@@ -1082,6 +1085,7 @@ DO j = 1,4
     IF(self%nksolver%cits<0)THEN
         IF(self%resid_dump)CALL mugtok_dump_residual(self, time)
         CALL self%u%add(0.d0,1.d0,self%tmp)
+        CALL xmhd_2d_floor_update(self%mug, .TRUE.) ! raise the floor source from this attempt's flags
         !---A stale preconditioner may be the cause: refresh it and retry at the same dt first
         IF(self%pre_age>1)THEN
             WRITE(*,*)'Newton failed with a stale preconditioner; rebuilding and retrying at same dt'

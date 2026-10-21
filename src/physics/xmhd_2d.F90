@@ -144,8 +144,9 @@ TYPE, public :: oft_xmhd_2d_sim
   PROCEDURE(xmhd_2d_sink_func), POINTER, NOPASS :: sink_func => NULL() !< Optional closure testing whether the temperature sink term should be applied at a point; evaluated pointwise at each quadrature point (compressible only)
   REAL(r8) :: T_sink = -1.d0 !< Temperature the sink term relaxes towards where `sink_func` returns true, dT/dt = -(T-T_sink)/tau_sink. Only meaningful when `tau_sink>0`
   REAL(r8) :: tau_sink = -1.d0 !< Relaxation timescale for the temperature sink term. The sink term is disabled unless explicitly set to a positive value
-  REAL(r8) :: T_floor = -1.d0 !< Implicit temperature floor [eV]: where T < T_floor (at a quadrature point) the temperature equation gets the heating term dT/dt = -(T-T_floor)/tau_floor, with its Jacobian, so the floor acts inside the Newton solve rather than as a clip. Applied everywhere (no sink_func test); compressible, evolved T only
-  REAL(r8) :: tau_floor = -1.d0 !< Relaxation timescale for the implicit temperature floor; the floor is disabled unless both T_floor and tau_floor are positive
+  REAL(r8) :: T_floor = -1.d0 !< Temperature floor [eV], per-cell scheme of the 3D xmhd.F90 (temp_floor): (1) every term except the dT/dt mass term uses max(T,T_floor); (2) cells where T < T_floor at any quadrature point are flagged (T_floor_flag = max (T_floor-T)/T_floor); at each step start the per-cell source T_floor_src = max(T_floor_src/2, min(2,flag)) (dropped below 1e-2) adds heating dT/dt = +T_floor_src*T_floor/(4 dt) in that cell (explicit, no Jacobian term). <= 0 disables; compressible, evolved T only
+  REAL(r8), ALLOCATABLE :: T_floor_flag(:) !< Per cell: max (T_floor-T)/T_floor seen since the last source update (see T_floor)
+  REAL(r8), ALLOCATABLE :: T_floor_src(:) !< Per cell: floor heating amplitude for the current step (see T_floor)
   LOGICAL :: use_spitzer = .FALSE. !< If true (compressible only), override the region eta with Spitzer resistivity eta(n,T) at each quadrature point
   CLASS(oft_vector), POINTER :: T_eta => NULL() !< Snapshot of the temperature field used to evaluate the Spitzer resistivity when T is evolved. Frozen once per timestep by `xmhd_2d_freeze_eta_temp` so that eta is identical in the RHS (dt=0) and LHS (dt>0) evaluations of the residual; see that routine for why this matters
   CLASS(oft_vector), POINTER :: n_eta => NULL() !< Snapshot of the (normalized) density field used with `T_eta` for the Spitzer resistivity; frozen alongside it by `xmhd_2d_freeze_eta_temp`
@@ -196,7 +197,7 @@ TYPE(oft_ml_fem_type), TARGET, PUBLIC :: ML_oft_blagrange !< Multilevel finite e
 CLASS(oft_scalar_bfem), POINTER, PUBLIC :: oft_blagrange => NULL() !< Lagrange finite element representation
 TYPE(oft_ml_fem_type), TARGET, PUBLIC :: ML_oft_blagrange_p !< Multilevel finite element representation for pressure (if incompressible)
 CLASS(oft_scalar_bfem), POINTER, PUBLIC :: oft_blagrange_p => NULL() !< Lagrange finite element representation for pressure (if incompressible)
-PUBLIC xmhd_2d_plot, build_approx_jacobian, xmhd_2d_freeze_eta_temp
+PUBLIC xmhd_2d_plot, build_approx_jacobian, xmhd_2d_freeze_eta_temp, xmhd_2d_floor_update
 CONTAINS
 
 !---------------------------------------------------------------------------
@@ -862,6 +863,10 @@ CALL b%get_local(T_res, 5)
 CALL b%get_local(psi_res, 6)
 CALL b%get_local(by_res, 7)
 diag_vals=0.d0
+IF((self%parent_sim%T_floor>0.d0).AND.(.NOT.ALLOCATED(self%parent_sim%T_floor_flag)))THEN
+  ALLOCATE(self%parent_sim%T_floor_flag(mesh%nc),self%parent_sim%T_floor_src(mesh%nc))
+  self%parent_sim%T_floor_flag=0.d0; self%parent_sim%T_floor_src=0.d0
+END IF
 
 !!$omp parallel reduction(+:diag_vals)
 BLOCK
@@ -870,14 +875,14 @@ INTEGER(i4) :: k,m,jr
 INTEGER(i4), ALLOCATABLE, DIMENSION(:) :: cell_dofs, cell_dofs_p
 REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dpsi_0(3),dby(3),T_eta_val,n_eta_val
 REAL(r8) :: dvel(3,3),div_vel,jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),coords(3),kappa_T(3,3)
-REAL(r8) :: sink_term
+REAL(r8) :: sink_term, T_mass
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals,basis_vals_p,T_weights_loc,n_weights_loc,psi_weights_loc,by_weights_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: T_eta_loc, n_eta_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grads_p, res_loc
 !$omp parallel private(k,m,jr,curved,coords,cell_dofs,cell_dofs_p,basis_vals,basis_grads, basis_vals_p, basis_grads_p, T_weights_loc, &
 !$omp n_weights_loc,psi_weights_loc, by_weights_loc,vel_weights_loc,res_loc,jac_mat, &
 !$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dpsi_0,dby,dvel,div_vel,btmp, tmp1, kappa_T, &
-!$omp T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, &
+!$omp T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, T_mass, &
 !$omp chi, m_i, eta, nu, nu1, nu2, T_visc, visc_fac, psiN_visc, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 ALLOCATE(n_weights_loc(oft_blagrange%nce),&
@@ -992,12 +997,17 @@ DO i=1,mesh%nc
         sink_term = (T-self%parent_sim%T_sink)/(self%parent_sim%tau_sink*(gamma-1.d0))
       END IF
     END IF
-    !---Implicit temperature floor: dT/dt = -(T-T_floor)/tau_floor where T < T_floor
-    !   (one-sided, added to sink_term so it enters the residual the same way)
-    IF ((.NOT.incomp) .AND. (.NOT.ASSOCIATED(self%parent_sim%T_func)) .AND. &
-        (self%parent_sim%tau_floor>0.d0) .AND. (self%parent_sim%T_floor>0.d0)) THEN
-      IF (T<self%parent_sim%T_floor) sink_term = sink_term &
-        + (T-self%parent_sim%T_floor)/(self%parent_sim%tau_floor*(gamma-1.d0))
+    !---Temperature floor (per-cell scheme of xmhd.F90): flag the cell, use max(T,T_floor) in every
+    !   term except the dT/dt mass term (T_mass), and add this step's per-cell heating source
+    T_mass = T
+    IF ((.NOT.incomp) .AND. (.NOT.ASSOCIATED(self%parent_sim%T_func)) .AND. (self%parent_sim%T_floor>0.d0)) THEN
+      IF (T<self%parent_sim%T_floor) THEN
+        self%parent_sim%T_floor_flag(i) = MAX(self%parent_sim%T_floor_flag(i), &
+          (self%parent_sim%T_floor-T)/self%parent_sim%T_floor)
+        T = self%parent_sim%T_floor
+      END IF
+      IF ((self%parent_sim%T_floor_src(i)>0.d0) .AND. (self%dt>0.d0)) sink_term = sink_term &
+        - self%parent_sim%T_floor_src(i)*self%parent_sim%T_floor/(4.d0*self%dt*(gamma-1.d0))
     END IF
     !---Spitzer resistivity: override the region eta with a T-dependent value.
     !   When T is evolved, eta uses the frozen snapshot (eta_lag) so that it is
@@ -1082,7 +1092,7 @@ DO i=1,mesh%nc
         !---Temperature
         IF (cyl_flag) THEN
           res_loc(jr,5) = res_loc(jr, 5) &
-            + basis_vals(jr)*T*int_factor*coords(1)/(gamma-1) &
+            + basis_vals(jr)*T_mass*int_factor*coords(1)/(gamma-1) &
             + self%dt*basis_vals(jr)*DOT_PRODUCT(vel, dT)*int_factor*coords(1)/(gamma-1) &
             + self%dt*basis_vals(jr)*T*div_vel*int_factor*coords(1) &
             + self%dt*DOT_PRODUCT(MATMUL(kappa_T,dT), basis_grads(:,jr))*int_factor*coords(1) &
@@ -1092,7 +1102,7 @@ DO i=1,mesh%nc
             - pres_fac*self%dt*D_diff*basis_vals(jr)*(DOT_PRODUCT(dT,dn)/n - T*DOT_PRODUCT(dn,dn)/n**2)*int_factor*coords(1)/(gamma-1) ! grad(T/n) part
         ELSE
           res_loc(jr,5) = res_loc(jr, 5) &
-            + basis_vals(jr)*T*int_factor/(gamma-1) &
+            + basis_vals(jr)*T_mass*int_factor/(gamma-1) &
             + self%dt*basis_vals(jr)*DOT_PRODUCT(vel, dT)*int_factor/(gamma-1) &
             + self%dt*basis_vals(jr)*T*div_vel*int_factor &
             + self%dt*DOT_PRODUCT(MATMUL(kappa_T,dT), basis_grads(:,jr))*int_factor &
@@ -1295,6 +1305,26 @@ DEALLOCATE(psi_vac_weights)
 IF(ASSOCIATED(T_eta_weights))DEALLOCATE(T_eta_weights)
 IF(ASSOCIATED(n_eta_weights))DEALLOCATE(n_eta_weights)
 END SUBROUTINE nlfun_apply
+!---------------------------------------------------------------------------------
+!> Update the per-cell temperature-floor heating source (xmhd.F90 scheme, see T_floor).
+!! At the start of a step (retry=.FALSE.): halve the source, drop it below 1e-2, raise it to
+!! min(2,flag) where flagged, clear the flags and report the number of floored cells. After a failed
+!! Newton attempt (retry=.TRUE.): raise the source from the flags and clear them, without halving.
+!---------------------------------------------------------------------------------
+SUBROUTINE xmhd_2d_floor_update(self, retry)
+CLASS(oft_xmhd_2d_sim), INTENT(inout) :: self
+LOGICAL, INTENT(in) :: retry
+IF(self%T_floor<=0.d0)RETURN
+IF(.NOT.ALLOCATED(self%T_floor_flag))RETURN
+IF(.NOT.retry)THEN
+  self%T_floor_src = self%T_floor_src/2.d0
+  WHERE(self%T_floor_src<1.d-2) self%T_floor_src = 0.d0
+END IF
+WHERE(self%T_floor_flag>0.d0) self%T_floor_src = MAX(self%T_floor_src, MIN(2.d0, self%T_floor_flag))
+IF(oft_env%head_proc.AND.(.NOT.retry))WRITE(*,'(A,I8,A,ES10.2)')' T-FLOOR cells ',COUNT(self%T_floor_src>0.d0), &
+  ', max source',MAXVAL(self%T_floor_src)
+self%T_floor_flag = 0.d0
+END SUBROUTINE xmhd_2d_floor_update
 !---------------------------------------------------------------------------
 !> Spitzer resistivity as a function of density and temperature. Returns the
 !! in-plane (perpendicular) and out-of-plane (parallel) resistivity in units
@@ -1661,14 +1691,9 @@ DO i=1,mesh%nc
         dsink_dT = 1.d0/(self%tau_sink*(gamma-1.d0))
       END IF
     END IF
-    !---Implicit temperature floor, matching nlfun_apply
-    IF ((.NOT.incomp) .AND. (.NOT.ASSOCIATED(self%T_func)) .AND. &
-        (self%tau_floor>0.d0) .AND. (self%T_floor>0.d0)) THEN
-      IF (T<self%T_floor) THEN
-        sink_term = sink_term + (T-self%T_floor)/(self%tau_floor*(gamma-1.d0))
-        dsink_dT = dsink_dT + 1.d0/(self%tau_floor*(gamma-1.d0))
-      END IF
-    END IF
+    !---Temperature floor, matching nlfun_apply: coefficients use max(T,T_floor); the per-cell
+    !   source is explicit (constant within a step), so it adds nothing to the Jacobian
+    IF ((.NOT.incomp) .AND. (.NOT.ASSOCIATED(self%T_func)) .AND. (self%T_floor>0.d0)) T = MAX(T, self%T_floor)
     IF ((.NOT.incomp) .AND. self%use_spitzer) THEN
       IF (eta_lag) THEN
         !---eta is frozen over the step, so it contributes no Jacobian sensitivity
