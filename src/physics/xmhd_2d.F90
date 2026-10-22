@@ -134,6 +134,7 @@ TYPE, public :: oft_xmhd_2d_sim
   LOGICAL :: visc_sol_on_psi = .FALSE. !< Key the visc_sol_mult boost on normalized flux instead of T: f = (1+tanh((psiN-visc_sol_psiN0)/visc_sol_dpsiN))/2, so f~1 outside the LCFS (psiN > 1) and ~0 inside; psiN = (psi_axis-psi)/(psi_axis-psi_lcfs) from psi_norm_bounds, using the current iterate's psi (no Jacobian term for the psi dependence)
   REAL(r8) :: visc_sol_psiN0 = 1.d0 !< Normalized flux at the middle of the psi-keyed visc_sol_mult transition
   REAL(r8) :: visc_sol_dpsiN = 0.002d0 !< Width in normalized flux of the psi-keyed visc_sol_mult transition
+  REAL(r8) :: drag_rate = 0.d0 !< Linear drag rate kappa [1/s] on the poloidal velocity (R and Z): adds +kappa*v to dv/dt, i.e. a force -m_i*n*kappa*v_pol in the MHD region (a TSC-style 'drag term'). Not gradient based, so it damps flow at all scales equally and adds no wall-layer dissipation; 0 = off
   REAL(r8) :: psi_norm_bounds(2) = [0.d0,1.d0] !< [LCFS, axis] poloidal flux for psiN (set by the caller each step, e.g. from gs_equil%plasma_bounds)
   REAL(r8) :: nu2_ratio = 0.d0 !< Ratio nu2/nu1 of bulk (compressive) to shear kinematic viscosity. Adds a -nu2*grad(div(v)) bulk-viscosity term to the momentum equation, damping compressive motion independently of shear (nu1). Default 0 recovers the original pure-shear (grad^2) viscosity exactly, with nu1=nu(:)
   REAL(r8), ALLOCATABLE :: gamma(:) !< adiabatic index, by region, by region
@@ -1162,6 +1163,9 @@ DO i=1,mesh%nc
         res_loc(jr,4) = res_loc(jr,4) &
           + nu2*self%dt*basis_grads(3,jr)*div_vel*int_factor*coords(1) &
           - nu2*basis_vals(jr)*self%dt*div_vel*dn(3)*int_factor*coords(1)/n
+        !---Linear drag on the poloidal velocity (0 by default)
+        res_loc(jr,2) = res_loc(jr,2) + self%parent_sim%drag_rate*self%dt*basis_vals(jr)*vel(1)*int_factor*coords(1)
+        res_loc(jr,4) = res_loc(jr,4) + self%parent_sim%drag_rate*self%dt*basis_vals(jr)*vel(3)*int_factor*coords(1)
         res_loc(jr,2) = res_loc(jr,2) &
         + self%dt*basis_vals(jr)*(btmp(2)**2-btmp(1)**2-btmp(3)**2)*int_factor/(2.d0*mu0*m_i*n) &
         + self%dt*basis_vals(jr)*nu1*vel(1)*int_factor/(coords(1)+gs_epsilon)  &
@@ -1198,6 +1202,9 @@ DO i=1,mesh%nc
         res_loc(jr,4) = res_loc(jr,4) &
           + nu2*self%dt*basis_grads(3,jr)*div_vel*int_factor &
           - nu2*basis_vals(jr)*self%dt*div_vel*dn(3)*int_factor/n
+        !---Linear drag on the poloidal velocity (0 by default)
+        res_loc(jr,2) = res_loc(jr,2) + self%parent_sim%drag_rate*self%dt*basis_vals(jr)*vel(1)*int_factor
+        res_loc(jr,4) = res_loc(jr,4) + self%parent_sim%drag_rate*self%dt*basis_vals(jr)*vel(3)*int_factor
       END IF
       !---Psi
       tmp1 = cross_product(B_0,vel)
@@ -1915,6 +1922,7 @@ DO i=1,mesh%nc
           DO k=1,3
             jac_loc(k+1,k+1)%m(jr,jc)= jac_loc(k+1,k+1)%m(jr,jc) &
               + basis_vals(jr)*basis_vals(jc)*int_factor*coords(1) &
+              + MERGE(dt_fac*self%drag_rate, 0.d0, k /= 2)*basis_vals(jr)*basis_vals(jc)*int_factor*coords(1) &
               + convect_fac*dt_fac*basis_vals(jr)*DOT_PRODUCT(vel, basis_grads(:,jc))*int_factor*coords(1) &
               + dt_fac*nu1*DOT_PRODUCT(basis_grads(:,jr), basis_grads(:,jc))*int_factor*coords(1) &
               - dt_fac*nu1*basis_vals(jr)*DOT_PRODUCT(dn, basis_grads(:,jc))*int_factor*coords(1)/n
@@ -1952,6 +1960,7 @@ DO i=1,mesh%nc
           DO k=1,3
             jac_loc(k+1,k+1)%m(jr,jc)= jac_loc(k+1,k+1)%m(jr,jc) &
               + basis_vals(jr)*basis_vals(jc)*int_factor &
+              + MERGE(dt_fac*self%drag_rate, 0.d0, k /= 2)*basis_vals(jr)*basis_vals(jc)*int_factor &
               + convect_fac*dt_fac*basis_vals(jr)*DOT_PRODUCT(vel, basis_grads(:,jc))*int_factor &
               + dt_fac*nu1*DOT_PRODUCT(basis_grads(:,jr), basis_grads(:,jc))*int_factor &
               - dt_fac*nu1*basis_vals(jr)*DOT_PRODUCT(dn, basis_grads(:,jc))*int_factor/n

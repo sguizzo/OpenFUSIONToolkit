@@ -92,6 +92,7 @@ REAL(r8) :: visc_sol_dT = 10.d0 !< Width of the visc_sol_mult transition [eV]
 LOGICAL :: visc_sol_on_psi = .FALSE. !< Key the visc_sol_mult boost on normalized flux instead of T: boost where psiN > visc_sol_psiN0 (tanh width visc_sol_dpsiN), i.e. outside the LCFS (see xmhd_2d visc_sol_on_psi)
 REAL(r8) :: visc_sol_psiN0 = 1.d0 !< Middle of the psi-keyed transition (normalized flux)
 REAL(r8) :: visc_sol_dpsiN = 0.002d0 !< Width of the psi-keyed transition (normalized flux)
+REAL(r8) :: drag_rate = 0.d0 !< Post-kick linear drag rate [1/s] on the poloidal velocity (force -m_i*n*drag_rate*v_pol); 0 = off
 LOGICAL :: drop_convection = .FALSE. !< If true, drop the (v.grad)v convective term from the momentum equation (setup_mhd's default); this driver keeps it by default
 LOGICAL :: visc_dynamic = .FALSE. !< If true, the dynamic viscosity m_i*n*nu is uniform in the plasma (as with M3D-C1's amu/amuc): visc_kick/visc_post are then the kinematic viscosity at density visc_nref, and nu = visc*visc_nref/n pointwise
 REAL(r8) :: visc_nref = 1.d20 !< Reference density [m^-3] for visc_dynamic (M3D-C1: n0_norm)
@@ -142,7 +143,7 @@ TYPE(oft_mugtok_td):: b_sim
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol,mf_b0,T_clip, &
-  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
+  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq
 !------------------------------------------------------------------------------
 ! Initialize enviroment
@@ -369,6 +370,7 @@ b_sim%mug%visc_sol_dT = visc_sol_dT
 b_sim%mug%visc_sol_on_psi = visc_sol_on_psi
 b_sim%mug%visc_sol_psiN0 = visc_sol_psiN0
 b_sim%mug%visc_sol_dpsiN = visc_sol_dpsiN
+WRITE(*,'(A,ES12.4,A)')' Linear drag on V_pol (post-kick): drag_rate =',drag_rate,' 1/s (0: off)'
 IF(visc_sol_on_psi)WRITE(*,'(A,F8.4,A,F8.4,A)')' Viscosity: SOL multiplier keyed on psiN (not T): above psiN0 =',visc_sol_psiN0,' (width',visc_sol_dpsiN,')'
 WRITE(*,'(A,F8.2,A,F8.2,A,F8.2,A)')' Viscosity: post-kick SOL multiplier =',visc_sol_mult, &
   '  below T0 =',visc_sol_T0,' eV (width',visc_sol_dT,' eV)'
@@ -441,6 +443,7 @@ DO i=rst_start+1,nstep_total
     b_sim%mug%visc_sol_mult = visc_sol_mult
     b_sim%mug%m_i(1) = m_i_plasma*mass_scale_post
     b_sim%mug%evolve_pressure = .TRUE.
+    b_sim%mug%drag_rate = drag_rate
     SELECT CASE(kick_phase)
     CASE(2) ! before the quench: the parent run's post-kick settings
       b_sim%mug%kappa(1) = kappa_base
