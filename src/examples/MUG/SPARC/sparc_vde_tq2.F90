@@ -8,6 +8,10 @@
 !   dt_tq2       timestep during the quench phase [s] (default 5e-7)
 !   dt_cq        largest timestep in the current-quench phase [s] (default 2.5e-4); dt starts at the
 !                quench dt and doubles after every dt_grow_steps clean steps (default here 3) up to dt_cq
+!   mass_scale_tq2  ion mass enhancement during the quench phase (default <= 0: mass_scale_post)
+!   mass_scale_cq   ion mass enhancement during the current-quench phase (default <= 0: mass_scale_post)
+!                The quench response is Alfvenic, so a smaller mass there follows M3D-C1 more closely;
+!                visc_post stays the kinematic nu, so the viscous decay rate does not change with the mass
 ! Viscosity, mass scale, SOL viscosity, tolerances etc. are the post-kick values (visc_post, mass_scale_post, ...).
 ! Needs rst_start > 0. Phases: 3 = second thermal quench, 4 = current quench (kick_phase in the log).
 #include "local.h"
@@ -103,6 +107,8 @@ REAL(r8) :: tq2_t_start = -1.d0 !< Start of the second thermal quench [s]; <= 0:
 REAL(r8) :: tq2_dur = 2.d-5 !< Length of the short-step quench phase [s]
 REAL(r8) :: dt_tq2 = 5.d-7 !< Timestep during the quench phase [s]
 REAL(r8) :: dt_cq = 2.5d-4 !< Largest timestep in the current-quench phase [s]
+REAL(r8) :: mass_scale_tq2 = -1.d0 !< Ion mass enhancement in the quench phase (3); <= 0: mass_scale_post
+REAL(r8) :: mass_scale_cq = -1.d0 !< Ion mass enhancement in the current-quench phase (4); <= 0: mass_scale_post
 REAL(r8) :: dt_stop_ref = 0.d0 !< dt at entry to the current phase: reference for the dt_min_frac stop
 REAL(r8) :: dt_post = 5.d-4 !< Nominal post-kick timestep [s] (kick_phase 2); also the cap for dt_grow_steps and the reference for dt_min_frac. A restart still starts at the restart file's dt and reaches dt_post only through dt_grow_steps
 INTEGER(i4) :: dt_grow_steps = 0 !< If > 0: after this many consecutive steps with no retry, double dt again (capped at the phase's nominal dt), so a dt halved by step() retries can recover; 0 = never (dt stays reduced)
@@ -137,7 +143,7 @@ CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
-  T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq
+  T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -413,9 +419,13 @@ IF(rst_start <= 0)THEN
 END IF
 IF(tq2_t_start <= 0.d0) tq2_t_start = t
 IF(dt_grow_steps <= 0) dt_grow_steps = 3
+IF(mass_scale_tq2 <= 0.d0) mass_scale_tq2 = mass_scale_post
+IF(mass_scale_cq <= 0.d0) mass_scale_cq = mass_scale_post
 WRITE(*,'(A,ES12.4,A,ES12.4,A,ES12.4,A,ES12.4,A,ES12.4)')' Second thermal quench: kappa_tq2 =',kappa_tq2, &
   ' from t =',tq2_t_start,' for',tq2_dur,' s at dt =',dt_tq2,'; then current quench, dt up to',dt_cq
 WRITE(*,'(A,ES12.4,A,I3,A)')'   kappa_par/kappa_perp =',kappa_par/kappa_tq2,'; dt doubles after',dt_grow_steps,' clean steps'
+WRITE(*,'(A,F10.2,A,F10.2,A,F10.2)')'   mass scale: before the quench',mass_scale_post,', quench',mass_scale_tq2, &
+  ', current quench',mass_scale_cq
 DO i=rst_start+1,nstep_total
   ! Phase 2 (post-kick, as in the parent run) until tq2_t_start, then 3 (quench: kappa_tq2, dt_tq2)
   ! for tq2_dur, then 4 (current quench: kappa_tq2 kept, dt grows towards dt_cq)
@@ -443,11 +453,13 @@ DO i=rst_start+1,nstep_total
       b_sim%pre_freq = pre_freq
     CASE(3) ! second thermal quench: kappa_perp up, short steps, fresh preconditioner every step
       b_sim%mug%kappa(1) = kappa_tq2
+      b_sim%mug%m_i(1) = m_i_plasma*mass_scale_tq2
       dt = dt_tq2
       dt_phase = dt_tq2
       b_sim%pre_freq = 1
     CASE(4) ! current quench: keep kappa_perp, let dt grow from the quench dt to dt_cq
       b_sim%mug%kappa(1) = kappa_tq2
+      b_sim%mug%m_i(1) = m_i_plasma*mass_scale_cq
       dt_phase = dt_cq
       b_sim%pre_freq = 1
     END SELECT
