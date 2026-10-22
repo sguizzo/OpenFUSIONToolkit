@@ -21,6 +21,7 @@ USE oft_gs_util, ONLY: gs_profile_load
 USE oft_lag_basis, ONLY: oft_lag_setup,oft_scalar_bfem, oft_blag_eval, oft_blag_geval, oft_2D_lagrange_cast
 USE fem_base, ONLY: oft_ml_fem_type
 USE mugtok_td
+USE xmhd_2d, ONLY: xmhd_2d_force_terms
 USE oft_lu, ONLY: oft_lusolver
 
 IMPLICIT NONE
@@ -92,6 +93,9 @@ INTEGER(i4) :: dt_grow_steps = 0 !< If > 0: after this many consecutive steps wi
 LOGICAL :: newton_backtrack = .FALSE. !< Turn on backtracking (step halving while |F| grows) in the Newton solver; mugtok_td switches it off by default
 LOGICAL :: resid_dump = .FALSE. !< Write the Newton residual of failed Newton attempts to the XDMF group mugtok_resid (oft_mugtok_td%resid_dump; at most 8)
 INTEGER(i4) :: n_clean = 0 !< Consecutive steps without a retry (for dt_grow_steps)
+INTEGER(i4) :: force_rst(32) = 0 !< Diagnostic: if force_rst(1) > 0, load each listed restart file, write its momentum-equation terms (force_<term>_NNNNN.rst, see xmhd_2d_force_terms) with the post-kick settings, and stop
+INTEGER(i4) :: ifr
+CHARACTER(LEN=8) :: fr_tag
 LOGICAL :: plot_only = .FALSE. !< If true, set up as usual, then only convert the mugtok_*.rst files in the current folder to XDMF output (no time stepping, no new restart files)
 INTEGER(i4) :: pre_freq = 1 !< Post-kick only: rebuild the approximate Jacobian/refactor the preconditioner every pre_freq steps (see oft_mugtok_td%pre_freq); pre-kick and kick phases always rebuild every step
 REAL(r8) :: kappa_par = 1.542d26 !< Parallel (field-aligned) thermal conductivity kappa=chi*n [1/(m s)], held fixed for the whole run by setting chi_par_mult=kappa_par/kappa(1) in each phase (set in oft.in group sparc_vde_options; applied at the phase setup, so also on a restart)
@@ -117,7 +121,7 @@ CHARACTER(LEN=OFT_PATH_SLEN) :: filename_eq !< Equilibrium file (same as mesh fi
 CHARACTER(LEN=25) :: tmp_str
 TYPE(oft_mugtok_td):: b_sim 
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
-NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
+NAMELIST/sparc_vde_options/force_rst,rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   T_floor,kappa_par
@@ -382,6 +386,27 @@ coil_currs_fixed = equil%coil_currs
 ! (range set by rst_start/rst_end in the mugtok_plot_options group)
 IF(plot_only)THEN
   CALL b_sim%plot()
+  CALL oft_finalize()
+END IF
+
+! Force-term diagnostic: post-kick coefficients, then for each listed restart file load it and write the
+! momentum-equation terms (no time stepping)
+IF(force_rst(1) > 0)THEN
+  b_sim%mug%kappa(1) = kappa_base
+  b_sim%mug%chi_par_mult = kappa_par/b_sim%mug%kappa(1)
+  b_sim%mug%nu(1) = visc_post
+  b_sim%mug%visc_sol_mult = visc_sol_mult
+  b_sim%mug%m_i(1) = m_i_plasma*mass_scale_post
+  b_sim%mug%drag_rate = drag_rate
+  b_sim%mug%evolve_pressure = .TRUE.
+  IF(visc_dynamic) b_sim%mug%nu_n(1) = b_sim%mug%nu(1)*visc_nref
+  DO ifr=1,SIZE(force_rst)
+    IF(force_rst(ifr) <= 0)EXIT
+    CALL b_sim%restart(force_rst(ifr), t, dt_rst)
+    WRITE(fr_tag,'(I5.5)') force_rst(ifr)
+    WRITE(*,'(A,I6,A,ES14.6)')' Force terms of restart file ',force_rst(ifr),'  t = ',t
+    CALL xmhd_2d_force_terms(b_sim%mug, b_sim%u, t, TRIM(fr_tag))
+  END DO
   CALL oft_finalize()
 END IF
 
