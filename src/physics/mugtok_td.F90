@@ -63,7 +63,7 @@ INTEGER(i4) :: F0_node = 0 !< Index of the first plasma_flag=.TRUE. DOF, used to
 REAL(r8) :: f_scale_prev = 1.d0 !< FF' scale (tkmr%f_scale) from previous timestep
 CLASS(flux_func), POINTER :: I_prev => NULL() !< FF' profile (gs_equil%I) from previous timestep
 LOGICAL :: mhd_plasma = .FALSE. !< True when the plasma (region 1) is evolved with MHD (set by setup_mhd)
-LOGICAL :: fix_F_boundary = .FALSE. !< If true (set before setup_mhd), hold F = R B_phi at its initial value on the outer boundary of the mesh (Dirichlet; fixed TF current, as M3D-C1's iconst_bz=1) instead of the natural no-current condition, which conserves the total toroidal flux of the domain
+LOGICAL :: fix_F_boundary = .TRUE. !< If true (default; set before setup_mhd), hold F = R B_phi at its initial value on the outer boundary of the mesh (Dirichlet; fixed TF current, as M3D-C1's iconst_bz=1) instead of the natural no-current condition, which conserves the total toroidal flux of the domain
 INTEGER(i4) :: pre_freq = 1 !< Rebuild the approximate Jacobian and refactor the preconditioner every pre_freq steps (always on a dt change, on request via pre_force_update, and before halving dt after a Newton failure with a stale preconditioner)
 INTEGER(i4) :: pre_age = 0 !< Number of steps since the approximate Jacobian/preconditioner was last rebuilt
 LOGICAL :: pre_force_update = .TRUE. !< Force a Jacobian/preconditioner rebuild on the next step (set after changing physics coefficients, e.g. nu, m_i, kappa)

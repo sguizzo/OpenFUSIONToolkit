@@ -77,7 +77,7 @@ REAL(r8) :: visc_sol_dT = 10.d0 !< Width of the visc_sol_mult transition [eV]
 LOGICAL :: visc_sol_on_psi = .FALSE. !< Key the visc_sol_mult boost on normalized flux instead of T: boost where psiN > visc_sol_psiN0 (tanh width visc_sol_dpsiN), i.e. outside the LCFS (see xmhd_2d visc_sol_on_psi)
 REAL(r8) :: visc_sol_psiN0 = 1.d0 !< Middle of the psi-keyed transition (normalized flux)
 REAL(r8) :: visc_sol_dpsiN = 0.002d0 !< Width of the psi-keyed transition (normalized flux)
-LOGICAL :: fix_F_boundary = .FALSE. !< Hold F = R B_phi at its initial value on the outer mesh boundary (fixed TF current, as M3D-C1's default iconst_bz=1) instead of the natural condition that conserves the domain's toroidal flux
+LOGICAL :: fix_F_boundary = .TRUE. !< Hold F = R B_phi at its initial value on the outer mesh boundary (fixed TF current, as M3D-C1's default iconst_bz=1; default); .FALSE. = the natural condition that conserves the domain's toroidal flux (runs before 2026-10-26)
 REAL(r8) :: drag_rate = 0.d0 !< Post-kick linear drag rate [1/s] on the poloidal velocity (force -m_i*n*drag_rate*v_pol); 0 = off
 LOGICAL :: drop_convection = .FALSE. !< If true, drop the (v.grad)v convective term from the momentum equation (setup_mhd's default); this driver keeps it by default
 LOGICAL :: visc_dynamic = .FALSE. !< If true, the dynamic viscosity m_i*n*nu is uniform in the plasma (as with M3D-C1's amu/amuc): visc_kick/visc_post are then the kinematic viscosity at density visc_nref, and nu = visc*visc_nref/n pointwise
