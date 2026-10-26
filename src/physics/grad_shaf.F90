@@ -194,8 +194,6 @@ TYPE :: gs_factory
   INTEGER(i4), POINTER, DIMENSION(:) :: lim_con => NULL() !< Limiter contour list (contains all limiters)
   INTEGER(i4), POINTER, DIMENSION(:) :: lim_ptr => NULL() !< Pointer to start of each
   REAL(r8), POINTER, DIMENSION(:) :: cond_weights => NULL() !< Needs docs
-  REAL(r8), POINTER, DIMENSION(:) :: mag_suscep => NULL() !< Magnetic susceptibility by region. Values <= -1.d98 mark a non-magnetic region (the default), so a region only participates in the nonlinear-permeability model once a driver sets this
-  REAL(r8), POINTER, DIMENSION(:) :: mu_cell => NULL() !< Relative permeability in each cell, updated from |B| by gs_update_mu. Initialized to 1 everywhere, so it is a no-op until a driver enables magnetic regions
   REAL(r8), POINTER, DIMENSION(:) :: coil_vcont => NULL() !< Virtual VSC definition as weighted sum of other coils
   REAL(r8), POINTER, DIMENSION(:) :: Rcoils => NULL() !< Lumped resistance [Ohms] of each coil (negative for Icoils)
   REAL(r8), POINTER, DIMENSION(:) :: coils_dt => NULL() !< Coil currents at start of step for quasi-static calculations
@@ -539,13 +537,6 @@ SELECT TYPE(this=>ML_lag_2d%current_level)
     CALL oft_abort("Invalid FE space","gs_setup",__FILE__)
 END SELECT
 self%mesh=>self%fe_rep%mesh
-!---Nonlinear-permeability state. Allocated here (rather than only in the Python
-!   wrapper, as on tMaker_iron) so Fortran drivers get it too. The defaults make
-!   this inert: mu_cell=1 leaves the Delta* operator unchanged, and the
-!   mag_suscep sentinel marks every region non-magnetic until a driver opts in.
-ALLOCATE(self%mu_cell(self%mesh%nc),self%mag_suscep(self%mesh%nreg))
-self%mu_cell=1.d0
-self%mag_suscep=-1.d99
 ALLOCATE(self%zerob_bc)
 self%zerob_bc%ML_lag_rep=>self%ML_fe_rep
 ALLOCATE(self%zerogrnd_bc)
@@ -5272,7 +5263,7 @@ real(8), optional, intent(in) :: dt !< Timestep size for time-dependent version
 real(8), optional, intent(in) :: scale !< Global scale factor
 integer(i4) :: i,m,jr,jc
 integer(i4), allocatable :: j(:),j2(:)
-real(r8) :: vol,det,goptmp(3,4),elapsed_time,pt(3),dt_in,main_scale,mu_loc
+real(r8) :: vol,det,goptmp(3,4),elapsed_time,pt(3),dt_in,main_scale
 real(r8), allocatable :: rop(:),gop(:,:),lop(:,:),eta_reg(:)
 logical :: curved
 integer(i4) :: nnonaxi
@@ -5388,7 +5379,7 @@ IF(nnonaxi>0)THEN
   ALLOCATE(nonaxi_vals(self%region_info%block_max+1,self%region_info%nnonaxi))
   nonaxi_vals=0.d0
 END IF
-!$omp parallel private(j,rop,gop,det,lop,curved,goptmp,m,vol,jc,jr,pt,nonaxi_tmp,mu_loc)
+!$omp parallel private(j,rop,gop,det,lop,curved,goptmp,m,vol,jc,jr,pt,nonaxi_tmp)
 allocate(j(self%fe_rep%nce)) ! Local DOF and matrix indices
 allocate(rop(self%fe_rep%nce),gop(3,self%fe_rep%nce)) ! Reconstructed gradient operator
 allocate(lop(self%fe_rep%nce,self%fe_rep%nce)) ! Local laplacian matrix
@@ -5397,8 +5388,6 @@ IF(nnonaxi>0)allocate(nonaxi_tmp(self%fe_rep%nce))
 do i=1,self%fe_rep%mesh%nc
   !---Skip cell if in 'ignore' region
   IF(self%ignore_rmask(self%fe_rep%mesh%reg(i))) CYCLE
-  !---Relative permeability of this cell (1 unless a magnetic region is active)
-  mu_loc=self%mu_cell(i)
   !---Get local reconstructed operators
   lop=0.d0
   IF(nnonaxi>0)nonaxi_tmp=0.d0
@@ -5413,7 +5402,7 @@ do i=1,self%fe_rep%mesh%nc
     !---Compute local matrix contributions
     do jr=1,self%fe_rep%nce
       do jc=1,self%fe_rep%nce
-        lop(jr,jc) = lop(jr,jc) + DOT_PRODUCT(gop(1:2,jr),gop(1:2,jc))*det/(pt(1)+gs_epsilon)/mu_loc
+        lop(jr,jc) = lop(jr,jc) + DOT_PRODUCT(gop(1:2,jr),gop(1:2,jc))*det/(pt(1)+gs_epsilon)
       end do
     end do
     IF(dt_in>0.d0.AND.eta_reg(smesh%reg(i))>0.d0)THEN
@@ -5804,8 +5793,6 @@ END IF
 IF(ASSOCIATED(self%bc_rhs_list))DEALLOCATE(self%bc_rhs_list)
 IF(ASSOCIATED(self%bc_lmat))DEALLOCATE(self%bc_lmat)
 IF(ASSOCIATED(self%bc_bmat))DEALLOCATE(self%bc_bmat)
-IF(ASSOCIATED(self%mag_suscep))DEALLOCATE(self%mag_suscep)
-IF(ASSOCIATED(self%mu_cell))DEALLOCATE(self%mu_cell)
 IF(ASSOCIATED(self%dels_dt))THEN
   CALL self%dels_dt%delete()
   DEALLOCATE(self%dels_dt)
@@ -5860,15 +5847,13 @@ end subroutine equil_destroy
 !------------------------------------------------------------------------------
 !> Relative permeability of the iron as a function of local |B_pol|
 !!
-!! The B-H table is the one carried on the tMaker_iron branch. Kept as a single
-!! function so that anything evaluating mu inside a residual and anything caching
-!! it into an operator cannot drift apart.
+!! The B-H table is the one carried on the tMaker_iron branch. Used by empump_td
+!! for the iron regions of standalone xmhd_2d device simulations.
 !!
 !! Note this is only C0: `linterp` is piecewise linear, so d(mu)/d|B| jumps at the
-!! table breakpoints. That is harmless when the result is cached into a matrix,
-!! but a caller that differentiates it (e.g. a matrix-free Jacobian probing a
-!! residual) can see a noisy derivative near a breakpoint. Replace with a
-!! monotone cubic if that shows up in convergence.
+!! table breakpoints and a caller that differentiates it (e.g. a matrix-free
+!! Jacobian probing a residual) can see a noisy derivative near a breakpoint.
+!! Replace with a monotone cubic if that shows up in convergence.
 !------------------------------------------------------------------------------
 FUNCTION gs_mu_of_B(Bpol,dmu_dB) RESULT(mu_r)
 real(r8), intent(in) :: Bpol !< Poloidal field magnitude [T]
@@ -6130,111 +6115,6 @@ IF(PRESENT(dmu_dB))THEN
   END IF
 END IF
 END FUNCTION gs_mu_of_B
-!------------------------------------------------------------------------------
-!> Update the per-cell relative permeability from the local field strength
-!!
-!! Ported from the tMaker_iron branch, with three changes:
-!!  1) mu is evaluated per cell from that cell's own |B_pol|, rather than from a
-!!     single |B_pol| averaged over the whole region. Region averaging is fine for
-!!     a tokamak iron core but washes out the axial variation along a linear
-!!     device, which is exactly the structure of interest there.
-!!  2) The relaxation weight is a parameter instead of a hard-coded 1/5. Damping
-!!     costs one nonlinear iteration per application when this is driven from
-!!     inside a Newton loop, so the right value depends on the caller.
-!!  3) Rebuilding `dels` is optional. `dels` is the un-scaled operator used by
-!!     gs_vacuum_solve; a time-dependent caller applies `vac_op` instead and must
-!!     rebuild that itself, making the `dels` rebuild dead work.
-!!
-!! Only regions with `mag_suscep` set above the -1.d98 sentinel are touched, so
-!! this is a no-op on a device with no magnetic regions.
-!------------------------------------------------------------------------------
-subroutine gs_update_mu(self,relax,rebuild_dels,mu_change,bpol_stats,knee_damp)
-class(gs_equil), intent(inout) :: self !< G-S equilibrium object
-real(r8), optional, intent(in) :: relax !< Weight on the newly computed mu, in (0,1]. 1 (default) is undamped successive substitution; smaller values damp the mu fixed-point iteration at the cost of converging more slowly
-logical, optional, intent(in) :: rebuild_dels !< Rebuild the `dels` operator when done (default true, matching tMaker_iron). Pass false if the caller applies a different operator and rebuilds it itself
-real(r8), optional, intent(out) :: mu_change !< Largest relative change |dmu|/mu over the magnetic cells, for monitoring convergence of the mu iteration
-real(r8), optional, intent(out) :: bpol_stats(4) !< Diagnostic over the magnetic cells: [max |B_pol|, mean |B_pol|, min mu(|B|), mean mu(|B|)]. Reports the field the B-H table is actually being sampled at, which says whether the iron is anywhere near the knee
-logical, optional, intent(in) :: knee_damp !< Damp the relaxation target by 1/(1+|dln(mu)/dln(B)|) so cells past the B-H knee are driven back toward mu=1 instead of tracking mu(|B|). The assembled Jacobian carries no d(mu)/d|B| term, and mu_cell sets how much jac_op^-1 amplifies that omission: below the knee the omitted term is ~0 and tracking mu(|B|) is nearly exact, above it the term is 5-13x the retained one and tracking makes the preconditioner far worse than leaving mu_cell at 1. Default false (track mu(|B|) everywhere)
-type(oft_lag_bginterp), target :: psi_geval
-real(8) :: goptmp(3,4),v,gpsitmp(3),pt(3),ftmp(3)
-real(8) :: Bpol,mu_new,mu_old,wt,max_change
-real(8) :: bmax,bsum,mutab,mutab_min,mutab_sum
-real(8) :: slope,mu_lo,mu_hi,mu_target
-logical :: do_knee
-real(8), parameter :: knee_h=0.05d0   ! relative offset for the log-slope probe
-real(8), parameter :: knee_bmin=1.d-3 ! below this |B| the curve is flat; skip the probe
-integer(4) :: i,nmag
-logical :: do_dels
-type(gs_factory), pointer :: device
-DEBUG_STACK_PUSH
-device=>self%device
-wt=1.d0
-IF(PRESENT(relax))wt=relax
-IF((wt<=0.d0).OR.(wt>1.d0))CALL oft_abort('"relax" must lie in (0,1]','gs_update_mu',__FILE__)
-do_dels=.TRUE.
-IF(PRESENT(rebuild_dels))do_dels=rebuild_dels
-do_knee=.FALSE.
-IF(PRESENT(knee_damp))do_knee=knee_damp
-IF(.NOT.ASSOCIATED(device%mag_suscep))THEN
-  IF(PRESENT(mu_change))mu_change=0.d0
-  DEBUG_STACK_POP
-  RETURN
-END IF
-!---Evaluate |B_pol| at each magnetic cell's centroid and relax mu toward the
-!   table value. B_pol = |grad(psi)|/R, matching the convention used elsewhere.
-psi_geval%u=>self%psi
-CALL psi_geval%setup(device%fe_rep)
-ftmp=1.d0/3.d0
-max_change=0.d0
-bmax=0.d0; bsum=0.d0; nmag=0; mutab_min=1.d99; mutab_sum=0.d0
-!$omp parallel do private(goptmp,v,gpsitmp,pt,Bpol,mu_new,mu_old,mutab, &
-!$omp   slope,mu_lo,mu_hi,mu_target) &
-!$omp   reduction(max:max_change,bmax) reduction(min:mutab_min) &
-!$omp   reduction(+:bsum,nmag,mutab_sum)
-do i=1,device%fe_rep%mesh%nc
-  IF(device%mag_suscep(device%fe_rep%mesh%reg(i))<-1.d98)CYCLE
-  call device%fe_rep%mesh%jacobian(i,ftmp,goptmp,v)
-  call psi_geval%interp(i,ftmp,goptmp,gpsitmp)
-  pt=device%fe_rep%mesh%log2phys(i,ftmp)
-  gpsitmp=gpsitmp*self%psiscale/(pt(1)+gs_epsilon)
-  Bpol=SQRT(SUM(gpsitmp(1:2)**2))
-  mu_old=device%mu_cell(i)
-  mutab=gs_mu_of_B(Bpol)
-  !---Damp the target where the B-H curve is steep (see `knee_damp`)
-  mu_target=mutab
-  IF(do_knee)THEN
-    slope=0.d0
-    IF(Bpol>knee_bmin)THEN
-      mu_lo=gs_mu_of_B(Bpol*(1.d0-knee_h)); mu_hi=gs_mu_of_B(Bpol*(1.d0+knee_h))
-      IF(mu_lo>0.d0.AND.mu_hi>0.d0)slope=ABS(LOG(mu_hi/mu_lo))/(2.d0*knee_h)
-    END IF
-    mu_target=MAX(1.d0, mutab/(1.d0+slope))   ! mu_r < 1 is unphysical
-  END IF
-  mu_new=(1.d0-wt)*mu_old + wt*mu_target
-  device%mu_cell(i)=mu_new
-  max_change=MAX(max_change,ABS(mu_new-mu_old)/mu_old)
-  bmax=MAX(bmax,Bpol); bsum=bsum+Bpol; nmag=nmag+1
-  mutab_min=MIN(mutab_min,mutab); mutab_sum=mutab_sum+mutab
-end do
-CALL psi_geval%delete()
-IF(PRESENT(mu_change))mu_change=max_change
-IF(PRESENT(bpol_stats))THEN
-  IF(nmag>0)THEN
-    bpol_stats=[bmax, bsum/REAL(nmag,8), mutab_min, mutab_sum/REAL(nmag,8)]
-  ELSE
-    bpol_stats=0.d0
-  END IF
-END IF
-!---Rebuild the un-scaled operator, unless the caller owns that
-IF(do_dels)THEN
-  IF(device%free)THEN
-    CALL build_dels(device%dels,device,"free")
-  ELSE
-    CALL build_dels(device%dels,device,"zerob")
-  END IF
-END IF
-DEBUG_STACK_POP
-end subroutine gs_update_mu
 !------------------------------------------------------------------------------
 !> Compute boundary condition matrix for free-boundary case
 !------------------------------------------------------------------------------

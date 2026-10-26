@@ -8,7 +8,7 @@
 /
 
 &native_mesh_options
-  filename="pump_mesh_native.h5"
+  filename="cyl_pump_mesh_native.h5"
 /
 
 &em_pump_options
@@ -24,6 +24,7 @@
   rho_fluid=1.94E3
   eta_fluid=1.625E-3
   eta_wall=1.2E-6
+  eta_vac=1.0E7
   nu_fluid=3.0E-5
   lin_tol=1.0E-7
   nl_tol=1.0E-6
@@ -31,13 +32,12 @@
   wall_region=4
   iron_region=3
   coil_reg0=5
-  dt_recover=20
-  mu_relax=0.0
   mf_b0=1.0E-7
+  cyl=T
   flow_on=F
 /
 
-&mugtok_plot_options
+&xmhd_plot_options
   rst_start=0
   rst_end=2000
 /

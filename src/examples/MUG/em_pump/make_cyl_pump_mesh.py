@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Build the cylindrical-duct induction pump mesh for the MUG em_pump driver.
+"""Build the cylindrical-duct induction pump mesh for the em_pump driver.
 
-Edit the INPUTS block below and run:  python3 make_pump_mesh.py
+Edit the INPUTS block below and run:  python3 make_cyl_pump_mesh.py
 
+The magnetic field boundary conditions in em_pump are conducting, not truly free-boundary.
+So, scans of air_z and air_r should be performed to ensure the air box is large enough that the 
+field is not affected by the boundary.
 """
 
 import os
@@ -16,17 +19,26 @@ import numpy as np
 # =============================================================================
 
 # --- Radii [m], inside to out ------------------------------------------------
-pipe_rout     = 0.040   # fluid radius, i.e. the duct bore (80 mm diameter)
+pipe_rout     = 0.040   # fluid radius, i.e. the duct bore
 wall_rout     = 0.045   # duct wall outer radius
 coil_rin      = 0.055   # winding inner radius
 coil_rout     = 0.105   # winding outer radius
-yoke_rout     = 0.155   # stator outer radius; the iron runs in from here to coil_rin
+yoke_rout     = 0.155   # stator outer radius
 
 # --- Axial extents [m] -------------------------------------------------------
 chan_len      = 0.72    # full duct length; runs past the pump section at both ends
                         # so the outflow boundary is clear of the driven region
 pump_len      = 0.72    # axial length of the coil stack, i.e. the active pump section
 iron_len      = 0.72    # axial length of the stator; >= pump_len, the excess becoming end teeth
+
+# --- Air ---------------------------------------------------------------------
+air_r         = 0.20    # air padding beyond the stator outer radius (yoke_rout)
+air_z         = 0.25    # air padding beyond each end of the longest part
+                        # 0.20 / 0.25 is the smallest box with the stall force within 0.1% of
+                        # much larger boxes (air scan, 2026-10-26)
+                        # If meshing fails with "unclaimed region detected", change air_z
+                        # slightly (e.g. by a few mm): for some box sizes the mesher's air
+                        # seed point lands exactly on the outer edge.
 
 # --- Winding -----------------------------------------------------------------
 n_seg         = 24      # number of coil segments
@@ -41,10 +53,10 @@ fluid_dx      = 0.010   # channel
 wall_dx       = 0.015   # duct wall
 coil_dx       = 0.024   # coils
 iron_dx       = 0.016   # iron; must resolve the tooth, so keep it below seg_gap
-vac_dx        = 0.040   # vacuum
+vac_dx        = 0.080   
 
 # --- Output ------------------------------------------------------------------
-mesh_file     = "pump_mesh_native.h5"   # OFT native format, what the Fortran driver reads
+mesh_file     = "cyl_pump_mesh_native.h5"   # OFT native format, what the Fortran driver reads
 show_plots    = True                    # draw the topology and the finished mesh
 
 
@@ -79,7 +91,8 @@ seg_zc = -pump_len / 2.0 + (np.arange(n_seg) + 0.5) * seg_pitch
 # Regions are declared first, then drawn.  Each piece is a rectangle in (R,Z)
 # given as (centre_R, centre_Z, width, height), all as children of "air".
 
-gs_mesh = gs_Domain()
+z_ext = max(chan_len, pump_len, iron_len) / 2.0 + air_z
+gs_mesh = gs_Domain(rextent=yoke_rout + air_r, zextents=[-z_ext, z_ext])
 
 gs_mesh.define_region("air", vac_dx, "boundary")
 gs_mesh.define_region("channel", fluid_dx, "plasma")
@@ -88,7 +101,7 @@ for k in range(n_seg):
     gs_mesh.define_region(f"coil_{k:02d}", coil_dx, "coil")
 gs_mesh.define_region("iron_yoke", iron_dx, "vacuum")
 
-# Fluid.  A solid cylinder on the axis: R in [0, pipe_rout], so its centre is
+# Fluid.  A solid cylinder on the axis: R in [0, pipe_rout], so its center is
 # pipe_rout/2 and its width is pipe_rout.
 gs_mesh.add_rectangle(pipe_rout / 2.0, 0.0, pipe_rout, chan_len,
                       "channel", parent_name="air")
@@ -165,5 +178,5 @@ for name, rid in sorted(ids.items(), key=lambda kv: kv[1]):
     if not name.startswith("COIL_"):
         print(f"  {rid:3d}  {name}")
 print(f"  {ids['COIL_00']:3d} .. {ids[f'COIL_{n_seg-1:02d}']:<3d}  COIL_00 .. COIL_{n_seg-1:02d}")
-print(f"\n&em_pump_options:  wall_region={ids['WALL']}  iron_region={ids['IRON_YOKE']}"
-      f"  coil_reg0={ids['COIL_00']}  n_seg={n_seg}  pump_len={pump_len}  chan_zmax={chan_len/2}")
+print(f"\n&em_pump_options:  cyl=T  wall_region={ids['WALL']}  iron_region={ids['IRON_YOKE']}"
+      f"  coil_reg0={ids['COIL_00']}  n_seg={n_seg}")
