@@ -23,7 +23,7 @@ USE mhd_utils, ONLY: mu0
 USE oft_gs, ONLY: gs_epsilon, gs_equil, gs_factory, gs_update_bounds, gs_test_bounds, flux_func, build_dels
 USE oft_gs_td, ONLY: oft_tmaker_td_mfop, build_vac_op, apply_rhs
 USE oft_mesh_local_util, ONLY: mesh_local_findedge
-USE xmhd_2d, ONLY: oft_xmhd_2d_sim, build_approx_jacobian, xmhd_2d_freeze_eta_temp, xmhd_2d_floor_update
+USE xmhd_2d, ONLY: oft_xmhd_2d_sim, build_approx_jacobian, xmhd_2d_freeze_eta_temp, xmhd_2d_freeze_ohmic, xmhd_2d_floor_update
 USE oft_stitching, ONLY: seam_list
 IMPLICIT NONE
 #include "local.h"
@@ -816,6 +816,7 @@ CALL mugtok_seed_fields(self)
 !---Capture the seeded temperature for the Spitzer resistivity, so the first
 !   Jacobian build below sees the initial eta profile
 CALL xmhd_2d_freeze_eta_temp(self%mug, self%u)
+CALL xmhd_2d_freeze_ohmic(self%mug, self%u)
 
 !------------------------------------------------------------------------------
 ! Build the nonlinear function, approximate Jacobian, preconditioner and solvers
@@ -1034,6 +1035,7 @@ self%mug%psi_norm_bounds = self%tkmr%gs_equil%plasma_bounds
 !Freeze the temperature used for the Spitzer resistivity at the start of the step,
 !so that eta is the same coefficient in the RHS and LHS residual passes below
 CALL xmhd_2d_freeze_eta_temp(self%mug, self%u)
+CALL xmhd_2d_freeze_ohmic(self%mug, self%u)
 
 !Update plasma time advance operator
 CALL self%tkmr%update()
@@ -1992,6 +1994,7 @@ CALL mugtok_refresh_bounds(self, self%u)
 CALL mugtok_update_psi_limiting(self)
 CALL snapshot_f_profile(self)
 CALL xmhd_2d_freeze_eta_temp(self%mug, self%u)
+CALL xmhd_2d_freeze_ohmic(self%mug, self%u)
 self%rst_count = rst_index
 end subroutine mugtok_rst_restore
 

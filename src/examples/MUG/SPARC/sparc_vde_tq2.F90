@@ -93,6 +93,7 @@ LOGICAL :: visc_sol_on_psi = .FALSE. !< Key the visc_sol_mult boost on normalize
 REAL(r8) :: visc_sol_psiN0 = 1.d0 !< Middle of the psi-keyed transition (normalized flux)
 REAL(r8) :: visc_sol_dpsiN = 0.002d0 !< Width of the psi-keyed transition (normalized flux)
 LOGICAL :: fix_F_boundary = .TRUE. !< Hold F = R B_phi at its initial value on the outer mesh boundary (fixed TF current, as M3D-C1's default iconst_bz=1; default); .FALSE. = the natural condition that conserves the domain's toroidal flux (runs before 2026-10-26)
+LOGICAL :: ohmic_heating = .FALSE. !< Ohmic heating eta*J^2 in the temperature equation (xmhd_2d option ohmic; current frozen once per step, explicit source). Default off (runs before 2026-10-26 have none)
 REAL(r8) :: drag_rate = 0.d0 !< Post-kick linear drag rate [1/s] on the poloidal velocity (force -m_i*n*drag_rate*v_pol); 0 = off
 LOGICAL :: drop_convection = .FALSE. !< If true, drop the (v.grad)v convective term from the momentum equation (setup_mhd's default); this driver keeps it by default
 LOGICAL :: visc_dynamic = .FALSE. !< If true, the dynamic viscosity m_i*n*nu is uniform in the plasma (as with M3D-C1's amu/amuc): visc_kick/visc_post are then the kinematic viscosity at density visc_nref, and nu = visc*visc_nref/n pointwise
@@ -144,7 +145,7 @@ TYPE(oft_mugtok_td):: b_sim
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol,mf_b0,T_clip, &
-  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
+  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq
 !------------------------------------------------------------------------------
 ! Initialize enviroment
@@ -342,6 +343,8 @@ END DO
 b_sim%fix_F_boundary = fix_F_boundary
 WRITE(*,'(A,L2)')' Fixed F = R*B_phi on the outer boundary (fix_F_boundary): ',fix_F_boundary
 CALL b_sim%setup_mhd(equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg=eta_reg, kappa_reg=kappa_reg, mass_scale=mass_scale_kick, D_reg=D_reg, toroidal_flow = .FALSE.)
+b_sim%mug%ohmic = ohmic_heating
+WRITE(*,'(A,L2)')' Ohmic heating in the temperature equation (ohmic_heating): ',ohmic_heating
 
 ! Compare the seeded 2*k*n*T with the equilibrium pressure on axis (psihat=1, where the
 ! normalized n/T profiles are 1)
@@ -482,6 +485,7 @@ DO i=rst_start+1,nstep_total
     "  kappa_par = ", b_sim%mug%kappa(1)*b_sim%mug%chi_par_mult, &
     "  nu(1) = ", b_sim%mug%nu(1), "  mass_scale = ", b_sim%mug%m_i(1)/m_i_plasma, &
     "  evolve_pressure = ", b_sim%mug%evolve_pressure
+  IF(ohmic_heating) WRITE(*,'(A,ES12.4,A)') '  Ohmic power (start of step) = ', b_sim%mug%ohm_power, ' W'
   write(*,*) "opoint: ", b_sim%tkmr%gs_equil%o_point
   write(*,*) "diverted: ", b_sim%tkmr%gs_equil%diverted
   CALL b_sim%step(coil_currs_fixed, t, dt, nl_its, l_its, nretry)

@@ -152,6 +152,13 @@ TYPE, public :: oft_xmhd_2d_sim
   CLASS(oft_vector), POINTER :: T_eta => NULL() !< Snapshot of the temperature field used to evaluate the Spitzer resistivity when T is evolved. Frozen once per timestep by `xmhd_2d_freeze_eta_temp` so that eta is identical in the RHS (dt=0) and LHS (dt>0) evaluations of the residual; see that routine for why this matters
   CLASS(oft_vector), POINTER :: n_eta => NULL() !< Snapshot of the (normalized) density field used with `T_eta` for the Spitzer resistivity; frozen alongside it by `xmhd_2d_freeze_eta_temp`
   LOGICAL :: T_eta_valid = .FALSE. !< True once `T_eta` (and `n_eta`) hold a valid snapshot
+  LOGICAL :: ohmic = .FALSE. !< Ohmic heating eta*J^2 in the temperature equation (compressible, evolved T only). The current is frozen once per timestep by `xmhd_2d_freeze_ohmic` (explicit source, no Jacobian term); eta and n are the same frozen values as for the Spitzer resistivity
+  CLASS(oft_vector), POINTER :: ohm_q => NULL() !< Frozen q = Delta*psi/R (cylindrical; lap(psi) otherwise) from a mass-matrix projection, so that mu0*J_phi = -q
+  CLASS(oft_vector), POINTER :: ohm_by => NULL() !< Frozen F (= R B_phi, field 7), for J_pol = grad(F) x grad(phi)/mu0
+  LOGICAL :: ohm_valid = .FALSE. !< True once `ohm_q` and `ohm_by` hold a valid snapshot
+  REAL(r8) :: ohm_power = 0.d0 !< Total Ohmic power [W] (2*pi*R-weighted in cylindrical geometry) over the MHD region, from the last `xmhd_2d_freeze_ohmic`
+  CLASS(oft_matrix), POINTER :: ohm_mop => NULL() !< Lagrange mass matrix for the J_phi projection
+  CLASS(oft_solver), POINTER :: ohm_minv => NULL() !< CG solver for the J_phi projection
   REAL(r8), ALLOCATABLE :: m_i(:) !< ion mass, by region
   REAL(r8), ALLOCATABLE :: eta(:, :) !< electrical resistivity, in units of mu0, by region. First column is in plane, second column is out of plane (for anisotropic resistivity)
   LOGICAL, ALLOCATABLE :: ignore_rmask(:) !< Mask for regions to ignore when populating physics (defaults to false)
@@ -198,7 +205,7 @@ TYPE(oft_ml_fem_type), TARGET, PUBLIC :: ML_oft_blagrange !< Multilevel finite e
 CLASS(oft_scalar_bfem), POINTER, PUBLIC :: oft_blagrange => NULL() !< Lagrange finite element representation
 TYPE(oft_ml_fem_type), TARGET, PUBLIC :: ML_oft_blagrange_p !< Multilevel finite element representation for pressure (if incompressible)
 CLASS(oft_scalar_bfem), POINTER, PUBLIC :: oft_blagrange_p => NULL() !< Lagrange finite element representation for pressure (if incompressible)
-PUBLIC xmhd_2d_plot, build_approx_jacobian, xmhd_2d_freeze_eta_temp, xmhd_2d_floor_update, xmhd_2d_force_terms
+PUBLIC xmhd_2d_plot, build_approx_jacobian, xmhd_2d_freeze_eta_temp, xmhd_2d_freeze_ohmic, xmhd_2d_floor_update, xmhd_2d_force_terms
 CONTAINS
 
 !---------------------------------------------------------------------------
@@ -254,6 +261,7 @@ CALL self%rst_save(u, self%t, self%dt, 'xmhd2d_'//rst_char//'.rst', 'U')
 
 !---Freeze the resistivity temperature for the first Jacobian build
 CALL xmhd_2d_freeze_eta_temp(self,u)
+CALL xmhd_2d_freeze_ohmic(self,u)
 
 !---Fill timestep control cache
 itcount=self%ittarget
@@ -333,6 +341,7 @@ DO i=1,self%nsteps
   !---Freeze eta's temperature at the start of the step, so the RHS and LHS
   !   passes below use the same resistivity
   CALL xmhd_2d_freeze_eta_temp(self,u)
+  CALL xmhd_2d_freeze_ohmic(self,u)
   IF(self%timestep_cn)THEN
     self%nlfun%dt=-self%dt/2.0
   ELSE
@@ -817,6 +826,8 @@ REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights,psi_weights,by_weights, T
                               n_res, psi_res, by_res, vtmp, velx_res, vely_res, velz_res
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
 REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights, T_eta_weights, n_eta_weights
+REAL(r8), POINTER, DIMENSION(:) :: ohm_q_weights, ohm_by_weights
+LOGICAL :: ohm_on !< Ohmic heating active (frozen current snapshot available)
 REAL(r8) :: convect_fac !< Zeroes the convective derivative term below when parent_sim%drop_convection=.TRUE.
 REAL(r8) :: pres_fac !< Enables the pressure-conserving density diffusion term in the temperature equation when parent_sim%evolve_pressure=.TRUE.
 quad=>oft_blagrange%quad
@@ -853,6 +864,12 @@ eta_lag = self%parent_sim%use_spitzer .AND. (.NOT.incomp) &
           .AND. (.NOT.ASSOCIATED(self%parent_sim%T_func)) .AND. self%parent_sim%T_eta_valid
 IF(eta_lag)CALL self%parent_sim%T_eta%get_local(T_eta_weights)
 IF(eta_lag)CALL self%parent_sim%n_eta%get_local(n_eta_weights)
+!---Ohmic heating: current frozen at the start of the step (see xmhd_2d_freeze_ohmic)
+NULLIFY(ohm_q_weights, ohm_by_weights)
+ohm_on = self%parent_sim%ohmic .AND. self%parent_sim%ohm_valid .AND. (.NOT.incomp) &
+         .AND. (.NOT.ASSOCIATED(self%parent_sim%T_func))
+IF(ohm_on)CALL self%parent_sim%ohm_q%get_local(ohm_q_weights)
+IF(ohm_on)CALL self%parent_sim%ohm_by%get_local(ohm_by_weights)
 
 !---Zero result and get storage array
 CALL b%set(0.d0)
@@ -876,14 +893,15 @@ INTEGER(i4) :: k,m,jr
 INTEGER(i4), ALLOCATABLE, DIMENSION(:) :: cell_dofs, cell_dofs_p
 REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dpsi_0(3),dby(3),T_eta_val,n_eta_val
 REAL(r8) :: dvel(3,3),div_vel,jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),coords(3),kappa_T(3,3)
-REAL(r8) :: sink_term, T_mass
+REAL(r8) :: sink_term, T_mass, q_ohm, dby_ohm(3), heat_ohm, n_ohm
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals,basis_vals_p,T_weights_loc,n_weights_loc,psi_weights_loc,by_weights_loc
-REAL(r8), ALLOCATABLE, DIMENSION(:) :: T_eta_loc, n_eta_loc
+REAL(r8), ALLOCATABLE, DIMENSION(:) :: T_eta_loc, n_eta_loc, ohm_q_loc, ohm_by_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grads_p, res_loc
 !$omp parallel private(k,m,jr,curved,coords,cell_dofs,cell_dofs_p,basis_vals,basis_grads, basis_vals_p, basis_grads_p, T_weights_loc, &
 !$omp n_weights_loc,psi_weights_loc, by_weights_loc,vel_weights_loc,res_loc,jac_mat, &
 !$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dpsi_0,dby,dvel,div_vel,btmp, tmp1, kappa_T, &
 !$omp T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, T_mass, &
+!$omp ohm_q_loc, ohm_by_loc, q_ohm, dby_ohm, heat_ohm, n_ohm, &
 !$omp chi, m_i, eta, nu, nu1, nu2, T_visc, visc_fac, psiN_visc, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 ALLOCATE(n_weights_loc(oft_blagrange%nce),&
@@ -895,6 +913,7 @@ ELSE
   ALLOCATE(T_weights_loc(oft_blagrange%nce))
 END IF
 IF (eta_lag) ALLOCATE(T_eta_loc(oft_blagrange%nce), n_eta_loc(oft_blagrange%nce))
+IF (ohm_on) ALLOCATE(ohm_q_loc(oft_blagrange%nce), ohm_by_loc(oft_blagrange%nce))
 ALLOCATE(cell_dofs(oft_blagrange%nce), res_loc(oft_blagrange%nce,7))
 IF (incomp) ALLOCATE(basis_vals_p(oft_blagrange_p%nce), basis_grads_p(3,oft_blagrange_p%nce), cell_dofs_p(oft_blagrange_p%nce))
 !$omp do ordered
@@ -915,6 +934,8 @@ DO i=1,mesh%nc
   by_weights_loc = by_weights(cell_dofs)
   IF (eta_lag) T_eta_loc = T_eta_weights(cell_dofs)
   IF (eta_lag) n_eta_loc = n_eta_weights(cell_dofs)
+  IF (ohm_on) ohm_q_loc = ohm_q_weights(cell_dofs)
+  IF (ohm_on) ohm_by_loc = ohm_by_weights(cell_dofs)
 
   !Set material properties
   chi = self%parent_sim%chi(mesh%reg(i))
@@ -1061,6 +1082,26 @@ DO i=1,mesh%nc
       nu2 = nu1*self%parent_sim%nu2_ratio
     END IF
     kappa_T = chi_tensor(chi, self%parent_sim%chi_par_mult, self%parent_sim%chi_aniso, btmp)
+    !---Ohmic heating per particle, Q/(n k) [eV/s] with Q = eta_pol*J_pol^2 + eta_tor*J_phi^2:
+    !   J_pol = grad(F) x grad(phi)/mu0 from the frozen F, mu0*J_phi = -q from the frozen projection;
+    !   eta is the (frozen) resistivity above, stored as eta_phys/mu0; n is the frozen density when
+    !   the Spitzer snapshot is used, so the whole source is fixed over the step (explicit)
+    heat_ohm = 0.d0
+    IF (ohm_on) THEN
+      q_ohm = 0.d0; dby_ohm = 0.d0
+      DO jr=1,oft_blagrange%nce
+        q_ohm = q_ohm + ohm_q_loc(jr)*basis_vals(jr)
+        dby_ohm = dby_ohm + ohm_by_loc(jr)*basis_grads(:,jr)
+      END DO
+      n_ohm = n
+      IF (eta_lag) n_ohm = n_eta_val*self%parent_sim%den_scale
+      IF (cyl_flag) THEN
+        heat_ohm = (eta(1)*DOT_PRODUCT(dby_ohm,dby_ohm)/(coords(1)+gs_epsilon)**2 + eta(2)*q_ohm**2)/mu0
+      ELSE
+        heat_ohm = (eta(1)*DOT_PRODUCT(dby_ohm,dby_ohm) + eta(2)*q_ohm**2)/mu0
+      END IF
+      heat_ohm = heat_ohm/(n_ohm*k_boltz)
+    END IF
     IF(cyl_flag)THEN
       diag_vals(1) = diag_vals(1) + DOT_PRODUCT(btmp,btmp)*int_factor*coords(1)
       diag_vals(2) = diag_vals(2) + 0.5d0*m_i*n*DOT_PRODUCT(vel,vel)*int_factor*coords(1)
@@ -1099,6 +1140,7 @@ DO i=1,mesh%nc
             + self%dt*DOT_PRODUCT(MATMUL(kappa_T,dT), basis_grads(:,jr))*int_factor*coords(1) &
             - self%dt*basis_vals(jr)*DOT_PRODUCT(dn, MATMUL(kappa_T,dT))*int_factor*coords(1)/n &
             + self%dt*basis_vals(jr)*sink_term*int_factor*coords(1) &
+            - self%dt*basis_vals(jr)*heat_ohm*int_factor*coords(1) &
             - pres_fac*self%dt*D_diff*T*DOT_PRODUCT(dn,basis_grads(:,jr))*int_factor*coords(1)/(n*(gamma-1)) & ! -(T/n)*D*lap(n), grad(phi) part
             - pres_fac*self%dt*D_diff*basis_vals(jr)*(DOT_PRODUCT(dT,dn)/n - T*DOT_PRODUCT(dn,dn)/n**2)*int_factor*coords(1)/(gamma-1) ! grad(T/n) part
         ELSE
@@ -1109,6 +1151,7 @@ DO i=1,mesh%nc
             + self%dt*DOT_PRODUCT(MATMUL(kappa_T,dT), basis_grads(:,jr))*int_factor &
             - self%dt*basis_vals(jr)*DOT_PRODUCT(dn, MATMUL(kappa_T,dT))*int_factor/n &
             + self%dt*basis_vals(jr)*sink_term*int_factor &
+            - self%dt*basis_vals(jr)*heat_ohm*int_factor &
             - pres_fac*self%dt*D_diff*T*DOT_PRODUCT(dn,basis_grads(:,jr))*int_factor/(n*(gamma-1)) & ! -(T/n)*D*lap(n), grad(phi) part
             - pres_fac*self%dt*D_diff*basis_vals(jr)*(DOT_PRODUCT(dT,dn)/n - T*DOT_PRODUCT(dn,dn)/n**2)*int_factor/(gamma-1) ! grad(T/n) part
         END IF
@@ -1280,6 +1323,7 @@ END DO
 DEALLOCATE(basis_vals,basis_grads, n_weights_loc,T_weights_loc,&
           vel_weights_loc, psi_weights_loc, by_weights_loc,cell_dofs, res_loc)
 IF (eta_lag) DEALLOCATE(T_eta_loc, n_eta_loc)
+IF (ohm_on) DEALLOCATE(ohm_q_loc, ohm_by_loc)
 IF (incomp) DEALLOCATE(basis_vals_p, basis_grads_p, cell_dofs_p)
 !$omp end parallel
 END BLOCK
@@ -1311,6 +1355,8 @@ DEALLOCATE(n_res,velx_res,vely_res, velz_res, T_res, psi_res, by_res, &
 DEALLOCATE(psi_vac_weights)
 IF(ASSOCIATED(T_eta_weights))DEALLOCATE(T_eta_weights)
 IF(ASSOCIATED(n_eta_weights))DEALLOCATE(n_eta_weights)
+IF(ASSOCIATED(ohm_q_weights))DEALLOCATE(ohm_q_weights)
+IF(ASSOCIATED(ohm_by_weights))DEALLOCATE(ohm_by_weights)
 END SUBROUTINE nlfun_apply
 !---------------------------------------------------------------------------------
 !> Update the per-cell temperature-floor heating source (xmhd.F90 scheme, see T_floor).
@@ -1651,6 +1697,133 @@ IF(self%use_spitzer.AND.(.NOT.self%incomp).AND.(.NOT.ASSOCIATED(self%T_func)))TH
 END IF
 DEBUG_STACK_POP
 end subroutine xmhd_2d_freeze_eta_temp
+!---------------------------------------------------------------------------
+!> Freeze the current density used for Ohmic heating (option `ohmic`), from `u`.
+!!
+!! The poloidal current J_pol = grad(F) x grad(phi)/mu0 only needs the gradient of
+!! F (field 7), so F is simply copied. The toroidal current needs second derivatives
+!! of psi, which the Lagrange basis does not provide across cells, so
+!! q = Delta*psi/R (cylindrical; lap(psi) in slab geometry) is projected onto the
+!! Lagrange space with the mass matrix,
+!!   int v q dA = - int grad(v).grad(psi)/R dA   (cylindrical; no 1/R otherwise),
+!! over all cells (so the projection is not truncated at the MHD-region boundary;
+!! the dropped boundary term only matters at the outer edge of the mesh), with psi
+!! the total flux (field 6 plus psi_vac). Then mu0*J_phi = -q.
+!!
+!! Call once per timestep, next to `xmhd_2d_freeze_eta_temp`: the heating term in
+!! the temperature equation then uses this frozen current (explicit source, no
+!! Jacobian contribution). Also records the total Ohmic power `ohm_power` over the
+!! MHD region (Spitzer eta from the T and n of `u` when `use_spitzer`, else the
+!! region eta).
+!---------------------------------------------------------------------------
+subroutine xmhd_2d_freeze_ohmic(self,u)
+class(oft_xmhd_2d_sim), intent(inout) :: self !< Simulation object
+class(oft_vector), intent(inout) :: u !< Solution whose psi (field 6) and F (field 7) are captured
+type(oft_quad_type), pointer :: quad
+CLASS(oft_vector), POINTER :: rhs
+REAL(r8), POINTER, DIMENSION(:) :: psi_w, pvac_w, by_w, T_w, n_w, q_w, rhs_w
+INTEGER(i4) :: i, m, jr
+INTEGER(i4), ALLOCATABLE, DIMENSION(:) :: cell_dofs
+REAL(r8) :: jac_mat(3,4), jac_det, det, coords(3), Rfac, dpsi(2), dby(2), q, T, n, eta(2), power
+REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals
+REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: basis_grads
+LOGICAL :: curved
+DEBUG_STACK_PUSH
+IF((.NOT.self%ohmic).OR.self%incomp.OR.ASSOCIATED(self%T_func))THEN
+  DEBUG_STACK_POP
+  RETURN
+END IF
+!---Storage, mass matrix and its solver (once)
+IF(.NOT.ASSOCIATED(self%ohm_q))THEN
+  CALL oft_blagrange%vec_create(self%ohm_q)
+  CALL oft_blagrange%vec_create(self%ohm_by)
+  NULLIFY(self%ohm_mop)
+  CALL oft_blag_getmop(oft_blagrange,self%ohm_mop)
+  CALL create_cg_solver(self%ohm_minv)
+  self%ohm_minv%A=>self%ohm_mop
+  self%ohm_minv%its=-2
+  CALL create_diag_pre(self%ohm_minv%pre)
+END IF
+quad=>oft_blagrange%quad
+NULLIFY(psi_w, pvac_w, by_w, T_w, n_w, q_w, rhs, rhs_w)
+CALL u%get_local(psi_w,6)
+CALL self%psi_vac%get_local(pvac_w)
+CALL u%get_local(by_w,7)
+CALL u%get_local(T_w,5)
+CALL u%get_local(n_w,1)
+psi_w = psi_w + pvac_w
+ALLOCATE(rhs_w(oft_blagrange%ne), cell_dofs(oft_blagrange%nce), &
+         basis_vals(oft_blagrange%nce), basis_grads(3,oft_blagrange%nce))
+!---Projection right-hand side, -int grad(v).grad(psi)/R dA over all cells
+rhs_w = 0.d0
+DO i=1,mesh%nc
+  curved=cell_is_curved(mesh,i)
+  CALL oft_blagrange%ncdofs(i,cell_dofs)
+  DO m=1,quad%np
+    IF(curved.OR.(m==1))CALL mesh%jacobian(i,quad%pts(:,m),jac_mat,jac_det)
+    det = jac_det*quad%wts(m)
+    DO jr=1,oft_blagrange%nce
+      CALL oft_blag_geval(oft_blagrange,i,jr,quad%pts(:,m),basis_grads(:,jr),jac_mat)
+    END DO
+    Rfac = 1.d0
+    IF(self%cyl_flag)THEN
+      coords = mesh%log2phys(i,quad%pts(:,m))
+      Rfac = 1.d0/(coords(1)+gs_epsilon)
+    END IF
+    dpsi = 0.d0
+    DO jr=1,oft_blagrange%nce
+      dpsi = dpsi + psi_w(cell_dofs(jr))*basis_grads(1:2,jr)
+    END DO
+    DO jr=1,oft_blagrange%nce
+      rhs_w(cell_dofs(jr)) = rhs_w(cell_dofs(jr)) - DOT_PRODUCT(basis_grads(1:2,jr),dpsi)*Rfac*det
+    END DO
+  END DO
+END DO
+CALL oft_blagrange%vec_create(rhs)
+CALL rhs%set(0.d0)
+CALL rhs%restore_local(rhs_w,add=.TRUE.) ! sums the partial cell contributions at DOFs shared between MPI ranks
+CALL self%ohm_q%set(0.d0)
+CALL self%ohm_minv%apply(self%ohm_q,rhs)
+CALL rhs%delete
+DEALLOCATE(rhs)
+CALL self%ohm_by%restore_local(by_w)
+self%ohm_valid = .TRUE.
+!---Diagnostic: total Ohmic power over the MHD (non-ignored) region
+CALL self%ohm_q%get_local(q_w)
+power = 0.d0
+DO i=1,mesh%nc
+  IF(self%ignore_rmask(mesh%reg(i)))CYCLE
+  curved=cell_is_curved(mesh,i)
+  CALL oft_blagrange%ncdofs(i,cell_dofs)
+  eta = self%eta(mesh%reg(i),:)
+  DO m=1,quad%np
+    IF(curved.OR.(m==1))CALL mesh%jacobian(i,quad%pts(:,m),jac_mat,jac_det)
+    det = jac_det*quad%wts(m)
+    DO jr=1,oft_blagrange%nce
+      CALL oft_blag_eval(oft_blagrange,i,jr,quad%pts(:,m),basis_vals(jr))
+      CALL oft_blag_geval(oft_blagrange,i,jr,quad%pts(:,m),basis_grads(:,jr),jac_mat)
+    END DO
+    q = 0.d0; dby = 0.d0; T = 0.d0; n = 0.d0
+    DO jr=1,oft_blagrange%nce
+      q = q + q_w(cell_dofs(jr))*basis_vals(jr)
+      dby = dby + by_w(cell_dofs(jr))*basis_grads(1:2,jr)
+      T = T + T_w(cell_dofs(jr))*basis_vals(jr)
+      n = n + n_w(cell_dofs(jr))*basis_vals(jr)
+    END DO
+    IF(self%use_spitzer)CALL spitzer_eta(n*self%den_scale, MAX(T,self%T_floor), eta)
+    IF(self%cyl_flag)THEN
+      coords = mesh%log2phys(i,quad%pts(:,m))
+      power = power + (eta(1)*DOT_PRODUCT(dby,dby)/(coords(1)+gs_epsilon)**2 + eta(2)*q**2)/mu0 &
+        *2.d0*pi*coords(1)*det
+    ELSE
+      power = power + (eta(1)*DOT_PRODUCT(dby,dby) + eta(2)*q**2)/mu0*det
+    END IF
+  END DO
+END DO
+self%ohm_power = oft_mpi_sum(power)
+DEALLOCATE(psi_w, pvac_w, by_w, T_w, n_w, q_w, rhs_w, cell_dofs, basis_vals, basis_grads)
+DEBUG_STACK_POP
+end subroutine xmhd_2d_freeze_ohmic
 !---------------------------------------------------------------------------
 !> Compute the approximate Jacobian matrix for the nonlinear function being solved
 !---------------------------------------------------------------------------
