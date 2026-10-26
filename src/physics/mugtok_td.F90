@@ -65,7 +65,8 @@ CLASS(flux_func), POINTER :: I_prev => NULL() !< FF' profile (gs_equil%I) from p
 LOGICAL :: mhd_plasma = .FALSE. !< True when the plasma (region 1) is evolved with MHD (set by setup_mhd)
 LOGICAL :: fix_F_boundary = .TRUE. !< If true (default; set before setup_mhd), hold F = R B_phi at its initial value on the outer boundary of the mesh (Dirichlet; fixed TF current, as M3D-C1's iconst_bz=1) instead of the natural no-current condition, which conserves the total toroidal flux of the domain
 INTEGER(i4) :: pre_freq = 1 !< Rebuild the approximate Jacobian and refactor the preconditioner every pre_freq steps (always on a dt change, on request via pre_force_update, and before halving dt after a Newton failure with a stale preconditioner)
-LOGICAL :: lu_reanalyze = .FALSE. !< Redo the LU symbolic analysis (ordering) at every preconditioner rebuild. The Jacobian's sparsity pattern is fixed, so by default only the first factorization (setup / restart) does the analysis and rebuilds refactor numerically (MUMPS job 2 instead of 4); .TRUE. restores the old behaviour
+LOGICAL :: lu_reanalyze = .FALSE. !< Redo the LU symbolic analysis (ordering) at every preconditioner rebuild. The Jacobian's sparsity pattern is fixed, so by default only the first factorization of the preconditioner does the analysis and later rebuilds refactor numerically (MUMPS job 2 instead of 4); .TRUE. restores the old behaviour
+LOGICAL :: lu_analysed = .FALSE. !< The preconditioner's LU has had its symbolic analysis (first rebuild). Needed because pre%update(new_pattern) overwrites the solver's update_graph flag even before its first factorization, so the first rebuild must request the analysis explicitly
 INTEGER(i4) :: pre_age = 0 !< Number of steps since the approximate Jacobian/preconditioner was last rebuilt
 LOGICAL :: pre_force_update = .TRUE. !< Force a Jacobian/preconditioner rebuild on the next step (set after changing physics coefficients, e.g. nu, m_i, kappa)
 REAL(r8) :: T_clip = -1.d0 !< If > 0, hard temperature floor [eV]: after each accepted step, T DOFs (field 5) below T_clip are set to T_clip. Not energy conserving and outside the Newton solve; off by default
@@ -1066,7 +1067,8 @@ CALL self%tkmr%update()
 !Rebuild approximate jacobian and refactor preconditioner every pre_freq steps
 IF(self%pre_force_update .OR. self%pre_age>=MAX(1,self%pre_freq))THEN
     CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
-    CALL self%pre%update(self%lu_reanalyze)
+    CALL self%pre%update(self%lu_reanalyze .OR. (.NOT.self%lu_analysed))
+    self%lu_analysed = .TRUE.
     self%pre_age=0
     self%pre_force_update=.FALSE.
 ELSE
@@ -1107,7 +1109,8 @@ DO j = 1,4
         IF(self%pre_age>1)THEN
             WRITE(*,*)'Newton failed with a stale preconditioner; rebuilding and retrying at same dt'
             CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
-            CALL self%pre%update(self%lu_reanalyze)
+            CALL self%pre%update(self%lu_reanalyze .OR. (.NOT.self%lu_analysed))
+            self%lu_analysed = .TRUE.
             self%pre_age=1
             CYCLE
         END IF
@@ -1116,7 +1119,8 @@ DO j = 1,4
         self%tkmr%dt=self%nlfun%dt
         CALL self%tkmr%update()
         CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
-        CALL self%pre%update(self%lu_reanalyze)
+        CALL self%pre%update(self%lu_reanalyze .OR. (.NOT.self%lu_analysed))
+        self%lu_analysed = .TRUE.
         self%pre_age=1
         CALL apply_rhs_mugtok(self%nlfun,self%u,self%rhs)
         CYCLE
