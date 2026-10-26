@@ -78,6 +78,7 @@ LOGICAL :: use_full_lu = .FALSE. !< In MHD-plasma mode, use a complete LU of the
 INTEGER(i4) :: pre_nlocal = 0 !< If > 0: spatial block-Jacobi preconditioner instead of the LU of the whole Jacobian: the Jacobian graph is split into pre_nlocal subdomains (METIS) and each is factorized with its own LU, the coupling between subdomains being dropped (takes precedence over use_full_lu; 0 = off). Set before calling setup_mhd
 LOGICAL :: pre_overlap = .FALSE. !< With pre_nlocal > 0: extend each subdomain by one layer of neighbouring unknowns (additive Schwarz, oft_bjprecond loverlap)
 INTEGER(i4) :: pre_part = 0 !< Partition for the spatial block-Jacobi (pre_nlocal > 0): 0 = METIS on the Jacobian graph (pre_nlocal subdomains); 1 = geometric, 2 subdomains: the unknowns of fields 1-7 belonging to plasma-region (region 1) cells vs everything else, so the dense couplings (outer-boundary psi, coil currents) all stay in one subdomain and the cut is at the plasma boundary
+REAL(r8) :: lin_rtol = 1.d-14 !< Relative tolerance of the linear (GMRES) solve inside Newton: it stops when |r| < lin_tol (absolute) or |r|/|r0| < lin_rtol, whichever comes first (inexact Newton). The default leaves only the absolute tolerance active; e.g. 1e-6 lets an inexact preconditioner (spatial block-Jacobi) stop once the linear residual is a small fraction of the current |F|. Set before calling setup_mhd
 LOGICAL :: pre_parts_reported = .FALSE. !< One-time report of the spatial block-Jacobi subdomains (sizes by field) done
 CLASS(flux_func), POINTER :: n_prof => NULL() !< Normalized density profile nhat(psihat), evaluated via %fp (linterp values). If set before setup_mhd (together with T_prof), n and T are seeded from the profiles and n is evolved
 CLASS(flux_func), POINTER :: T_prof => NULL() !< Normalized temperature profile That(psihat), evaluated via %fp (linterp values). See n_prof
@@ -557,6 +558,7 @@ self%mf_solver%A=>self%mfmat
 self%mf_solver%its=250
 self%mf_solver%nrits=40
 self%mf_solver%atol=lin_tol
+self%mf_solver%rtol=self%lin_rtol
 self%mf_solver%itplot=1
 oft_env%pm = self%pm
 self%mf_solver%pm=oft_env%pm
