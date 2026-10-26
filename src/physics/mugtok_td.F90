@@ -77,6 +77,7 @@ TYPE(xdmf_plot_file) :: resid_xdmf !< XDMF output for the residual dumps
 LOGICAL :: use_full_lu = .FALSE. !< In MHD-plasma mode, use a complete LU of the coupled Jacobian instead of per-field block-Jacobi (better linear convergence in the stiff near-ideal regime, but much higher memory). Set before calling setup_mhd.
 INTEGER(i4) :: pre_nlocal = 0 !< If > 0: spatial block-Jacobi preconditioner instead of the LU of the whole Jacobian: the Jacobian graph is split into pre_nlocal subdomains (METIS) and each is factorized with its own LU, the coupling between subdomains being dropped (takes precedence over use_full_lu; 0 = off). Set before calling setup_mhd
 LOGICAL :: pre_overlap = .FALSE. !< With pre_nlocal > 0: extend each subdomain by one layer of neighbouring unknowns (additive Schwarz, oft_bjprecond loverlap)
+INTEGER(i4) :: pre_part = 0 !< Partition for the spatial block-Jacobi (pre_nlocal > 0): 0 = METIS on the Jacobian graph (pre_nlocal subdomains); 1 = geometric, 2 subdomains: the unknowns in or on the border of the plasma region (region 1, plasma_flag) vs everything else, so the dense couplings (outer-boundary psi, coil currents) all stay in one subdomain and the cut is at the plasma boundary
 LOGICAL :: pre_parts_reported = .FALSE. !< One-time report of the spatial block-Jacobi subdomains (sizes by field) done
 CLASS(flux_func), POINTER :: n_prof => NULL() !< Normalized density profile nhat(psihat), evaluated via %fp (linterp values). If set before setup_mhd (together with T_prof), n and T are seeded from the profiles and n is evolved
 CLASS(flux_func), POINTER :: T_prof => NULL() !< Normalized temperature profile That(psihat), evaluated via %fp (linterp values). See n_prof
@@ -478,6 +479,27 @@ END IF
 
 !Create jacobian matrix
 CALL create_matrix(self%nlfun%jac_op,graphs,self%aug_vec,self%aug_vec)
+
+!---Geometric partition for the spatial block-Jacobi (pre_part=1): row coloring of the Jacobian
+!   (as xmhd.F90), color 2 = plasma-region unknowns of fields 1-7, color 1 = the rest incl. coil currents
+IF((self%pre_nlocal > 0).AND.(self%pre_part == 1))THEN
+    SELECT TYPE(this => self%nlfun%jac_op)
+    CLASS IS(oft_native_matrix)
+        ALLOCATE(this%color(this%nr))
+        this%color = 1
+        j = 0
+        DO i=1,self%fe_rep%nfields
+            IF(self%fe_rep%fields(i)%fe%ne /= SIZE(self%plasma_flag)) &
+                CALL oft_abort('pre_part=1 needs all fields on the plasma_flag Lagrange space','mugtok_finalize_setup',__FILE__)
+            WHERE(self%plasma_flag) this%color(j+1:j+self%fe_rep%fields(i)%fe%ne) = 2
+            j = j + self%fe_rep%fields(i)%fe%ne
+        END DO
+        WRITE(*,'(A,I9,A,I9,A)')' Block-Jacobi geometric partition (pre_part=1):',COUNT(this%color==2), &
+            ' plasma-region unknowns,',COUNT(this%color==1),' others (walls, vacuum, boundary, coils)'
+    CLASS DEFAULT
+        CALL oft_abort('pre_part=1 needs a native Jacobian matrix','mugtok_finalize_setup',__FILE__)
+    END SELECT
+END IF
 
 DO i=1,nkgraphs
     DEALLOCATE(known_graphs(i)%g)
@@ -1029,6 +1051,53 @@ end function mugtok_apply_sink
 !-----------------------------------------------------------------
 !> Take one timestep of the combined MUG and TokaMaker simulation
 !-----------------------------------------------------------------
+!---------------------------------------------------------------------------
+!> Build the spatial block-Jacobi partition and factorize its subdomains now, by applying the
+!! preconditioner once to a zero vector (the factorization would otherwise happen inside the first
+!! linear solve, so this adds no cost), and report the subdomains: unknowns in total and per field,
+!! and the time of this first factorization
+!---------------------------------------------------------------------------
+subroutine mugtok_report_parts(self)
+CLASS(oft_mugtok_td), target, intent(inout) :: self
+CLASS(oft_vector), POINTER :: v1, v2
+INTEGER(i4) :: ip, jj, kf, row
+INTEGER(8) :: c0, c1, crate
+INTEGER(i4), ALLOCATABLE :: field_of(:), cnt(:)
+NULLIFY(v1, v2)
+CALL self%rhs%new(v1); CALL self%rhs%new(v2)
+CALL v1%set(0.d0); CALL v2%set(0.d0)
+CALL SYSTEM_CLOCK(c0, crate)
+CALL self%pre%apply(v1, v2)
+CALL SYSTEM_CLOCK(c1)
+CALL v1%delete; CALL v2%delete
+DEALLOCATE(v1, v2)
+SELECT TYPE(bj => self%pre)
+CLASS IS(oft_bjprecond)
+    IF(ASSOCIATED(bj%parts))THEN
+        ALLOCATE(field_of(bj%A%nr), cnt(bj%A%ni))
+        field_of = 0
+        DO kf=1,bj%A%ni
+            DO jj=1,bj%A%i_map(kf)%nslice
+                field_of(bj%A%i_map(kf)%offset+bj%A%i_map(kf)%slice(jj)) = kf
+            END DO
+        END DO
+        WRITE(*,'(A,I4,A,L2,A,I9,A,F8.1,A)')' Block-Jacobi subdomains:',bj%nlocal,' (overlap',bj%loverlap,') of', &
+            bj%A%nr,' unknowns; first factorization',REAL(c1-c0,8)/REAL(crate,8),' s; per subdomain: total | by field 1..n'
+        DO ip=1,bj%nlocal
+            cnt = 0
+            DO jj=1,bj%parts(ip)%n
+                row = ABS(bj%parts(ip)%v(jj))
+                IF(field_of(row)>0) cnt(field_of(row)) = cnt(field_of(row)) + 1
+            END DO
+            WRITE(*,'(A,I3,A,I9,A,20I8)')'   subdomain',ip,':',bj%parts(ip)%n,'  |',cnt
+        END DO
+        DEALLOCATE(field_of, cnt)
+    END IF
+END SELECT
+FLUSH(6)
+self%pre_parts_reported = .TRUE.
+end subroutine mugtok_report_parts
+
 subroutine step_mugtok_td(self,coil_currents,time,dt,nl_its,lin_its,nretry)
 CLASS(oft_mugtok_td), target, intent(inout) :: self !< Simulation object
 REAL(r8), INTENT(in) :: coil_currents(:) !< Prescribed I-coil currents for this step (size ncoils)
@@ -1069,6 +1138,7 @@ IF(self%pre_force_update .OR. self%pre_age>=MAX(1,self%pre_freq))THEN
     CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
     CALL self%pre%update(self%lu_reanalyze .OR. (.NOT.self%lu_analysed))
     self%lu_analysed = .TRUE.
+    IF((self%pre_nlocal > 0).AND.(.NOT.self%pre_parts_reported))CALL mugtok_report_parts(self)
     self%pre_age=0
     self%pre_force_update=.FALSE.
 ELSE
@@ -1128,38 +1198,6 @@ DO j = 1,4
         EXIT
     END IF
 END DO
-
-!---One-time report of the spatial block-Jacobi subdomains: unknowns per field in each subdomain
-IF((self%pre_nlocal > 0).AND.(.NOT.self%pre_parts_reported))THEN
-    SELECT TYPE(bj => self%pre)
-    CLASS IS(oft_bjprecond)
-        IF(ASSOCIATED(bj%parts))THEN
-            BLOCK
-            INTEGER(i4) :: ip, jj, kf, row
-            INTEGER(i4), ALLOCATABLE :: field_of(:), cnt(:)
-            ALLOCATE(field_of(bj%A%nr), cnt(bj%A%ni))
-            field_of = 0
-            DO kf=1,bj%A%ni
-                DO jj=1,bj%A%i_map(kf)%nslice
-                    field_of(bj%A%i_map(kf)%offset+bj%A%i_map(kf)%slice(jj)) = kf
-                END DO
-            END DO
-            WRITE(*,'(A,I4,A,L2,A,I9,A)')' Block-Jacobi subdomains:',bj%nlocal,' (overlap',bj%loverlap,') of', &
-                bj%A%nr,' unknowns; per subdomain: total, then by field 1..n'
-            DO ip=1,bj%nlocal
-                cnt = 0
-                DO jj=1,bj%parts(ip)%n
-                    row = bj%parts(ip)%v(jj)
-                    IF(field_of(row)>0) cnt(field_of(row)) = cnt(field_of(row)) + 1
-                END DO
-                WRITE(*,'(A,I3,A,I9,A,20I8)')'   subdomain',ip,':',bj%parts(ip)%n,'  |',cnt
-            END DO
-            DEALLOCATE(field_of, cnt)
-            END BLOCK
-            self%pre_parts_reported = .TRUE.
-        END IF
-    END SELECT
-END IF
 
 !Advance time and return iteration counts (nretry = extra Newton attempts this step: stale-preconditioner
 !retries and dt halvings; j is 5 if all four attempts failed)

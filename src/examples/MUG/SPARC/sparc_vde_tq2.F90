@@ -98,6 +98,7 @@ LOGICAL :: ohmic_heating = .FALSE. !< Ohmic heating eta*J^2 in the temperature e
 LOGICAL :: lu_reanalyze = .FALSE. !< Redo the LU symbolic analysis at every preconditioner rebuild (mugtok_td lu_reanalyze; default: only at the first factorization). .TRUE. reproduces runs before 2026-10-26
 INTEGER(i4) :: pre_nlocal = 0 !< If > 0: spatial block-Jacobi preconditioner with pre_nlocal METIS subdomains, one LU (package lu_package) each, instead of the full LU (mugtok_td pre_nlocal); 0 = full LU
 LOGICAL :: pre_overlap = .FALSE. !< With pre_nlocal > 0: overlap the subdomains by one layer of unknowns (additive Schwarz)
+INTEGER(i4) :: pre_part = 0 !< With pre_nlocal > 0: 0 = METIS partition; 1 = geometric 2-way split, plasma region vs the rest (all dense boundary/coil couplings in one subdomain)
 REAL(r8) :: drag_rate = 0.d0 !< Post-kick linear drag rate [1/s] on the poloidal velocity (force -m_i*n*drag_rate*v_pol); 0 = off
 LOGICAL :: drop_convection = .FALSE. !< If true, drop the (v.grad)v convective term from the momentum equation (setup_mhd's default); this driver keeps it by default
 LOGICAL :: visc_dynamic = .FALSE. !< If true, the dynamic viscosity m_i*n*nu is uniform in the plasma (as with M3D-C1's amu/amuc): visc_kick/visc_post are then the kinematic viscosity at density visc_nref, and nu = visc*visc_nref/n pointwise
@@ -149,7 +150,7 @@ TYPE(oft_mugtok_td):: b_sim
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol,mf_b0,T_clip, &
-  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
+  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq
 !------------------------------------------------------------------------------
 ! Initialize enviroment
@@ -348,6 +349,7 @@ b_sim%fix_F_boundary = fix_F_boundary
 WRITE(*,'(A,L2)')' Fixed F = R*B_phi on the outer boundary (fix_F_boundary): ',fix_F_boundary
 b_sim%pre_nlocal = pre_nlocal
 b_sim%pre_overlap = pre_overlap
+b_sim%pre_part = pre_part
 CALL b_sim%setup_mhd(equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg=eta_reg, kappa_reg=kappa_reg, mass_scale=mass_scale_kick, D_reg=D_reg, toroidal_flow = .FALSE.)
 b_sim%mug%ohmic = ohmic_heating
 b_sim%lu_reanalyze = lu_reanalyze
