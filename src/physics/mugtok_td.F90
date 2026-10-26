@@ -9,7 +9,7 @@ USE oft_gauss_quadrature, ONLY: set_quad_1d
 USE oft_la_base, ONLY: oft_vector, oft_matrix, oft_graph, oft_graph_ptr, map_list
 USE oft_deriv_matrices, ONLY: oft_noop_matrix, oft_mf_matrix
 USE oft_solver_base, ONLY: oft_solver
-USE oft_native_solvers, ONLY: oft_nksolver, oft_native_gmres_solver
+USE oft_native_solvers, ONLY: oft_nksolver, oft_native_gmres_solver, oft_bjprecond
 USE oft_solver_utils, ONLY: create_cg_solver, create_diag_pre, create_bjacobi_pre, create_native_pre
 USE oft_lu, ONLY: oft_lusolver
 USE oft_la_utils, ONLY: create_matrix, graph_add_dense_blocks, create_vector, create_dense_graph
@@ -74,6 +74,9 @@ INTEGER(i4) :: n_resid_dumps = 0 !< Residual dumps written so far
 LOGICAL :: resid_xdmf_ready = .FALSE. !< mugtok_resid XDMF output initialized
 TYPE(xdmf_plot_file) :: resid_xdmf !< XDMF output for the residual dumps
 LOGICAL :: use_full_lu = .FALSE. !< In MHD-plasma mode, use a complete LU of the coupled Jacobian instead of per-field block-Jacobi (better linear convergence in the stiff near-ideal regime, but much higher memory). Set before calling setup_mhd.
+INTEGER(i4) :: pre_nlocal = 0 !< If > 0: spatial block-Jacobi preconditioner instead of the LU of the whole Jacobian: the Jacobian graph is split into pre_nlocal subdomains (METIS) and each is factorized with its own LU, the coupling between subdomains being dropped (takes precedence over use_full_lu; 0 = off). Set before calling setup_mhd
+LOGICAL :: pre_overlap = .FALSE. !< With pre_nlocal > 0: extend each subdomain by one layer of neighbouring unknowns (additive Schwarz, oft_bjprecond loverlap)
+LOGICAL :: pre_parts_reported = .FALSE. !< One-time report of the spatial block-Jacobi subdomains (sizes by field) done
 CLASS(flux_func), POINTER :: n_prof => NULL() !< Normalized density profile nhat(psihat), evaluated via %fp (linterp values). If set before setup_mhd (together with T_prof), n and T are seeded from the profiles and n is evolved
 CLASS(flux_func), POINTER :: T_prof => NULL() !< Normalized temperature profile That(psihat), evaluated via %fp (linterp values). See n_prof
 REAL(r8) :: n_scale = 1.d20 !< Density scale [m^-3]: n = n_offset + n_scale*nhat inside the plasma (also used as mug%den_scale)
@@ -491,8 +494,16 @@ DEALLOCATE(fe_graphs)
 !    force a complete LU instead -- needed when the block preconditioner's linear
 !    convergence is too poor in the stiff, near-ideal (low physical eta) regime.
 !  - incompressible / Grad-Shafranov plasma: always a complete LU.
+!  - pre_nlocal > 0 (any mode): spatial block-Jacobi, one LU per METIS subdomain
+!    (optionally overlapping by one layer, pre_overlap).
 !------------------------------------------------------------------------------
-IF(self%mhd_plasma .AND. .NOT.self%use_full_lu)THEN
+IF(self%pre_nlocal > 0)THEN
+    CALL create_bjacobi_pre(self%pre, self%pre_nlocal) ! one LU per spatial subdomain (METIS partition of the Jacobian graph)
+    SELECT TYPE(bj => self%pre)
+    CLASS IS(oft_bjprecond)
+        bj%loverlap = self%pre_overlap
+    END SELECT
+ELSE IF(self%mhd_plasma .AND. .NOT.self%use_full_lu)THEN
     CALL create_bjacobi_pre(self%pre, -1) ! one LU block per field block
 ELSE
     CALL create_native_pre(self%pre, "lu")
@@ -1113,6 +1124,38 @@ DO j = 1,4
         EXIT
     END IF
 END DO
+
+!---One-time report of the spatial block-Jacobi subdomains: unknowns per field in each subdomain
+IF((self%pre_nlocal > 0).AND.(.NOT.self%pre_parts_reported))THEN
+    SELECT TYPE(bj => self%pre)
+    CLASS IS(oft_bjprecond)
+        IF(ASSOCIATED(bj%parts))THEN
+            BLOCK
+            INTEGER(i4) :: ip, jj, kf, row
+            INTEGER(i4), ALLOCATABLE :: field_of(:), cnt(:)
+            ALLOCATE(field_of(bj%A%nr), cnt(bj%A%ni))
+            field_of = 0
+            DO kf=1,bj%A%ni
+                DO jj=1,bj%A%i_map(kf)%nslice
+                    field_of(bj%A%i_map(kf)%offset+bj%A%i_map(kf)%slice(jj)) = kf
+                END DO
+            END DO
+            WRITE(*,'(A,I4,A,L2,A,I9,A)')' Block-Jacobi subdomains:',bj%nlocal,' (overlap',bj%loverlap,') of', &
+                bj%A%nr,' unknowns; per subdomain: total, then by field 1..n'
+            DO ip=1,bj%nlocal
+                cnt = 0
+                DO jj=1,bj%parts(ip)%n
+                    row = bj%parts(ip)%v(jj)
+                    IF(field_of(row)>0) cnt(field_of(row)) = cnt(field_of(row)) + 1
+                END DO
+                WRITE(*,'(A,I3,A,I9,A,20I8)')'   subdomain',ip,':',bj%parts(ip)%n,'  |',cnt
+            END DO
+            DEALLOCATE(field_of, cnt)
+            END BLOCK
+            self%pre_parts_reported = .TRUE.
+        END IF
+    END SELECT
+END IF
 
 !Advance time and return iteration counts (nretry = extra Newton attempts this step: stale-preconditioner
 !retries and dt halvings; j is 5 if all four attempts failed)
