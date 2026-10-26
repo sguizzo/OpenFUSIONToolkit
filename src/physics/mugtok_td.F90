@@ -77,7 +77,7 @@ TYPE(xdmf_plot_file) :: resid_xdmf !< XDMF output for the residual dumps
 LOGICAL :: use_full_lu = .FALSE. !< In MHD-plasma mode, use a complete LU of the coupled Jacobian instead of per-field block-Jacobi (better linear convergence in the stiff near-ideal regime, but much higher memory). Set before calling setup_mhd.
 INTEGER(i4) :: pre_nlocal = 0 !< If > 0: spatial block-Jacobi preconditioner instead of the LU of the whole Jacobian: the Jacobian graph is split into pre_nlocal subdomains (METIS) and each is factorized with its own LU, the coupling between subdomains being dropped (takes precedence over use_full_lu; 0 = off). Set before calling setup_mhd
 LOGICAL :: pre_overlap = .FALSE. !< With pre_nlocal > 0: extend each subdomain by one layer of neighbouring unknowns (additive Schwarz, oft_bjprecond loverlap)
-INTEGER(i4) :: pre_part = 0 !< Partition for the spatial block-Jacobi (pre_nlocal > 0): 0 = METIS on the Jacobian graph (pre_nlocal subdomains); 1 = geometric, 2 subdomains: the unknowns in or on the border of the plasma region (region 1, plasma_flag) vs everything else, so the dense couplings (outer-boundary psi, coil currents) all stay in one subdomain and the cut is at the plasma boundary
+INTEGER(i4) :: pre_part = 0 !< Partition for the spatial block-Jacobi (pre_nlocal > 0): 0 = METIS on the Jacobian graph (pre_nlocal subdomains); 1 = geometric, 2 subdomains: the unknowns of fields 1-7 belonging to plasma-region (region 1) cells vs everything else, so the dense couplings (outer-boundary psi, coil currents) all stay in one subdomain and the cut is at the plasma boundary
 LOGICAL :: pre_parts_reported = .FALSE. !< One-time report of the spatial block-Jacobi subdomains (sizes by field) done
 CLASS(flux_func), POINTER :: n_prof => NULL() !< Normalized density profile nhat(psihat), evaluated via %fp (linterp values). If set before setup_mhd (together with T_prof), n and T are seeded from the profiles and n is evolved
 CLASS(flux_func), POINTER :: T_prof => NULL() !< Normalized temperature profile That(psihat), evaluated via %fp (linterp values). See n_prof
@@ -481,7 +481,7 @@ END IF
 CALL create_matrix(self%nlfun%jac_op,graphs,self%aug_vec,self%aug_vec)
 
 !---Geometric partition for the spatial block-Jacobi (pre_part=1): row coloring of the Jacobian
-!   (as xmhd.F90), color 2 = plasma-region unknowns of fields 1-7, color 1 = the rest incl. coil currents
+!   (as xmhd.F90), color 2 = unknowns of fields 1-7 on region-1 cells, color 1 = the rest incl. coil currents
 IF((self%pre_nlocal > 0).AND.(self%pre_part == 1))THEN
     SELECT TYPE(this => self%nlfun%jac_op)
     CLASS IS(oft_native_matrix)
@@ -489,9 +489,21 @@ IF((self%pre_nlocal > 0).AND.(self%pre_part == 1))THEN
         this%color = 1
         j = 0
         DO i=1,self%fe_rep%nfields
-            IF(self%fe_rep%fields(i)%fe%ne /= SIZE(self%plasma_flag)) &
-                CALL oft_abort('pre_part=1 needs all fields on the plasma_flag Lagrange space','mugtok_finalize_setup',__FILE__)
-            WHERE(self%plasma_flag) this%color(j+1:j+self%fe_rep%fields(i)%fe%ne) = 2
+            !---Unknowns of this field that belong to a plasma-region (region 1) cell, on the field's own space
+            !   (plasma_flag is not used: it is only allocated by setup_mugtok_td, not in MHD-plasma mode)
+            BLOCK
+            INTEGER(i4) :: ic, kd
+            INTEGER(i4), ALLOCATABLE :: cdofs(:)
+            ALLOCATE(cdofs(self%fe_rep%fields(i)%fe%nce))
+            DO ic=1,mesh%nc
+                IF(mesh%reg(ic) /= 1)CYCLE
+                CALL self%fe_rep%fields(i)%fe%ncdofs(ic,cdofs)
+                DO kd=1,SIZE(cdofs)
+                    this%color(j+cdofs(kd)) = 2
+                END DO
+            END DO
+            DEALLOCATE(cdofs)
+            END BLOCK
             j = j + self%fe_rep%fields(i)%fe%ne
         END DO
         WRITE(*,'(A,I9,A,I9,A)')' Block-Jacobi geometric partition (pre_part=1):',COUNT(this%color==2), &
