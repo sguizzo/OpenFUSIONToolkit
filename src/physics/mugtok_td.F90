@@ -63,6 +63,7 @@ INTEGER(i4) :: F0_node = 0 !< Index of the first plasma_flag=.TRUE. DOF, used to
 REAL(r8) :: f_scale_prev = 1.d0 !< FF' scale (tkmr%f_scale) from previous timestep
 CLASS(flux_func), POINTER :: I_prev => NULL() !< FF' profile (gs_equil%I) from previous timestep
 LOGICAL :: mhd_plasma = .FALSE. !< True when the plasma (region 1) is evolved with MHD (set by setup_mhd)
+LOGICAL :: fix_F_boundary = .FALSE. !< If true (set before setup_mhd), hold F = R B_phi at its initial value on the outer boundary of the mesh (Dirichlet; fixed TF current, as M3D-C1's iconst_bz=1) instead of the natural no-current condition, which conserves the total toroidal flux of the domain
 INTEGER(i4) :: pre_freq = 1 !< Rebuild the approximate Jacobian and refactor the preconditioner every pre_freq steps (always on a dt change, on request via pre_force_update, and before halving dt after a Newton failure with a stale preconditioner)
 INTEGER(i4) :: pre_age = 0 !< Number of steps since the approximate Jacobian/preconditioner was last rebuilt
 LOGICAL :: pre_force_update = .TRUE. !< Force a Jacobian/preconditioner rebuild on the next step (set after changing physics coefficients, e.g. nu, m_i, kappa)
@@ -720,6 +721,8 @@ ALLOCATE(mhd_sim%by_bc(mhd_sim%fe_rep%fields(7)%fe%ne))
 
 mhd_sim%psi_bc = .FALSE.
 mhd_sim%by_bc = .FALSE.
+!Optionally fix F (= R B_phi) on the outer mesh boundary at its initial value (fixed TF current)
+IF(self%fix_F_boundary) mhd_sim%by_bc = mhd_sim%fe_rep%fields(7)%fe%be
 mhd_sim%n_bc = .NOT.evolve_dens !density prescribed (flat, or fixed initial profile) unless evolved
 !Temperature: evolved (free) by default when evolved at all; pinned (Dirichlet)
 !below on any DOF touched by a non-MHD cell (including the MHD/non-MHD
@@ -1407,6 +1410,7 @@ DO i=1,mesh%nc
   !---Add local values to the full residual vector
   !$omp ordered
   DO jr=1,lag_rep%nce
+    IF(self%parent_sim%mug%by_bc(cell_dofs(jr))) CYCLE !Dirichlet F rows keep the MUG Dirichlet residual
     !$omp atomic
     by_res(cell_dofs(jr)) = by_res(cell_dofs(jr)) + res_loc(jr)
   END DO
@@ -1671,6 +1675,7 @@ DO i=1,mesh%nc
   !$omp critical
   DO jr=1,lag_rep%nce
     IF(self%F0_node > 0 .AND. self%plasma_flag(cell_dofs(jr))) CYCLE !In the F0 model plasma DOFs get the F0 constraint instead; without it they get diffusion (matching add_f_res) on top of the MHD induction
+    IF(self%mug%by_bc(cell_dofs(jr))) CYCLE !Dirichlet F rows keep their identity row
     CALL mat%add_values([cell_dofs(jr)], cell_dofs, RESHAPE(jac_loc(jr,:),[1,lag_rep%nce]), &
                         1, lag_rep%nce, 7, 7)
   END DO

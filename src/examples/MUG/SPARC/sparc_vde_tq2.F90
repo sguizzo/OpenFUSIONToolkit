@@ -92,6 +92,7 @@ REAL(r8) :: visc_sol_dT = 10.d0 !< Width of the visc_sol_mult transition [eV]
 LOGICAL :: visc_sol_on_psi = .FALSE. !< Key the visc_sol_mult boost on normalized flux instead of T: boost where psiN > visc_sol_psiN0 (tanh width visc_sol_dpsiN), i.e. outside the LCFS (see xmhd_2d visc_sol_on_psi)
 REAL(r8) :: visc_sol_psiN0 = 1.d0 !< Middle of the psi-keyed transition (normalized flux)
 REAL(r8) :: visc_sol_dpsiN = 0.002d0 !< Width of the psi-keyed transition (normalized flux)
+LOGICAL :: fix_F_boundary = .FALSE. !< Hold F = R B_phi at its initial value on the outer mesh boundary (fixed TF current, as M3D-C1's default iconst_bz=1) instead of the natural condition that conserves the domain's toroidal flux
 REAL(r8) :: drag_rate = 0.d0 !< Post-kick linear drag rate [1/s] on the poloidal velocity (force -m_i*n*drag_rate*v_pol); 0 = off
 LOGICAL :: drop_convection = .FALSE. !< If true, drop the (v.grad)v convective term from the momentum equation (setup_mhd's default); this driver keeps it by default
 LOGICAL :: visc_dynamic = .FALSE. !< If true, the dynamic viscosity m_i*n*nu is uniform in the plasma (as with M3D-C1's amu/amuc): visc_kick/visc_post are then the kinematic viscosity at density visc_nref, and nu = visc*visc_nref/n pointwise
@@ -143,7 +144,7 @@ TYPE(oft_mugtok_td):: b_sim
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,nl_tol,mf_b0,T_clip, &
-  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
+  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq
 !------------------------------------------------------------------------------
 ! Initialize enviroment
@@ -338,6 +339,8 @@ DO i=1,SIZE(cond_names)
   WRITE(*,'(2A,I4,2(A,ES12.4))')' ',TRIM(cond_names(i)),reg_id_tmp, &
     '  eta_pol [Ohm*m] = ',eta_reg(reg_id_tmp,1)*mu0,'  eta_tor [Ohm*m] = ',eta_reg(reg_id_tmp,2)*mu0
 END DO
+b_sim%fix_F_boundary = fix_F_boundary
+WRITE(*,'(A,L2)')' Fixed F = R*B_phi on the outer boundary (fix_F_boundary): ',fix_F_boundary
 CALL b_sim%setup_mhd(equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg=eta_reg, kappa_reg=kappa_reg, mass_scale=mass_scale_kick, D_reg=D_reg, toroidal_flow = .FALSE.)
 
 ! Compare the seeded 2*k*n*T with the equilibrium pressure on axis (psihat=1, where the
