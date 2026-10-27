@@ -378,6 +378,9 @@ endif()
 if( OFT_MUMPS_FOUND )
   add_definitions( -DHAVE_MUMPS )
 endif()
+if( OFT_SMUMPS_FOUND )
+  add_definitions( -DHAVE_SMUMPS ) # EXPERIMENTAL draft: single-precision MUMPS ("smumps" LU package)
+endif()
 
 ########################
 # Setup component libraries

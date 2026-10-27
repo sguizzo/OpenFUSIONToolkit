@@ -30,6 +30,11 @@ IMPLICIT NONE
 #ifdef HAVE_MUMPS
 #include "dmumps_struc.h"
 #endif
+#ifdef HAVE_SMUMPS
+!---EXPERIMENTAL DRAFT (mugtok_halo, 2026-10-27): single-precision MUMPS factorization used as a
+!   preconditioner (package "smumps"); not intended for upstream OFT in this form
+#include "smumps_struc.h"
+#endif
 #ifdef HAVE_MKL_PARDISO
 #define HAVE_MKL
 #endif
@@ -112,6 +117,11 @@ TYPE, PUBLIC, EXTENDS(oft_solver) :: oft_lusolver
 #endif
 #ifdef HAVE_MUMPS
   TYPE(DMUMPS_STRUC) :: mumps_struct !< MUMPS solver information
+#endif
+#ifdef HAVE_SMUMPS
+  TYPE(SMUMPS_STRUC) :: smumps_struct !< EXPERIMENTAL: single-precision MUMPS solver information (package "smumps")
+  REAL(4), POINTER, DIMENSION(:) :: smumps_vals => NULL() !< EXPERIMENTAL: single-precision copy of the matrix values
+  REAL(4), POINTER, DIMENSION(:) :: smumps_rhs => NULL() !< EXPERIMENTAL: single-precision RHS/solution buffer
 #endif
 CONTAINS
   !> Solve linear system
@@ -371,7 +381,7 @@ IF((oft_env%pm.AND.oft_env%head_proc))WRITE(*,*)'Starting LU solver: ',self%pack
 IF(.NOT.native_matrix_cast(A_native,self%A))CALL oft_abort('Native matrix required', &
   'lusolver_apply',__FILE__)
 !---Check call threading for MUMPS
-IF(self%package(1:5)=='mumps')THEN
+IF((self%package(1:5)=='mumps').OR.(self%package(1:6)=='smumps'))THEN
   IF(omp_get_num_threads()>1)CALL oft_abort('MUMPS used by multiple threads', &
     'lusolver_apply',__FILE__)
 END IF
@@ -457,6 +467,34 @@ IF(.NOT.self%initialized)THEN
       END DO
 #else
       CALL oft_abort('OFT not compiled with MUMPS','lusolver_apply',__FILE__)
+#endif
+    CASE("smumps")
+#ifdef HAVE_SMUMPS
+      !---EXPERIMENTAL: as "mumps", but the factorization is done in single precision on a copy of the values
+      self%smumps_struct%job = -1
+#ifdef OFT_MPI_F08
+      self%smumps_struct%comm = MPI_COMM_SELF%MPI_VAL
+#else
+      self%smumps_struct%comm = MPI_COMM_SELF
+#endif
+      self%smumps_struct%sym = 0
+      self%smumps_struct%par = 1
+      CALL smumps(self%smumps_struct)
+      self%smumps_struct%icntl((/5,18/))=0 ! Set centralized assembly
+      self%smumps_struct%icntl((/20,21/))=0 ! Set centralized dense RHS
+      self%smumps_struct%icntl(3:4)=-1 ! Surpress information messages
+      self%smumps_struct%n=A_native%nr
+      self%smumps_struct%nz=A_native%nnz
+      self%smumps_struct%jcn=>A_native%lc
+      ALLOCATE(self%smumps_vals(A_native%nnz))
+      self%smumps_vals=REAL(mat_vals,4)
+      self%smumps_struct%A=>self%smumps_vals
+      ALLOCATE(self%smumps_struct%irn(A_native%nnz))
+      DO i=1,A_native%nr
+        self%smumps_struct%irn(A_native%kr(i):A_native%kr(i+1)-1)=i
+      END DO
+#else
+      CALL oft_abort('OFT not compiled with single-precision MUMPS (smumps)','lusolver_apply',__FILE__)
 #endif
   END SELECT
   self%initialized=.TRUE.
@@ -621,6 +659,36 @@ CASE("superd")
 #else
     CALL oft_abort('OFT not compiled with MUMPS','lusolver_apply',__FILE__)
 #endif
+  CASE("smumps")
+#ifdef HAVE_SMUMPS
+    !---EXPERIMENTAL: refresh the single-precision values, factor (job 2, or 4 with analysis), then solve
+    !   in single precision with the RHS converted down and the solution converted back up
+    IF(self%refactor)THEN
+      self%smumps_vals=REAL(mat_vals,4)
+      self%smumps_struct%job = 2
+      IF(self%update_graph)self%smumps_struct%job = 4
+      CALL smumps(self%smumps_struct)
+      self%refactor=.FALSE.
+      self%update_graph=.FALSE.
+    END IF
+    IF(ASSOCIATED(self%smumps_rhs))THEN
+      IF(SIZE(self%smumps_rhs)/=nrhs*g%n)DEALLOCATE(self%smumps_rhs)
+    END IF
+    IF(.NOT.ASSOCIATED(self%smumps_rhs))ALLOCATE(self%smumps_rhs(nrhs*g%n))
+    DO j=1,nrhs
+      self%smumps_rhs((j-1)*g%n+1:j*g%n)=REAL(vals(1:g%n,j),4)
+    END DO
+    self%smumps_struct%rhs=>self%smumps_rhs
+    self%smumps_struct%lrhs = g%n
+    self%smumps_struct%nrhs = nrhs
+    self%smumps_struct%job = 3 ! Solve phase
+    CALL smumps(self%smumps_struct)
+    DO j=1,nrhs
+      vals(1:g%n,j)=REAL(self%smumps_rhs((j-1)*g%n+1:j*g%n),8)
+    END DO
+#else
+    CALL oft_abort('OFT not compiled with single-precision MUMPS (smumps)','lusolver_apply',__FILE__)
+#endif
   CASE("lapack")
     IF(.NOT.ASSOCIATED(self%atmp))THEN
       ALLOCATE(self%ipiv(A_native%nr))
@@ -700,6 +768,7 @@ class(oft_lusolver), intent(inout) :: self
 logical :: thread_safe
 thread_safe=.TRUE.
 IF(self%package(1:5)=='mumps')thread_safe=.FALSE.
+IF(self%package(1:6)=='smumps')thread_safe=.FALSE.
 IF(self%package(1:6)=='superd')thread_safe=.FALSE.
 end function lusolver_check_thread
 !------------------------------------------------------------------------------
@@ -756,6 +825,13 @@ SELECT CASE(TRIM(self%package))
   CASE("mumps")
     self%mumps_struct%job = -2
     CALL dmumps(self%mumps_struct)
+#endif
+#ifdef HAVE_SMUMPS
+  CASE("smumps")
+    self%smumps_struct%job = -2
+    CALL smumps(self%smumps_struct)
+    IF(ASSOCIATED(self%smumps_vals))DEALLOCATE(self%smumps_vals)
+    IF(ASSOCIATED(self%smumps_rhs))DEALLOCATE(self%smumps_rhs)
 #endif
 #ifdef HAVE_MKL
   CASE("mkl")
