@@ -127,6 +127,7 @@ REAL(r8) :: dt_refactor_tol = 0.d0 !< dt changes within this relative distance o
 LOGICAL :: dt_adapt = .FALSE. !< Adaptive dt in the phases with a nominal dt cap (oft_mugtok_td%dt_adapt; replaces dt_grow_steps there): dt targets lin_its_target GMRES iterations per step, at most the phase's nominal dt. dt_min_frac then also stops a run whose controller drives dt below dt_min_frac x that cap
 INTEGER(i4) :: lin_its_target = 20 !< With dt_adapt: target GMRES iterations per step
 INTEGER(i4) :: dt_hist = 5 !< With dt_adapt: steps in the dt/GMRES history
+LOGICAL :: step_profile = .FALSE. !< Print a per-step profile of wall and CPU time by part of the step (oft_mugtok_td%step_profile)
 LOGICAL :: newton_backtrack = .FALSE. !< Turn on backtracking (step halving while |F| grows) in the Newton solver; mugtok_td switches it off by default
 LOGICAL :: resid_dump = .FALSE. !< Write the Newton residual of failed Newton attempts to the XDMF group mugtok_resid (oft_mugtok_td%resid_dump; at most 8)
 INTEGER(i4) :: n_clean = 0 !< Consecutive steps without a retry (for dt_grow_steps)
@@ -160,7 +161,7 @@ CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,lin_rtol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
-  dt_refactor_tol,pre_adapt,pre_max_age,dt_adapt,lin_its_target,dt_hist, &
+  dt_refactor_tol,pre_adapt,pre_max_age,dt_adapt,lin_its_target,dt_hist,step_profile, &
   T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq
 !------------------------------------------------------------------------------
 ! Initialize enviroment
@@ -371,6 +372,8 @@ b_sim%dt_refactor_tol = dt_refactor_tol
 b_sim%pre_max_age = pre_max_age
 b_sim%lin_its_target = lin_its_target
 b_sim%dt_hist = dt_hist
+b_sim%step_profile = step_profile
+WRITE(*,'(A,L2)')' Per-step profile (step_profile):',step_profile
 WRITE(*,'(A,L2,A,I4,A,ES10.2)')' Cost-based preconditioner refresh (pre_adapt):',pre_adapt,'  pre_max_age',pre_max_age, &
   '  dt_refactor_tol',dt_refactor_tol
 WRITE(*,'(A,L2,A,I4,A,I4)')' Adaptive dt (dt_adapt):',dt_adapt,'  lin_its_target',lin_its_target,'  dt_hist',dt_hist

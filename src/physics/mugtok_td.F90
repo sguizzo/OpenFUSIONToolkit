@@ -86,6 +86,9 @@ REAL(r8) :: dt_next = 0.d0 !< With dt_adapt: dt for the next step (output of ste
 INTEGER(i4) :: dt_nhist = 0 !< With dt_adapt: steps in the history (set 0 to reset it, e.g. on a phase change)
 REAL(r8) :: dt_hist_dt(50) = 0.d0 !< With dt_adapt: dt of the last dt_nhist steps (most recent first)
 INTEGER(i4) :: dt_hist_its(50) = 0 !< With dt_adapt: GMRES iterations of the last dt_nhist steps (most recent first)
+LOGICAL :: step_profile = .FALSE. !< Print a per-step profile: wall and process CPU time of each part of the step (CPU/wall = threads in use)
+REAL(r8) :: prof_mf_w = 0.d0 !< step_profile: matrix-free base update wall time this step, without its residual call
+REAL(r8) :: prof_mf_c = 0.d0 !< step_profile: the same, CPU time
 REAL(r8) :: T_clip = -1.d0 !< If > 0, hard temperature floor [eV]: after each accepted step, T DOFs (field 5) below T_clip are set to T_clip. Not energy conserving and outside the Newton solve; off by default
 LOGICAL :: resid_dump = .FALSE. !< If true, write the Newton residual F(u)-rhs of each failed Newton attempt (fields 1-7, plus the iterate's V and T) as a time step of the XDMF group "mugtok_resid" in resid_dump/oft_xdmf.*.h5 (at most 8 per run)
 INTEGER(i4) :: n_resid_dumps = 0 !< Residual dumps written so far
@@ -140,8 +143,68 @@ CLASS(oft_vector), POINTER :: dbg_wrk => NULL() !< Work vector ! NLDEBUG
 INTEGER(i4) :: dbg_it = 0 !< Newton iteration counter for diagnostics ! NLDEBUG
 CLASS(oft_bmesh), POINTER, PUBLIC :: mesh => NULL() !< Pointer to FE mesh
 CLASS(oft_scalar_bfem), POINTER :: lag_rep => NULL()!< Pointer to single field FE representation 
+!---Optional per-step profile (oft_mugtok_td%step_profile): wall and process CPU time per section; CPU/wall is
+! the number of threads effectively in use (1 = serial). Sections may nest (residual parts inside the Newton solve)
+INTEGER(i4), PARAMETER :: nprof = 15
+CHARACTER(LEN=30), PARAMETER :: prof_names(nprof) = [CHARACTER(LEN=30) :: 'start of step (updates)', &
+  'Jacobian build (total)', '  MUG approx. Jacobian', '  vacuum operator', 'preconditioner update', &
+  'RHS (floor + apply_rhs)', 'Newton solve (total)', '  residual: TokaMaker', '  residual: MUG', &
+  '  residual: F terms', '  residual (total)', '  matrix-free base update', 'after Newton (equil, psi_lim)', &
+  'restart + diagnostics', 'whole step']
+REAL(r8) :: prof_wall(nprof) = 0.d0, prof_cpu(nprof) = 0.d0, prof_w0(nprof) = 0.d0, prof_c0(nprof) = 0.d0
+INTEGER(i4) :: prof_n(nprof) = 0
+LOGICAL :: prof_on = .FALSE.
 
 CONTAINS
+!---------------------------------------------------------------------------------
+!> Start timing profile section k (no-op unless prof_on)
+!---------------------------------------------------------------------------------
+SUBROUTINE prof_tic(k)
+INTEGER(i4), INTENT(in) :: k
+INTEGER(8) :: c, r
+IF(.NOT.prof_on)RETURN
+CALL SYSTEM_CLOCK(c, r)
+prof_w0(k) = REAL(c,8)/REAL(r,8)
+CALL CPU_TIME(prof_c0(k))
+END SUBROUTINE prof_tic
+!---------------------------------------------------------------------------------
+!> Stop timing profile section k and accumulate its wall and process CPU time
+!---------------------------------------------------------------------------------
+SUBROUTINE prof_toc(k)
+INTEGER(i4), INTENT(in) :: k
+INTEGER(8) :: c, r
+REAL(r8) :: cpu
+IF(.NOT.prof_on)RETURN
+CALL SYSTEM_CLOCK(c, r)
+CALL CPU_TIME(cpu)
+prof_wall(k) = prof_wall(k) + REAL(c,8)/REAL(r,8) - prof_w0(k)
+prof_cpu(k) = prof_cpu(k) + cpu - prof_c0(k)
+prof_n(k) = prof_n(k) + 1
+END SUBROUTINE prof_toc
+!---------------------------------------------------------------------------------
+!> Print and reset the per-step profile
+!---------------------------------------------------------------------------------
+SUBROUTINE prof_report(w_res_nk, c_res_nk, w_mf_self, c_mf_self)
+REAL(r8), INTENT(in) :: w_res_nk, c_res_nk !< Residual wall/CPU time inside the Newton solve, base update excluded
+REAL(r8), INTENT(in) :: w_mf_self, c_mf_self !< Matrix-free base update wall/CPU time without its residual call
+INTEGER(i4) :: k
+REAL(r8) :: w, c
+WRITE(*,'(A)')' Step profile:                    wall [s]   CPU [s]  CPU/wall  calls'
+DO k=1,nprof
+  IF(prof_n(k)==0)CYCLE
+  WRITE(*,'(2X,A30,2F10.2,F10.2,I7)')prof_names(k),prof_wall(k),prof_cpu(k),prof_cpu(k)/MAX(prof_wall(k),1.d-9),prof_n(k)
+END DO
+w = prof_wall(2)-prof_wall(3)-prof_wall(4); c = prof_cpu(2)-prof_cpu(3)-prof_cpu(4)
+WRITE(*,'(2X,A30,2F10.2,F10.2)')'  = Jacobian copy/F rows',w,c,c/MAX(w,1.d-9)
+w = prof_wall(11)-prof_wall(8)-prof_wall(9)-prof_wall(10); c = prof_cpu(11)-prof_cpu(8)-prof_cpu(9)-prof_cpu(10)
+WRITE(*,'(2X,A30,2F10.2,F10.2)')'  = residual: other',w,c,c/MAX(w,1.d-9)
+w = prof_wall(7)-w_res_nk-w_mf_self; c = prof_cpu(7)-c_res_nk-c_mf_self
+WRITE(*,'(2X,A30,2F10.2,F10.2)')'  = Newton minus residuals (LU)',w,c,c/MAX(w,1.d-9)
+w = prof_wall(15)-SUM(prof_wall((/1,2,5,6,7,13,14/))); c = prof_cpu(15)-SUM(prof_cpu((/1,2,5,6,7,13,14/)))
+WRITE(*,'(2X,A30,2F10.2,F10.2)')'  = step: not in a section',w,c,c/MAX(w,1.d-9)
+FLUSH(6)
+prof_wall = 0.d0; prof_cpu = 0.d0; prof_n = 0
+END SUBROUTINE prof_report
 
 !---------------------------------------------------------
 !> Setup combined MUG and TokaMaker simulation object
@@ -1136,6 +1199,7 @@ REAL(8), INTENT(inout) :: time,dt !< Current time and desired timestep size [s]
 INTEGER(4), INTENT(out) :: nl_its,lin_its,nretry !< Number of nonlinear and linear iterations, and number of retries
 INTEGER(4) :: i,j,nclip,nh
 INTEGER(8) :: c_step0, c_step1, c_jac0, c_rate
+REAL(r8) :: w_res0, c_res0, w_res_nk, c_res_nk
 REAL(r8) :: t_step, t_jac, step_cost, dt_new
 LOGICAL :: rebuilt
 CHARACTER(LEN=12) :: pre_why
@@ -1145,8 +1209,13 @@ CLASS(oft_native_matrix), POINTER :: P => NULL()
 CLASS(oft_matrix), pointer :: pre
 
 current_sim=>self
+prof_on = self%step_profile
+self%prof_mf_w = 0.d0; self%prof_mf_c = 0.d0
+CALL prof_tic(15)
+CALL prof_tic(1)
 CALL SYSTEM_CLOCK(c_step0, c_rate)
 t_jac = 0.d0
+w_res_nk = 0.d0; c_res_nk = 0.d0
 rebuilt = .FALSE.
 pre_why = 'reuse'
 
@@ -1178,6 +1247,7 @@ IF(dt/=self%nlfun%dt)THEN
     END IF
 END IF
 CALL self%tkmr%update()
+CALL prof_toc(1)
 
 !Rebuild approximate jacobian and refactor preconditioner: every pre_freq steps, or with pre_adapt
 !once the last step cost more wall time per simulated second than the average since the last
@@ -1196,7 +1266,9 @@ END IF
 IF(pre_why/='reuse')THEN
     CALL SYSTEM_CLOCK(c_jac0)
     CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
+    CALL prof_tic(5)
     CALL self%pre%update(self%lu_reanalyze .OR. (.NOT.self%lu_analysed))
+    CALL prof_toc(5)
     self%lu_analysed = .TRUE.
     IF((self%pre_nlocal > 0).AND.(.NOT.self%pre_parts_reported))CALL mugtok_report_parts(self)
     self%pre_age=0
@@ -1210,11 +1282,13 @@ END IF
 self%pre_age=self%pre_age+1
 
 !Per-cell temperature-floor source for this step (xmhd_2d T_floor; no-op when off)
+CALL prof_tic(6)
 CALL xmhd_2d_floor_update(self%mug, .FALSE.)
 
 !Build RHS
 CALL self%tmp%add(0.d0,1.d0,self%u)
 CALL apply_rhs_mugtok(self%nlfun,self%u,self%rhs)
+CALL prof_toc(6)
 
 NULLIFY(currs_tmp)
 DO j = 1,4
@@ -1233,7 +1307,11 @@ DO j = 1,4
     END IF
     !Run the nonlinear solver
     dbg_it = 0 ! NLDEBUG
+    w_res0 = prof_wall(11); c_res0 = prof_cpu(11)
+    CALL prof_tic(7)
     CALL self%nksolver%apply(self%u,self%rhs)
+    CALL prof_toc(7)
+    w_res_nk = w_res_nk + prof_wall(11) - w_res0; c_res_nk = c_res_nk + prof_cpu(11) - c_res0
     IF(self%nksolver%cits<0)THEN
         IF(self%resid_dump)CALL mugtok_dump_residual(self, time)
         CALL self%u%add(0.d0,1.d0,self%tmp)
@@ -1315,6 +1393,7 @@ IF(self%pre_adapt .OR. self%dt_adapt)WRITE(*,'(A,ES11.4,A,I3,A,I4,A,F8.1,A,F8.1,
     '  pre: ',TRIM(pre_why)//'  dt_next =',self%dt_next
 
 !---Optional hard temperature floor on the accepted state
+CALL prof_tic(13)
 IF(self%T_clip>0.d0)THEN
     NULLIFY(tmp_arr)
     CALL self%u%get_local(tmp_arr,5)
@@ -1347,6 +1426,8 @@ END DO
 
 !---Capture the historical limiting-flux reference used by the T sink term
 CALL mugtok_update_psi_limiting(self)
+CALL prof_toc(13)
+CALL prof_tic(14)
 
 !---Optionally write a restart file for later plotting
 self%rst_count = self%rst_count + 1
@@ -1360,6 +1441,10 @@ write(*,*) 'Diagnostic b: ', self%mug%nlfun%diag_vals(1)
 write(*,*) 'Diagnostic v: ', self%mug%nlfun%diag_vals(2)
 write(*,*) 'Diagnostic p force: ', self%mug%nlfun%diag_vals(3)
 write(*,*) 'Diagnostic T: ', self%mug%nlfun%diag_vals(4)
+CALL prof_toc(14)
+CALL prof_toc(15)
+IF(prof_on)CALL prof_report(w_res_nk, c_res_nk, self%prof_mf_w, self%prof_mf_c)
+prof_on = .FALSE.
 end subroutine step_mugtok_td
 
 !------------------------------------------------------
@@ -1461,6 +1546,7 @@ class(oft_vector), target, intent(inout) :: a !< Source field
 class(oft_vector), intent(inout) :: b !< Result of metric function
 class(oft_vector), pointer :: tmp_in, tmp_out
 REAL(r8), POINTER, DIMENSION(:) :: tmp_arr1, tmp_arr2, coil_arr
+CALL prof_tic(11)
 
 !----------------------------------------------------------------------------------------
 !Compute TokaMaker contribution (must happen first so f_scale, plasma bounds are updated)
@@ -1488,7 +1574,9 @@ IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
 END IF
 
 !Apply tokamaker LHS
+CALL prof_tic(8)
 CALL self%parent_sim%tkmr%apply_real(tmp_in, tmp_out) 
+CALL prof_toc(8)
 CALL tmp_out%get_local(tmp_arr2, 1) !Put psi LHS into temp vector for adding
 
 !------------------------------------------------------
@@ -1510,10 +1598,14 @@ END IF
 IF(self%parent_sim%mhd_plasma) CALL mugtok_refresh_bounds(self%parent_sim, a)
 
 CALL b%set(0.d0)
+CALL prof_tic(9)
 CALL self%parent_sim%mug%nlfun%apply_real(a,b) !Apply MUG LHS
+CALL prof_toc(9)
 
 !---Add F LHS in the non-MHD regions, which are currently not computed in either code
+CALL prof_tic(10)
 CALL add_f_terms(self, a, b, self%dt)
+CALL prof_toc(10)
 NULLIFY(tmp_arr1)
 CALL b%get_local(tmp_arr1, 6)
 
@@ -1533,6 +1625,7 @@ NULLIFY(tmp_arr2)
 CALL tmp_in%delete()
 CALL tmp_out%delete()
 DEALLOCATE(tmp_in, tmp_out)
+CALL prof_toc(11)
 end subroutine nlfun_apply
 
 !-------------------------------------------------------------------------------------------
@@ -1939,6 +2032,7 @@ INTEGER(4), ALLOCATABLE :: bc_rows(:)
 INTEGER(4) :: nbc_rows, k
 class(oft_vector), pointer :: tmp
 
+CALL prof_tic(2)
 CALL mat%zero !Zero input matrix
 
 !Cast matrices to native types for access to entries 
@@ -1960,12 +2054,16 @@ end select
 
 !Populate MUG and TokaMaker Jacobian matrices
 self%mug%jac_dt = self%nlfun%dt
+CALL prof_tic(3)
 CALL build_approx_jacobian(self%mug, a)
+CALL prof_toc(3)
+CALL prof_tic(4)
 IF (PRESENT(update_vac)) THEN
     IF (update_vac) CALL build_vac_op(self%tkmr,self%tkmr%vac_op)
 ELSE
     CALL build_vac_op(self%tkmr,self%tkmr%vac_op)
 END IF
+CALL prof_toc(4)
 
 !---Zero the plasma_flag rows + F0 row of the MUG Jacobian's By block before
 ! copying, so add_f_jac can define these rows instead
@@ -2072,6 +2170,7 @@ CALL add_f_jac(self, mat)
 CALL self%aug_vec%new(tmp)
 CALL mat%assemble(tmp)
 CALL tmp%delete()
+CALL prof_toc(2)
 
 end subroutine build_mugtok_td_jacobian
 
@@ -2503,7 +2602,13 @@ END SUBROUTINE mugtok_dump_residual
 !---------------------------
 SUBROUTINE mugtok_mfnk_update(a)
 CLASS(oft_vector), TARGET, INTENT(inout) :: a !< Current solution vector
+REAL(r8) :: w_res0, c_res0, w_mf0, c_mf0
+w_res0 = prof_wall(11); c_res0 = prof_cpu(11); w_mf0 = prof_wall(12); c_mf0 = prof_cpu(12)
+CALL prof_tic(12)
 CALL current_sim%mfmat%update(a)
+CALL prof_toc(12)
+current_sim%prof_mf_w = current_sim%prof_mf_w + (prof_wall(12)-w_mf0) - (prof_wall(11)-w_res0)
+current_sim%prof_mf_c = current_sim%prof_mf_c + (prof_cpu(12)-c_mf0) - (prof_cpu(11)-c_res0)
 IF(current_sim%nl_debug)CALL mugtok_nl_debug(current_sim,a) ! NLDEBUG
 END SUBROUTINE mugtok_mfnk_update
 !---------------------------------------------------------------------------------
