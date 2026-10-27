@@ -673,8 +673,10 @@ ALLOCATE(T_weights_loc(oft_blagrange%nce),n_weights_loc(oft_blagrange%nce),&
         psi_weights_loc(oft_blagrange%nce), by_weights_loc(oft_blagrange%nce),&
         vel_weights_loc(3, oft_blagrange%nce))
 ALLOCATE(cell_dofs(oft_blagrange%nce),res_loc(oft_blagrange%nce,7))
-! Unordered: atomic adds (vectors) and row locks (matrix); summation order varies in the last digits
-!$omp do schedule(static)
+! Unordered: atomic adds (vectors) and row locks (matrix); summation order varies in the last digits.
+! Dynamic chunks: the cells a loop skips (other regions) are clustered in the cell numbering, so
+! static blocks leave threads idle
+!$omp do schedule(dynamic,64)
 DO i=1,mesh%nc
   IF(self%parent_sim%ignore_rmask(mesh%reg(i)))CYCLE ! Skip cells in ignored regions
   curved=cell_is_curved(mesh,i) ! Straight cell test
@@ -916,8 +918,10 @@ IF (eta_lag) ALLOCATE(T_eta_loc(oft_blagrange%nce), n_eta_loc(oft_blagrange%nce)
 IF (ohm_on) ALLOCATE(ohm_q_loc(oft_blagrange%nce), ohm_by_loc(oft_blagrange%nce))
 ALLOCATE(cell_dofs(oft_blagrange%nce), res_loc(oft_blagrange%nce,7))
 IF (incomp) ALLOCATE(basis_vals_p(oft_blagrange_p%nce), basis_grads_p(3,oft_blagrange_p%nce), cell_dofs_p(oft_blagrange_p%nce))
-! Unordered: atomic adds (vectors) and row locks (matrix); summation order varies in the last digits
-!$omp do schedule(static)
+! Unordered: atomic adds (vectors) and row locks (matrix); summation order varies in the last digits.
+! Dynamic chunks: the cells a loop skips (other regions) are clustered in the cell numbering, so
+! static blocks leave threads idle
+!$omp do schedule(dynamic,64)
 DO i=1,mesh%nc
   curved=cell_is_curved(mesh,i) ! Straight cell test
   IF(self%parent_sim%ignore_rmask(mesh%reg(i)))CYCLE ! Skip cells in ignored regions
@@ -1919,8 +1923,10 @@ DO ik=1,self%fe_rep%nfields
 END DO
 IF (incomp) iloc(5)%v => cell_dofs_p
 CALL self%fe_rep%mat_setup_local(jac_loc)
-! Unordered: atomic adds (vectors) and row locks (matrix); summation order varies in the last digits
-!$omp do schedule(static)
+! Unordered: atomic adds (vectors) and row locks (matrix); summation order varies in the last digits.
+! Dynamic chunks: the cells a loop skips (other regions) are clustered in the cell numbering, so
+! static blocks leave threads idle
+!$omp do schedule(dynamic,64)
 DO i=1,mesh%nc
   IF(self%ignore_rmask(mesh%reg(i)))CYCLE ! Skip cells in ignored regions
   curved=cell_is_curved(mesh,i) ! Straight cell test

@@ -1676,8 +1676,10 @@ REAL(r8), ALLOCATABLE :: basis_vals(:), basis_grads(:,:), by_weights_loc(:), res
 !$omp   basis_vals,basis_grads,by_weights_loc,res_loc)
 ALLOCATE(basis_vals(lag_rep%nce), basis_grads(3,lag_rep%nce))
 ALLOCATE(by_weights_loc(lag_rep%nce), cell_dofs(lag_rep%nce), res_loc(lag_rep%nce))
-! Unordered: atomic adds (vectors) and row locks (matrix); summation order varies in the last digits
-!$omp do schedule(static)
+! Unordered: atomic adds (vectors) and row locks (matrix); summation order varies in the last digits.
+! Dynamic chunks: the cells a loop skips (other regions) are clustered in the cell numbering, so
+! static blocks leave threads idle
+!$omp do schedule(dynamic,64)
 DO i=1,mesh%nc
   !---Only the non-MHD regions (those the MUG solve ignores)
   IF(.NOT.self%parent_sim%mug%ignore_rmask(mesh%reg(i)))CYCLE
