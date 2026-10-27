@@ -123,6 +123,7 @@ REAL(r8) :: dt_post = 5.d-4 !< Nominal post-kick timestep [s] (kick_phase 2); al
 INTEGER(i4) :: dt_grow_steps = 0 !< If > 0: after this many consecutive steps with no retry, double dt again (capped at the phase's nominal dt), so a dt halved by step() retries can recover; 0 = never (dt stays reduced)
 LOGICAL :: pre_adapt = .FALSE. !< Post-kick (phase 2) only: cost-based preconditioner refresh instead of pre_freq (oft_mugtok_td%pre_adapt)
 INTEGER(i4) :: pre_max_age = 0 !< With pre_adapt: also rebuild after this many steps (0: no limit)
+REAL(r8) :: pre_its_ratio = 1.5d0 !< With pre_adapt: also rebuild once a reused-preconditioner step needs more than this times the GMRES iterations of the first step after the last rebuild (oft_mugtok_td%pre_its_ratio; <= 0: off)
 REAL(r8) :: dt_refactor_tol = 0.d0 !< dt changes within this relative distance of the preconditioner's dt rebuild only the vacuum operator (oft_mugtok_td%dt_refactor_tol; 0: every dt change rebuilds)
 LOGICAL :: dt_adapt = .FALSE. !< Adaptive dt in the phases with a nominal dt cap (oft_mugtok_td%dt_adapt; replaces dt_grow_steps there): dt targets lin_its_target GMRES iterations per step, at most the phase's nominal dt. dt_min_frac then also stops a run whose controller drives dt below dt_min_frac x that cap
 INTEGER(i4) :: lin_its_target = 20 !< With dt_adapt: target GMRES iterations per step
@@ -161,7 +162,7 @@ CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,lin_rtol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
-  dt_refactor_tol,pre_adapt,pre_max_age,dt_adapt,lin_its_target,dt_hist,step_profile, &
+  dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile, &
   T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq
 !------------------------------------------------------------------------------
 ! Initialize enviroment
@@ -370,12 +371,13 @@ b_sim%lu_reanalyze = lu_reanalyze
 WRITE(*,'(A,L2)')' Redo the LU symbolic analysis at every rebuild (lu_reanalyze): ',lu_reanalyze
 b_sim%dt_refactor_tol = dt_refactor_tol
 b_sim%pre_max_age = pre_max_age
+b_sim%pre_its_ratio = pre_its_ratio
 b_sim%lin_its_target = lin_its_target
 b_sim%dt_hist = dt_hist
 b_sim%step_profile = step_profile
 WRITE(*,'(A,L2)')' Per-step profile (step_profile):',step_profile
-WRITE(*,'(A,L2,A,I4,A,ES10.2)')' Cost-based preconditioner refresh (pre_adapt):',pre_adapt,'  pre_max_age',pre_max_age, &
-  '  dt_refactor_tol',dt_refactor_tol
+WRITE(*,'(A,L2,A,I4,A,F6.2,A,ES10.2)')' Cost-based preconditioner refresh (pre_adapt):',pre_adapt,'  pre_max_age',pre_max_age, &
+  '  pre_its_ratio',pre_its_ratio,'  dt_refactor_tol',dt_refactor_tol
 WRITE(*,'(A,L2,A,I4,A,I4)')' Adaptive dt (dt_adapt):',dt_adapt,'  lin_its_target',lin_its_target,'  dt_hist',dt_hist
 WRITE(*,'(A,L2)')' Ohmic heating in the temperature equation (ohmic_heating): ',ohmic_heating
 

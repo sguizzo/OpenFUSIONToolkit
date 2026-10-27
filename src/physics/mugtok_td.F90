@@ -76,7 +76,10 @@ REAL(r8) :: pre_cyc_time = 0.d0 !< With pre_adapt: wall time [s] of the steps si
 REAL(r8) :: pre_cyc_dt = 0.d0 !< With pre_adapt: simulated time [s] of the steps since the last rebuild
 REAL(r8) :: pre_last_cost = 0.d0 !< With pre_adapt: wall time per simulated second of the last step
 INTEGER(i4) :: pre_cyc_n = 0 !< With pre_adapt: steps since the last rebuild
-LOGICAL :: dt_adapt = .FALSE. !< Adaptive dt: after each step set dt_next = lin_its_target*sum(dt)/sum(GMRES its) over the last dt_hist steps (xmhd.F90 scheme), growth <= dt_grow_max per step, decrease >= dt_shrink_min per step, capped at dt_max. The driver applies dt_next
+REAL(r8) :: pre_its_ratio = 1.5d0 !< With pre_adapt: also rebuild once a step with the reused preconditioner needed more than this times the GMRES iterations of the first step after the last rebuild (catches the fast loss of a stale LU before an expensive step; <= 0: off)
+INTEGER(i4) :: pre_cyc_its0 = 0 !< With pre_adapt: GMRES iterations of the first step after the last rebuild
+INTEGER(i4) :: pre_last_its = 0 !< With pre_adapt: GMRES iterations of the last step
+LOGICAL :: dt_adapt = .FALSE. !< Adaptive dt: after each step set dt_next = lin_its_target*sum(dt)/sum(GMRES its) over the last dt_hist steps that started with a freshly rebuilt preconditioner (xmhd.F90 scheme; steps with a reused one are left out, so the GMRES growth of an aging LU does not shrink dt), growth <= dt_grow_max per step, decrease >= dt_shrink_min per step, capped at dt_max. The driver applies dt_next
 INTEGER(i4) :: lin_its_target = 20 !< With dt_adapt: target GMRES iterations per step
 INTEGER(i4) :: dt_hist = 5 !< With dt_adapt: number of steps in the dt/GMRES history (at most 50)
 REAL(r8) :: dt_max = 0.d0 !< With dt_adapt: largest dt [s] (0: no cap)
@@ -1259,6 +1262,9 @@ ELSE IF(self%pre_adapt)THEN
         pre_why = 'max age'
     ELSE IF(self%pre_cyc_n>=2 .AND. self%pre_last_cost>self%pre_cyc_time/self%pre_cyc_dt)THEN
         pre_why = 'cost'
+    ELSE IF(self%pre_its_ratio>0.d0 .AND. self%pre_cyc_n>=2 .AND. &
+        REAL(self%pre_last_its,8)>self%pre_its_ratio*REAL(self%pre_cyc_its0,8))THEN
+        pre_why = 'GMRES growth'
     END IF
 ELSE IF(self%pre_age>=MAX(1,self%pre_freq))THEN
     pre_why = 'pre_freq'
@@ -1357,10 +1363,12 @@ lin_its=self%nksolver%lits
 CALL SYSTEM_CLOCK(c_step1)
 t_step = REAL(c_step1-c_step0,8)/REAL(c_rate,8)
 step_cost = t_step/dt
+self%pre_last_its = lin_its
 IF(rebuilt)THEN
     self%pre_cyc_time = t_step
     self%pre_cyc_dt = dt
     self%pre_cyc_n = 1
+    self%pre_cyc_its0 = lin_its
 ELSE
     self%pre_cyc_time = self%pre_cyc_time + t_step
     self%pre_cyc_dt = self%pre_cyc_dt + dt
@@ -1371,12 +1379,16 @@ self%dt_next = dt
 IF(self%dt_adapt)THEN
     IF(nretry>0)self%dt_nhist = 0 ! retries: restart the history from this step
     nh = MAX(1,MIN(self%dt_hist,SIZE(self%dt_hist_dt)))
-    self%dt_hist_dt(2:nh) = self%dt_hist_dt(1:nh-1)
-    self%dt_hist_its(2:nh) = self%dt_hist_its(1:nh-1)
-    self%dt_hist_dt(1) = dt
-    self%dt_hist_its(1) = lin_its
-    self%dt_nhist = MIN(self%dt_nhist+1,nh)
-    IF(SUM(self%dt_hist_its(1:self%dt_nhist))>0)THEN
+    IF(rebuilt)THEN ! only steps with a fresh preconditioner enter the history
+        self%dt_hist_dt(2:nh) = self%dt_hist_dt(1:nh-1)
+        self%dt_hist_its(2:nh) = self%dt_hist_its(1:nh-1)
+        self%dt_hist_dt(1) = dt
+        self%dt_hist_its(1) = lin_its
+        self%dt_nhist = MIN(self%dt_nhist+1,nh)
+    END IF
+    IF(self%dt_nhist==0)THEN
+        dt_new = dt
+    ELSE IF(SUM(self%dt_hist_its(1:self%dt_nhist))>0)THEN
         dt_new = REAL(self%lin_its_target,8)*SUM(self%dt_hist_dt(1:self%dt_nhist)) &
             /REAL(SUM(self%dt_hist_its(1:self%dt_nhist)),8)
     ELSE
