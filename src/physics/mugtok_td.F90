@@ -1676,7 +1676,8 @@ REAL(r8), ALLOCATABLE :: basis_vals(:), basis_grads(:,:), by_weights_loc(:), res
 !$omp   basis_vals,basis_grads,by_weights_loc,res_loc)
 ALLOCATE(basis_vals(lag_rep%nce), basis_grads(3,lag_rep%nce))
 ALLOCATE(by_weights_loc(lag_rep%nce), cell_dofs(lag_rep%nce), res_loc(lag_rep%nce))
-!$omp do ordered
+! Unordered: atomic adds (vectors) and row locks (matrix); summation order varies in the last digits
+!$omp do schedule(static)
 DO i=1,mesh%nc
   !---Only the non-MHD regions (those the MUG solve ignores)
   IF(.NOT.self%parent_sim%mug%ignore_rmask(mesh%reg(i)))CYCLE
@@ -1708,13 +1709,11 @@ DO i=1,mesh%nc
     END DO
   END DO
   !---Add local values to the full residual vector
-  !$omp ordered
   DO jr=1,lag_rep%nce
     IF(self%parent_sim%mug%by_bc(cell_dofs(jr))) CYCLE !Dirichlet F rows keep the MUG Dirichlet residual
     !$omp atomic
     by_res(cell_dofs(jr)) = by_res(cell_dofs(jr)) + res_loc(jr)
   END DO
-  !$omp end ordered
 END DO
 DEALLOCATE(basis_vals,basis_grads,by_weights_loc,cell_dofs,res_loc)
 !$omp end parallel
