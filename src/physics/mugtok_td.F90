@@ -69,6 +69,23 @@ LOGICAL :: lu_reanalyze = .FALSE. !< Redo the LU symbolic analysis (ordering) at
 LOGICAL :: lu_analysed = .FALSE. !< The preconditioner's LU has had its symbolic analysis (first rebuild). Needed because pre%update(new_pattern) overwrites the solver's update_graph flag even before its first factorization, so the first rebuild must request the analysis explicitly
 INTEGER(i4) :: pre_age = 0 !< Number of steps since the approximate Jacobian/preconditioner was last rebuilt
 LOGICAL :: pre_force_update = .TRUE. !< Force a Jacobian/preconditioner rebuild on the next step (set after changing physics coefficients, e.g. nu, m_i, kappa)
+REAL(r8) :: dt_refactor_tol = 0.d0 !< If > 0: a dt change within this relative distance of the dt of the current preconditioner (mug%jac_dt) only rebuilds the vacuum operator, the residual's one dt-dependent matrix, and keeps the preconditioner; larger changes rebuild it. 0 (default): every dt change rebuilds
+LOGICAL :: pre_adapt = .FALSE. !< Cost-based preconditioner refresh (replaces pre_freq): rebuild once the last step's wall time per simulated second exceeds the average since the last rebuild (which includes the rebuild's cost)
+INTEGER(i4) :: pre_max_age = 0 !< With pre_adapt: also rebuild after this many steps (0: no limit)
+REAL(r8) :: pre_cyc_time = 0.d0 !< With pre_adapt: wall time [s] of the steps since the last rebuild
+REAL(r8) :: pre_cyc_dt = 0.d0 !< With pre_adapt: simulated time [s] of the steps since the last rebuild
+REAL(r8) :: pre_last_cost = 0.d0 !< With pre_adapt: wall time per simulated second of the last step
+INTEGER(i4) :: pre_cyc_n = 0 !< With pre_adapt: steps since the last rebuild
+LOGICAL :: dt_adapt = .FALSE. !< Adaptive dt: after each step set dt_next = lin_its_target*sum(dt)/sum(GMRES its) over the last dt_hist steps (xmhd.F90 scheme), growth <= dt_grow_max per step, decrease >= dt_shrink_min per step, capped at dt_max. The driver applies dt_next
+INTEGER(i4) :: lin_its_target = 20 !< With dt_adapt: target GMRES iterations per step
+INTEGER(i4) :: dt_hist = 5 !< With dt_adapt: number of steps in the dt/GMRES history (at most 50)
+REAL(r8) :: dt_max = 0.d0 !< With dt_adapt: largest dt [s] (0: no cap)
+REAL(r8) :: dt_grow_max = 1.25d0 !< With dt_adapt: largest dt increase factor per step
+REAL(r8) :: dt_shrink_min = 0.5d0 !< With dt_adapt: smallest dt decrease factor per step
+REAL(r8) :: dt_next = 0.d0 !< With dt_adapt: dt for the next step (output of step)
+INTEGER(i4) :: dt_nhist = 0 !< With dt_adapt: steps in the history (set 0 to reset it, e.g. on a phase change)
+REAL(r8) :: dt_hist_dt(50) = 0.d0 !< With dt_adapt: dt of the last dt_nhist steps (most recent first)
+INTEGER(i4) :: dt_hist_its(50) = 0 !< With dt_adapt: GMRES iterations of the last dt_nhist steps (most recent first)
 REAL(r8) :: T_clip = -1.d0 !< If > 0, hard temperature floor [eV]: after each accepted step, T DOFs (field 5) below T_clip are set to T_clip. Not energy conserving and outside the Newton solve; off by default
 LOGICAL :: resid_dump = .FALSE. !< If true, write the Newton residual F(u)-rhs of each failed Newton attempt (fields 1-7, plus the iterate's V and T) as a time step of the XDMF group "mugtok_resid" in resid_dump/oft_xdmf.*.h5 (at most 8 per run)
 INTEGER(i4) :: n_resid_dumps = 0 !< Residual dumps written so far
@@ -1117,13 +1134,21 @@ CLASS(oft_mugtok_td), target, intent(inout) :: self !< Simulation object
 REAL(r8), INTENT(in) :: coil_currents(:) !< Prescribed I-coil currents for this step (size ncoils)
 REAL(8), INTENT(inout) :: time,dt !< Current time and desired timestep size [s]
 INTEGER(4), INTENT(out) :: nl_its,lin_its,nretry !< Number of nonlinear and linear iterations, and number of retries
-INTEGER(4) :: i,j,nclip
+INTEGER(4) :: i,j,nclip,nh
+INTEGER(8) :: c_step0, c_step1, c_jac0, c_rate
+REAL(r8) :: t_step, t_jac, step_cost, dt_new
+LOGICAL :: rebuilt
+CHARACTER(LEN=12) :: pre_why
 REAL(r8), pointer :: tmp_arr(:), currs_tmp(:)
 CLASS(oft_vector), pointer :: tmp_vec
 CLASS(oft_native_matrix), POINTER :: P => NULL()
 CLASS(oft_matrix), pointer :: pre
 
 current_sim=>self
+CALL SYSTEM_CLOCK(c_step0, c_rate)
+t_jac = 0.d0
+rebuilt = .FALSE.
+pre_why = 'reuse'
 
 !Flux normalization for a psi-keyed SOL viscosity (xmhd_2d visc_sol_on_psi): [LCFS, axis] of the current state
 self%mug%psi_norm_bounds = self%tkmr%gs_equil%plasma_bounds
@@ -1136,25 +1161,49 @@ CALL xmhd_2d_freeze_ohmic(self%mug, self%u)
 !Update plasma time advance operator
 CALL self%tkmr%update()
 
-!Update timestep if it has changed since setup (the vacuum operator used in the
-!residual depends on dt, so a dt change always forces a rebuild)
+!Update timestep if it has changed since setup. The residual depends on dt only through the
+!vacuum operator (tkmr%vac_op): with dt_refactor_tol > 0 a small change rebuilds just that
+!operator and keeps the preconditioner (built at mug%jac_dt); otherwise it forces a rebuild
 IF(dt/=self%nlfun%dt)THEN
     dt=ABS(dt)
     self%nlfun%dt=dt
     self%mug%dt = dt
     self%tkmr%dt=dt
-    self%pre_force_update=.TRUE.
+    IF(self%dt_refactor_tol>0.d0 .AND. self%mug%jac_dt>0.d0 .AND. &
+        ABS(dt-self%mug%jac_dt)<=self%dt_refactor_tol*self%mug%jac_dt)THEN
+        CALL build_vac_op(self%tkmr,self%tkmr%vac_op)
+    ELSE
+        self%pre_force_update=.TRUE.
+        pre_why = 'dt change'
+    END IF
 END IF
 CALL self%tkmr%update()
 
-!Rebuild approximate jacobian and refactor preconditioner every pre_freq steps
-IF(self%pre_force_update .OR. self%pre_age>=MAX(1,self%pre_freq))THEN
+!Rebuild approximate jacobian and refactor preconditioner: every pre_freq steps, or with pre_adapt
+!once the last step cost more wall time per simulated second than the average since the last
+!rebuild (rebuild included), or after pre_max_age steps
+IF(self%pre_force_update)THEN
+    IF(pre_why=='reuse')pre_why = 'forced'
+ELSE IF(self%pre_adapt)THEN
+    IF(self%pre_max_age>0 .AND. self%pre_age>=self%pre_max_age)THEN
+        pre_why = 'max age'
+    ELSE IF(self%pre_cyc_n>=2 .AND. self%pre_last_cost>self%pre_cyc_time/self%pre_cyc_dt)THEN
+        pre_why = 'cost'
+    END IF
+ELSE IF(self%pre_age>=MAX(1,self%pre_freq))THEN
+    pre_why = 'pre_freq'
+END IF
+IF(pre_why/='reuse')THEN
+    CALL SYSTEM_CLOCK(c_jac0)
     CALL build_mugtok_td_jacobian(self, self%nlfun%jac_op, self%u, update_vac = .TRUE.)
     CALL self%pre%update(self%lu_reanalyze .OR. (.NOT.self%lu_analysed))
     self%lu_analysed = .TRUE.
     IF((self%pre_nlocal > 0).AND.(.NOT.self%pre_parts_reported))CALL mugtok_report_parts(self)
     self%pre_age=0
     self%pre_force_update=.FALSE.
+    rebuilt = .TRUE.
+    CALL SYSTEM_CLOCK(c_step1)
+    t_jac = REAL(c_step1-c_jac0,8)/REAL(c_rate,8)
 ELSE
     WRITE(*,'(A,I4,A)')' Reusing preconditioner (age ',self%pre_age,' steps)'
 END IF
@@ -1196,6 +1245,8 @@ DO j = 1,4
             CALL self%pre%update(self%lu_reanalyze .OR. (.NOT.self%lu_analysed))
             self%lu_analysed = .TRUE.
             self%pre_age=1
+            rebuilt = .TRUE.
+            pre_why = 'retry'
             CYCLE
         END IF
         self%nlfun%dt=self%nlfun%dt/2.d0
@@ -1206,6 +1257,8 @@ DO j = 1,4
         CALL self%pre%update(self%lu_reanalyze .OR. (.NOT.self%lu_analysed))
         self%lu_analysed = .TRUE.
         self%pre_age=1
+        rebuilt = .TRUE.
+        pre_why = 'retry dt/2'
         CALL apply_rhs_mugtok(self%nlfun,self%u,self%rhs)
         CYCLE
     ELSE
@@ -1220,6 +1273,46 @@ time=time+self%nlfun%dt
 dt=self%nlfun%dt
 nl_its=self%nksolver%nlits
 lin_its=self%nksolver%lits
+
+!---Cost bookkeeping for pre_adapt (a step that rebuilt the preconditioner starts a new cycle;
+! with retries its time includes the failed attempts) and the dt_adapt controller
+CALL SYSTEM_CLOCK(c_step1)
+t_step = REAL(c_step1-c_step0,8)/REAL(c_rate,8)
+step_cost = t_step/dt
+IF(rebuilt)THEN
+    self%pre_cyc_time = t_step
+    self%pre_cyc_dt = dt
+    self%pre_cyc_n = 1
+ELSE
+    self%pre_cyc_time = self%pre_cyc_time + t_step
+    self%pre_cyc_dt = self%pre_cyc_dt + dt
+    self%pre_cyc_n = self%pre_cyc_n + 1
+END IF
+self%pre_last_cost = step_cost
+self%dt_next = dt
+IF(self%dt_adapt)THEN
+    IF(nretry>0)self%dt_nhist = 0 ! retries: restart the history from this step
+    nh = MAX(1,MIN(self%dt_hist,SIZE(self%dt_hist_dt)))
+    self%dt_hist_dt(2:nh) = self%dt_hist_dt(1:nh-1)
+    self%dt_hist_its(2:nh) = self%dt_hist_its(1:nh-1)
+    self%dt_hist_dt(1) = dt
+    self%dt_hist_its(1) = lin_its
+    self%dt_nhist = MIN(self%dt_nhist+1,nh)
+    IF(SUM(self%dt_hist_its(1:self%dt_nhist))>0)THEN
+        dt_new = REAL(self%lin_its_target,8)*SUM(self%dt_hist_dt(1:self%dt_nhist)) &
+            /REAL(SUM(self%dt_hist_its(1:self%dt_nhist)),8)
+    ELSE
+        dt_new = self%dt_grow_max*dt
+    END IF
+    dt_new = MAX(MIN(dt_new,self%dt_grow_max*dt),self%dt_shrink_min*dt)
+    IF(nretry>0)dt_new = MIN(dt_new,dt) ! no growth right after a failure
+    IF(self%dt_max>0.d0)dt_new = MIN(dt_new,self%dt_max)
+    self%dt_next = dt_new
+END IF
+IF(self%pre_adapt .OR. self%dt_adapt)WRITE(*,'(A,ES11.4,A,I3,A,I4,A,F8.1,A,F8.1,A,ES10.3,A,ES10.3,A,I4,2A,ES11.4)') &
+    ' Step summary: dt =',dt,'  Newton',nl_its,'  GMRES',lin_its,'  wall',t_step,' s  jac+pre',t_jac, &
+    ' s  cost',step_cost,' s/s  cycle avg',self%pre_cyc_time/self%pre_cyc_dt,' s/s  LU age',self%pre_age, &
+    '  pre: ',TRIM(pre_why)//'  dt_next =',self%dt_next
 
 !---Optional hard temperature floor on the accepted state
 IF(self%T_clip>0.d0)THEN
