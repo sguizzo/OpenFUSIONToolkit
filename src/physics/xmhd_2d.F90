@@ -198,6 +198,7 @@ TYPE, public :: oft_xmhd_2d_sim
   PROCEDURE :: rst_load => rst_load
 END TYPE oft_xmhd_2d_sim
 TYPE(oft_xmhd_2d_sim), POINTER :: current_sim => NULL() !Active 2D MHD simulation
+REAL(r8), PUBLIC :: spitzer_fac = 1.d0 !< Factor on the Spitzer coefficient in spitzer_eta (applied before the cap). 1 = the perpendicular coefficient 1.03e-4*Z*lnLam used so far; 0.511 = parallel Spitzer (the 0.51 Spitzer-Harm factor for Z=1), which is what M3D-C1's eta field shows (eta_C1 = 0.511 x this formula, 2026-10-27)
 !
 CLASS(multigrid_mesh), POINTER :: mg_mesh => NULL() !< Multigrid mesh object
 CLASS(oft_bmesh), POINTER, PUBLIC :: mesh => NULL() !< Current mesh level
@@ -1605,7 +1606,7 @@ dT = T - T_off
 capped = .TRUE.
 eta_phys = eta_cap
 IF(dT > 0.d0)THEN
-  eta_phys = C_sp/dT**1.5d0
+  eta_phys = spitzer_fac*C_sp/dT**1.5d0
   IF(eta_phys < eta_cap)THEN
     capped = .FALSE.
   ELSE

@@ -38,6 +38,7 @@ USE oft_lag_basis, ONLY: oft_lag_setup,oft_scalar_bfem, oft_blag_eval, oft_blag_
 USE fem_base, ONLY: oft_ml_fem_type
 USE mugtok_td
 USE oft_lu, ONLY: oft_lusolver
+USE xmhd_2d, ONLY: spitzer_fac_2d => spitzer_fac
 USE oft_native_solvers, ONLY: oft_bjprecond
 
 IMPLICIT NONE
@@ -136,6 +137,7 @@ REAL(r8) :: T_offset = 7.8d0 !< Temperature offset [eV]
 REAL(r8) :: p_axis_eq, p_axis_nT !< Equilibrium vs. 2*k*n*T pressure on axis [Pa] (diagnostic)
 REAL(r8) :: lin_tol = 1.d-7 !< Absolute tolerance of the linear (GMRES) solve (set in oft.in group sparc_vde_options)
 REAL(r8) :: lin_rtol = 1.d-14 !< Relative tolerance of the linear (GMRES) solve, |r|/|r0| (mugtok_td lin_rtol): GMRES stops at whichever of lin_tol / lin_rtol is met first. Default: off (absolute lin_tol only)
+REAL(r8) :: spitzer_fac = 1.d0 !< Factor on the Spitzer resistivity coefficient (xmhd_2d spitzer_fac): 1 = perpendicular Spitzer (runs before 2026-10-27), 0.511 = parallel Spitzer as in M3D-C1
 REAL(r8) :: nl_tol = 1.d-6 !< Absolute tolerance on the Newton residual |F| (set in oft.in group sparc_vde_options). Newton stalls at a round-off floor that rises at lower mass_scale (~5e-7 at mass_scale 1000, ~1-3e-6 at 100 for dt 0.5 ms); if nl_tol is below that floor every step fails and is retried with dt halved
 REAL(r8) :: mf_b0 = 1.d-3 !< Relative finite-difference step of the matrix-free Jacobian-vector product (oft_mf_matrix%b0; mugtok_td sets 1e-3, other OFT solvers 1e-5)
 REAL(r8) :: T_clip = -1.d0 !< Hard temperature floor [eV] on the accepted state after every step (oft_mugtok_td%T_clip); <= 0 disables
@@ -151,7 +153,7 @@ TYPE(oft_mugtok_td):: b_sim
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,lin_rtol,nl_tol,mf_b0,T_clip, &
-  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
+  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq
 !------------------------------------------------------------------------------
 ! Initialize enviroment
@@ -352,6 +354,8 @@ b_sim%pre_nlocal = pre_nlocal
 b_sim%pre_overlap = pre_overlap
 b_sim%pre_part = pre_part
 b_sim%lin_rtol = lin_rtol
+spitzer_fac_2d = spitzer_fac
+WRITE(*,'(A,F8.4)')' Spitzer resistivity factor (spitzer_fac; 1 = perpendicular, 0.511 = parallel as M3D-C1):',spitzer_fac
 CALL b_sim%setup_mhd(equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg=eta_reg, kappa_reg=kappa_reg, mass_scale=mass_scale_kick, D_reg=D_reg, toroidal_flow = .FALSE.)
 b_sim%mug%ohmic = ohmic_heating
 b_sim%lu_reanalyze = lu_reanalyze
