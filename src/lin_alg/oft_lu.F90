@@ -440,6 +440,11 @@ IF(.NOT.self%initialized)THEN
       ALLOCATE(self%pardiso_struct%perm(A_native%nr))
       self%pardiso_struct%iparm(1)=1
       self%pardiso_struct%iparm(27)=1
+      ! EXPERIMENTAL (2026-10-27): threaded PARDISO. iparm(1) stays 1 on later calls (0 would reset every
+      ! iparm to the defaults), so these settings hold for every refactor and solve
+      self%pardiso_struct%iparm(24)=1 ! Two-level parallel factorization
+      self%pardiso_struct%iparm(25)=1 ! Parallel forward/backward solve
+      self%pardiso_struct%msglvl=1 ! Statistics for the first factorization and solve only
 #else
       CALL oft_abort('OFT not compiled with MKL-PARDISO','lusolver_apply',__FILE__)
 #endif
@@ -620,21 +625,19 @@ CASE("superd")
         mat_vals,A_native%kr,A_native%lc,self%pardiso_struct%perm, &
         nrhs,self%pardiso_struct%iparm,self%pardiso_struct%msglvl,b,vals,ierr)
       IF(ierr/=0)CALL oft_abort('Factorization failed (MKL-PARDISO)','lusolver_apply',__FILE__)
-      self%pardiso_struct%iparm(1)=0
       self%pardiso_struct%iparm(27)=0
       self%refactor=.FALSE.
       self%update_graph=.FALSE.
     END IF
     mode=33
-    IF(self%iter_refine)THEN
-      self%pardiso_struct%iparm(8)=0
-    ELSE
-      self%pardiso_struct%iparm(8)=1
-    END IF
+    ! EXPERIMENTAL: iparm(8) = 0 (refine only after perturbed pivots) in both cases, which is what every
+    ! solve used before, when iparm(1) = 0 replaced it with the default; 1 would add a refinement step per solve
+    self%pardiso_struct%iparm(8)=0
     CALL pardiso(self%pardiso_struct%pt,1,1,self%pardiso_struct%mtype,mode,A_native%nr, &
       mat_vals,A_native%kr,A_native%lc,self%pardiso_struct%perm, &
       nrhs,self%pardiso_struct%iparm,self%pardiso_struct%msglvl,b,vals,ierr)
     IF(ierr/=0)CALL oft_abort('Solve failed (MKL-PARDISO)','lusolver_apply',__FILE__)
+    self%pardiso_struct%msglvl=0
     DEALLOCATE(b)
 #else
     CALL oft_abort('OFT not compiled with MKL-PARDISO','lusolver_apply',__FILE__)
