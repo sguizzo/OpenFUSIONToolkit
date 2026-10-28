@@ -60,6 +60,7 @@ LOGICAL, ALLOCATABLE, DIMENSION(:) :: plasma_flag !< True for DOFs in or on the 
 REAL(r8) :: psi_limiting = 0.d0 !< Edge (LCFS) poloidal flux captured the first time the plasma is limited (not diverted); set once and never overwritten thereafter. See mugtok_update_psi_limiting/mugtok_apply_sink
 LOGICAL :: psi_limiting_set = .FALSE. !< True once `psi_limiting` has been captured
 INTEGER(i4) :: F0_node = 0 !< Index of the first plasma_flag=.TRUE. DOF, used to evolve F0 (0 if none)
+INTEGER(i4) :: coil_ind = 8 !< Block index of the coil currents in the augmented vector (fe_rep%nfields+1, set in setup)
 REAL(r8) :: f_scale_prev = 1.d0 !< FF' scale (tkmr%f_scale) from previous timestep
 CLASS(flux_func), POINTER :: I_prev => NULL() !< FF' profile (gs_equil%I) from previous timestep
 LOGICAL :: mhd_plasma = .FALSE. !< True when the plasma (region 1) is evolved with MHD (set by setup_mhd)
@@ -400,26 +401,17 @@ self%mug => mhd_sim
 ! Create solver fields, augmented with coil currents for compatibility with TokaMaker
 !------------------------------------------------------------------------------------
 self%fe_rep => self%mug%fe_rep
+self%coil_ind = self%fe_rep%nfields + 1 !Coil currents follow the MUG fields in the augmented vector
 
 !---Create augmented vector
 IF (self%tkmr%gs_device%ncoils > 0) THEN
-    ALLOCATE(stitch_tmp(8),map_tmp(8))
-    stitch_tmp(1)%s=>self%fe_rep%fields(1)%fe%linkage
-    map_tmp(1)%m=>self%fe_rep%fields(1)%fe%map
-    stitch_tmp(2)%s=>self%fe_rep%fields(2)%fe%linkage
-    map_tmp(2)%m=>self%fe_rep%fields(2)%fe%map
-    stitch_tmp(3)%s=>self%fe_rep%fields(3)%fe%linkage
-    map_tmp(3)%m=>self%fe_rep%fields(3)%fe%map
-    stitch_tmp(4)%s=>self%fe_rep%fields(4)%fe%linkage
-    map_tmp(4)%m=>self%fe_rep%fields(4)%fe%map
-    stitch_tmp(5)%s=>self%fe_rep%fields(5)%fe%linkage
-    map_tmp(5)%m=>self%fe_rep%fields(5)%fe%map
-    stitch_tmp(6)%s=>self%fe_rep%fields(6)%fe%linkage
-    map_tmp(6)%m=>self%fe_rep%fields(6)%fe%map
-    stitch_tmp(7)%s=>self%fe_rep%fields(7)%fe%linkage
-    map_tmp(7)%m=>self%fe_rep%fields(7)%fe%map
-    stitch_tmp(8)%s=>self%tkmr%gs_device%coil_stitch
-    map_tmp(8)%m=>self%tkmr%gs_device%coil_map
+    ALLOCATE(stitch_tmp(self%coil_ind),map_tmp(self%coil_ind))
+    DO i=1,self%fe_rep%nfields
+        stitch_tmp(i)%s=>self%fe_rep%fields(i)%fe%linkage
+        map_tmp(i)%m=>self%fe_rep%fields(i)%fe%map
+    END DO
+    stitch_tmp(self%coil_ind)%s=>self%tkmr%gs_device%coil_stitch
+    map_tmp(self%coil_ind)%m=>self%tkmr%gs_device%coil_map
     CALL create_vector(self%aug_vec,stitch_tmp,map_tmp)
     DEALLOCATE(stitch_tmp,map_tmp)
     CALL self%aug_vec%new(self%u)
@@ -448,13 +440,13 @@ NULLIFY(tmp_arr, vals_out)
 CALL self%tkmr%gs_device%fe_rep%vec_create(tmp_vec)
 CALL tmp_vec%add(0.d0,1.d0,self%tkmr%gs_equil%psi) ! tmp_vec = total poloidal flux
 IF (self%tkmr%gs_device%ncoils > 0) THEN
-    CALL self%u%get_local(vals_out,8)
+    CALL self%u%get_local(vals_out,self%coil_ind)
     DO i=1,self%tkmr%gs_device%ncoils
         !---Subtract the coil (vacuum) flux, leaving the plasma poloidal flux for field 6
         CALL tmp_vec%add(1.d0,-self%tkmr%gs_equil%coil_currs(i),self%tkmr%gs_device%psi_coil(i)%f)
         vals_out(i)=self%tkmr%gs_equil%coil_currs(i)
     END DO
-    CALL self%u%restore_local(vals_out,8)
+    CALL self%u%restore_local(vals_out,self%coil_ind)
     DEALLOCATE(vals_out)
 END IF
 CALL tmp_vec%get_local(tmp_arr)
@@ -556,9 +548,9 @@ END IF
 
 !--- Add dense blocks for coil coupling if coils are present
 IF(self%tkmr%gs_device%ncoils > 0)THEN
-    CALL create_dense_graph(graphs(8,6)%g,self%tkmr%gs_device%coil_vec,tmp_vec)
-    CALL create_dense_graph(graphs(6,8)%g,tmp_vec,self%tkmr%gs_device%coil_vec)
-    CALL create_dense_graph(graphs(8,8)%g,self%tkmr%gs_device%coil_vec,self%tkmr%gs_device%coil_vec)
+    CALL create_dense_graph(graphs(self%coil_ind,6)%g,self%tkmr%gs_device%coil_vec,tmp_vec)
+    CALL create_dense_graph(graphs(6,self%coil_ind)%g,tmp_vec,self%tkmr%gs_device%coil_vec)
+    CALL create_dense_graph(graphs(self%coil_ind,self%coil_ind)%g,self%tkmr%gs_device%coil_vec,self%tkmr%gs_device%coil_vec)
 END IF
 
 !Create jacobian matrix
@@ -889,14 +881,15 @@ self%mug => mhd_sim
 ! Create solver fields, augmented with coil currents for compatibility with TokaMaker
 !------------------------------------------------------------------------------------
 self%fe_rep => self%mug%fe_rep
+self%coil_ind = self%fe_rep%nfields + 1 !Coil currents follow the MUG fields in the augmented vector
 IF (self%tkmr%gs_device%ncoils > 0) THEN
-    ALLOCATE(stitch_tmp(8),map_tmp(8))
-    DO i=1,7
+    ALLOCATE(stitch_tmp(self%coil_ind),map_tmp(self%coil_ind))
+    DO i=1,self%fe_rep%nfields
         stitch_tmp(i)%s=>self%fe_rep%fields(i)%fe%linkage
         map_tmp(i)%m=>self%fe_rep%fields(i)%fe%map
     END DO
-    stitch_tmp(8)%s=>self%tkmr%gs_device%coil_stitch
-    map_tmp(8)%m=>self%tkmr%gs_device%coil_map
+    stitch_tmp(self%coil_ind)%s=>self%tkmr%gs_device%coil_stitch
+    map_tmp(self%coil_ind)%m=>self%tkmr%gs_device%coil_map
     CALL create_vector(self%aug_vec,stitch_tmp,map_tmp)
     DEALLOCATE(stitch_tmp,map_tmp)
     CALL self%aug_vec%new(self%u)
@@ -924,12 +917,12 @@ NULLIFY(tmp_arr, vals_out)
 CALL self%tkmr%gs_device%fe_rep%vec_create(tmp_vec)
 CALL tmp_vec%add(0.d0,1.d0,self%tkmr%gs_equil%psi) ! tmp_vec = total poloidal flux
 IF (self%tkmr%gs_device%ncoils > 0) THEN
-    CALL self%u%get_local(vals_out,8)
+    CALL self%u%get_local(vals_out,self%coil_ind)
     DO i=1,self%tkmr%gs_device%ncoils
         CALL tmp_vec%add(1.d0,-self%tkmr%gs_equil%coil_currs(i),self%tkmr%gs_device%psi_coil(i)%f)
         vals_out(i)=self%tkmr%gs_equil%coil_currs(i)
     END DO
-    CALL self%u%restore_local(vals_out,8)
+    CALL self%u%restore_local(vals_out,self%coil_ind)
     DEALLOCATE(vals_out)
 END IF
 CALL tmp_vec%get_local(tmp_arr)
@@ -1300,16 +1293,16 @@ NULLIFY(currs_tmp)
 DO j = 1,4
     !---Prescribe the I-coil currents using the coil current input vector
     IF(self%tkmr%gs_device%ncoils > 0)THEN
-        CALL self%rhs%get_local(currs_tmp,8)
+        CALL self%rhs%get_local(currs_tmp,self%coil_ind)
         DO i=1,self%tkmr%gs_device%ncoils
             currs_tmp(i)=coil_currents(i)
         END DO
-        CALL self%rhs%restore_local(currs_tmp,8)
-        CALL self%u%get_local(currs_tmp,8)
+        CALL self%rhs%restore_local(currs_tmp,self%coil_ind)
+        CALL self%u%get_local(currs_tmp,self%coil_ind)
         DO i=1,self%tkmr%gs_device%ncoils
             currs_tmp(i)=coil_currents(i)
         END DO
-        CALL self%u%restore_local(currs_tmp,8)
+        CALL self%u%restore_local(currs_tmp,self%coil_ind)
     END IF
     !Run the nonlinear solver
     dbg_it = 0 ! NLDEBUG
@@ -1421,7 +1414,7 @@ END IF
 !Update equilibrium object to use the coil currents (field 8) 
 !and psi (field 6 + coil vaccum flux) from the converged solution vector 
 IF(self%tkmr%gs_device%ncoils > 0)THEN
-    CALL self%u%get_local(currs_tmp,8)
+    CALL self%u%get_local(currs_tmp,self%coil_ind)
     DO i=1,self%tkmr%gs_device%ncoils
         self%tkmr%gs_equil%coil_currs(i)=currs_tmp(i)
     END DO
@@ -1477,9 +1470,9 @@ self%parent_sim%mug%nlfun%dt = 0.d0 !Set dt = 0 for MUG RHS
 !---Rebuild psi_vac from input coil currents (currents from previous timestep)
 IF(self%parent_sim%tkmr%gs_device%ncoils > 0)THEN
   NULLIFY(coil_arr)
-  CALL a%get_local(coil_arr, 8)
+  CALL a%get_local(coil_arr, self%parent_sim%coil_ind)
   CALL build_psi_vac(self%parent_sim, coil_arr)
-  CALL a%restore_local(coil_arr, 8)
+  CALL a%restore_local(coil_arr, self%parent_sim%coil_ind)
   DEALLOCATE(coil_arr)
 END IF
 
@@ -1515,12 +1508,12 @@ CALL a%get_local(tmp_arr2, 6)
 CALL tmp_in%restore_local(tmp_arr2, 1)
 CALL a%restore_local(tmp_arr2, 6)  ! 
 
-! Extract component 8 from a and put into component 2 of tmp_in
+! Extract the coil-current block (coil_ind) from a and put into component 2 of tmp_in
 NULLIFY(tmp_arr2)
 IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
-    CALL a%get_local(tmp_arr2, 8)
+    CALL a%get_local(tmp_arr2, self%parent_sim%coil_ind)
     CALL tmp_in%restore_local(tmp_arr2, 2)
-    CALL a%restore_local(tmp_arr2, 8)
+    CALL a%restore_local(tmp_arr2, self%parent_sim%coil_ind)
     NULLIFY(tmp_arr2)
 END IF
 
@@ -1536,10 +1529,10 @@ tmp_arr1 = tmp_arr1 + tmp_arr2
 CALL b%restore_local(tmp_arr1, 6)
 NULLIFY(tmp_arr1)
 
-! Extract component 2 from tmp_out and put in field 8
+! Extract component 2 from tmp_out and put in the coil-current block
 IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
     CALL tmp_out%get_local(tmp_arr2, 2)
-    CALL b%restore_local(tmp_arr2, 8)
+    CALL b%restore_local(tmp_arr2, self%parent_sim%coil_ind)
     NULLIFY(tmp_arr2)
 END IF
 
@@ -1580,7 +1573,7 @@ CALL tmp_in%restore_local(tmp_arr2, 1) !Put current psi into tokamaker vector
 NULLIFY(tmp_arr2)
 
 IF (self%parent_sim%tkmr%gs_device%ncoils > 0) THEN
-    CALL a%get_local(tmp_arr2, 8)
+    CALL a%get_local(tmp_arr2, self%parent_sim%coil_ind)
     CALL tmp_in%restore_local(tmp_arr2, 2) !Put coil currents into tokamaker vector
     NULLIFY(tmp_arr2)
 END IF
@@ -1599,9 +1592,9 @@ self%parent_sim%mug%nlfun%dt = self%dt !Use real timestep for LHS
 !---Rebuild psi_vac from input coil currents (currents from previous timestep)
 IF(self%parent_sim%tkmr%gs_device%ncoils > 0)THEN
   NULLIFY(coil_arr)
-  CALL a%get_local(coil_arr, 8)
+  CALL a%get_local(coil_arr, self%parent_sim%coil_ind)
   CALL build_psi_vac(self%parent_sim, coil_arr)
-  CALL a%restore_local(coil_arr, 8)
+  CALL a%restore_local(coil_arr, self%parent_sim%coil_ind)
   DEALLOCATE(coil_arr)
 END IF
 
@@ -1628,9 +1621,9 @@ tmp_arr1 = tmp_arr1 + tmp_arr2
 CALL b%restore_local(tmp_arr1, 6)
 NULLIFY(tmp_arr2, tmp_arr1)
 
-! Put coil current RHS into field 8
+! Put coil current RHS into the coil-current block
 CALL tmp_out%get_local(tmp_arr2, 2)
-CALL b%restore_local(tmp_arr2, 8)
+CALL b%restore_local(tmp_arr2, self%parent_sim%coil_ind)
 NULLIFY(tmp_arr2)
 
 ! Cleanup
@@ -2141,7 +2134,7 @@ DO i = 1, V%i_map(row_block)%n
     vals = V%M(jp:jn)
     cols = cols - V%j_map(col_block)%offset
     CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
-        1, colcount, 6, 8)
+        1, colcount, 6, self%coil_ind)
     DEALLOCATE(cols, vals)
 END DO
 
@@ -2157,7 +2150,7 @@ DO i = 1, V%i_map(row_block)%n
     vals = V%M(jp:jn)
     cols = cols - V%j_map(col_block)%offset
     CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
-        1, colcount, 8, 6)
+        1, colcount, self%coil_ind, 6)
     DEALLOCATE(cols, vals)
 END DO
 
@@ -2173,7 +2166,7 @@ DO i = 1, V%i_map(row_block)%n
     vals = V%M(jp:jn)
     cols = cols - V%j_map(col_block)%offset
     CALL mat%add_values([i], cols, RESHAPE(vals, [1,colcount]), &
-        1, colcount, 8, 8)
+        1, colcount, self%coil_ind, self%coil_ind)
     DEALLOCATE(cols, vals)
 END DO
 
@@ -2632,7 +2625,8 @@ END SUBROUTINE mugtok_mfnk_update
 SUBROUTINE mugtok_nl_debug(self,a)
 CLASS(oft_mugtok_td), INTENT(inout) :: self !< Simulation object
 CLASS(oft_vector), INTENT(inout) :: a !< Current Newton iterate
-CHARACTER(LEN=5), PARAMETER :: fnames(8) = ['n    ','v_R  ','v_phi','v_Z  ','T    ','psi  ','F    ','coils']
+CHARACTER(LEN=5), PARAMETER :: fnames(7) = ['n    ','v_R  ','v_phi','v_Z  ','T    ','psi  ','F    ']
+CHARACTER(LEN=5) :: fname
 REAL(r8), POINTER, DIMENSION(:) :: vals
 REAL(r8) :: nrm(3), nmin, tmin
 INTEGER(i4) :: k
@@ -2652,7 +2646,14 @@ DO k=1,a%nblocks
     CALL dbg_wrk%add(0.d0,1.d0,a,-1.d0,dbg_uprev)
     CALL field_norm(dbg_wrk,k,nrm(3))
   END IF
-  IF(oft_env%head_proc)WRITE(*,'(4X,A,2X,A5,3ES14.6)')'NLDEBUG',fnames(k),nrm
+  IF(k <= 7)THEN
+    fname = fnames(k)
+  ELSE IF(k == self%coil_ind)THEN
+    fname = 'coils'
+  ELSE
+    fname = self%fe_rep%field_tags(k)
+  END IF
+  IF(oft_env%head_proc)WRITE(*,'(4X,A,2X,A5,3ES14.6)')'NLDEBUG',fname,nrm
 END DO
 NULLIFY(vals)
 CALL a%get_local(vals,1)
