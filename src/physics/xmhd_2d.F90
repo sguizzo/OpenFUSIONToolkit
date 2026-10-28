@@ -128,6 +128,13 @@ TYPE, public :: oft_xmhd_2d_sim
   REAL(r8) :: chi_par_mult = 1.d5 !< Ratio of field-aligned to cross-field thermal diffusivity when chi_aniso=.TRUE.
   REAL(r8), ALLOCATABLE :: nu(:) !< kinematic viscosity [m^2/s], by region. This is the TOTAL viscosity nu1+nu2 (see nu2_ratio); the momentum equation uses nu1=nu/(1+nu2_ratio) as the shear (grad^2) coefficient and nu2=nu1*nu2_ratio as the bulk (grad(div)) coefficient
   REAL(r8), ALLOCATABLE :: nu_n(:) !< Optional fixed dynamic viscosity, given as nu*n [1/(m s)], by region. If allocated, it is used in place of nu(:), with the (total) kinematic viscosity nu=nu_n/n evaluated pointwise, so the dynamic viscosity m_i*n*nu is uniform within a region (as with M3D-C1's amu/amuc); nu2_ratio splits it into shear and bulk parts as usual
+  LOGICAL :: hyper_visc = .FALSE. !< Hyperviscosity -nu4*grad^4(v) in the momentum equation (set before setup). As the hyper-diffusivity d2_dens of xmhd.F90, through auxiliary Lagrange fields W_k = (vector Laplacian of v)_k/w_scale, one per velocity component (fields 8.., after by): W_k is defined weakly by int(phi W_k) + int(grad(phi).grad(v_k))/w_scale (+ the cylindrical v_k/R^2 part for R, phi) = 0, and the momentum flux nu1*grad(v_k) gains -nu4*w_scale*grad(W_k). W = 0 wherever v is Dirichlet (no-slip wall), the second boundary condition of the grad^4 operator
+  LOGICAL :: hyper_visc_pol = .FALSE. !< With hyper_visc: hyperviscosity on the poloidal components (v_R, v_Z) only (2 auxiliary fields instead of 3)
+  INTEGER(i4) :: w_ind(3) = 0 !< Field index of the auxiliary W field for each velocity component (R, phi, Z); 0 = none
+  REAL(r8), ALLOCATABLE :: nu4(:) !< Kinematic hyperviscosity [m^4/s], by region (with hyper_visc; allocated as 0 by setup)
+  REAL(r8), ALLOCATABLE :: nu4_n(:) !< Optional fixed dynamic hyperviscosity nu4*n [m^2/s], by region: if allocated, nu4 = nu4_n/n pointwise (as nu_n)
+  INTEGER(i4), ALLOCATABLE :: jac_mask(:,:) !< Block mask of the Jacobian (with hyper_visc: W_k couples only to v_k and itself), as xmhd.F90's xmhd_mat_mask; unallocated = all blocks
+  REAL(r8) :: w_scale = 1.d0 !< Scale of the auxiliary W fields, (order/hrms)^2 (as xmhd.F90's n2_scale/j2_scale), so that W ~ v in magnitude
   REAL(r8) :: visc_sol_mult = 1.d0 !< Multiplier on the kinematic viscosity in cold (SOL) plasma: nu -> nu*(1+(visc_sol_mult-1)*f(T)) with f = (1-tanh((T-visc_sol_T0)/visc_sol_dT))/2, so f~1 for T << visc_sol_T0 and ~0 in the hot core. T is the frozen per-step snapshot when T is evolved with Spitzer eta (so the factor is constant over a step and adds no Jacobian terms), else the current T. 1 = off
   REAL(r8) :: visc_sol_T0 = 50.d0 !< Temperature [eV] at the middle of the visc_sol_mult transition
   REAL(r8) :: visc_sol_dT = 10.d0 !< Width [eV] of the visc_sol_mult tanh transition
@@ -830,6 +837,10 @@ REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
 REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights, T_eta_weights, n_eta_weights
 REAL(r8), POINTER, DIMENSION(:) :: ohm_q_weights, ohm_by_weights
 LOGICAL :: ohm_on !< Ohmic heating active (frozen current snapshot available)
+LOGICAL :: hyp_on !< Hyperviscosity auxiliary fields present (w_ind)
+REAL(r8), POINTER, DIMENSION(:,:) :: W_weights
+REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: W_res
+REAL(r8), POINTER, DIMENSION(:) :: wtmp
 REAL(r8) :: convect_fac !< Zeroes the convective derivative term below when parent_sim%drop_convection=.TRUE.
 REAL(r8) :: pres_fac !< Enables the pressure-conserving density diffusion term in the temperature equation when parent_sim%evolve_pressure=.TRUE.
 quad=>oft_blagrange%quad
@@ -851,6 +862,18 @@ CALL a%get_local(by_weights,7)
 !---Get vacuum poloidal flux offset (added to the psi field reconstruction)
 NULLIFY(psi_vac_weights)
 CALL self%parent_sim%psi_vac%get_local(psi_vac_weights)
+!---Hyperviscosity auxiliary fields W (one per velocity component, 0 where absent)
+hyp_on = (self%parent_sim%w_ind(1) > 0)
+NULLIFY(W_weights)
+IF(hyp_on)THEN
+  ALLOCATE(W_weights(3,oft_blagrange%ne), W_res(3,oft_blagrange%ne))
+  W_weights = 0.d0; W_res = 0.d0
+  DO l=1,3
+    IF(self%parent_sim%w_ind(l)==0)CYCLE
+    wtmp => W_weights(l,:)
+    CALL a%get_local(wtmp, self%parent_sim%w_ind(l))
+  END DO
+END IF
 
 B_0 = self%parent_sim%B_0
 cyl_flag = self%parent_sim%cyl_flag
@@ -896,6 +919,8 @@ INTEGER(i4), ALLOCATABLE, DIMENSION(:) :: cell_dofs, cell_dofs_p
 REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dpsi_0(3),dby(3),T_eta_val,n_eta_val
 REAL(r8) :: dvel(3,3),div_vel,jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),coords(3),kappa_T(3,3)
 REAL(r8) :: sink_term, T_mass, q_ohm, dby_ohm(3), heat_ohm, n_ohm
+REAL(r8) :: nu4q, rfac, Wv(3), dW(3,3)
+REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: W_weights_loc, resW_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals,basis_vals_p,T_weights_loc,n_weights_loc,psi_weights_loc,by_weights_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: T_eta_loc, n_eta_loc, ohm_q_loc, ohm_by_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grads_p, res_loc
@@ -904,6 +929,7 @@ REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grad
 !$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dpsi_0,dby,dvel,div_vel,btmp, tmp1, kappa_T, &
 !$omp T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, T_mass, &
 !$omp ohm_q_loc, ohm_by_loc, q_ohm, dby_ohm, heat_ohm, n_ohm, &
+!$omp nu4q, rfac, Wv, dW, W_weights_loc, resW_loc, &
 !$omp chi, m_i, eta, nu, nu1, nu2, T_visc, visc_fac, psiN_visc, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 ALLOCATE(n_weights_loc(oft_blagrange%nce),&
@@ -917,6 +943,7 @@ END IF
 IF (eta_lag) ALLOCATE(T_eta_loc(oft_blagrange%nce), n_eta_loc(oft_blagrange%nce))
 IF (ohm_on) ALLOCATE(ohm_q_loc(oft_blagrange%nce), ohm_by_loc(oft_blagrange%nce))
 ALLOCATE(cell_dofs(oft_blagrange%nce), res_loc(oft_blagrange%nce,7))
+IF (hyp_on) ALLOCATE(W_weights_loc(3,oft_blagrange%nce), resW_loc(oft_blagrange%nce,3))
 IF (incomp) ALLOCATE(basis_vals_p(oft_blagrange_p%nce), basis_grads_p(3,oft_blagrange_p%nce), cell_dofs_p(oft_blagrange_p%nce))
 ! Unordered: atomic adds (vectors) and row locks (matrix); summation order varies in the last digits.
 ! Dynamic chunks: the cells a loop skips (other regions) are clustered in the cell numbering, so
@@ -937,6 +964,10 @@ DO i=1,mesh%nc
   n_weights_loc = n_weights(cell_dofs)
   psi_weights_loc = psi_weights(cell_dofs) + psi_vac_weights(cell_dofs)
   by_weights_loc = by_weights(cell_dofs)
+  IF (hyp_on) THEN
+    W_weights_loc = W_weights(:,cell_dofs)
+    resW_loc = 0.d0
+  END IF
   IF (eta_lag) T_eta_loc = T_eta_weights(cell_dofs)
   IF (eta_lag) n_eta_loc = n_eta_weights(cell_dofs)
   IF (ohm_on) ohm_q_loc = ohm_q_weights(cell_dofs)
@@ -996,6 +1027,14 @@ DO i=1,mesh%nc
       dpsi_0 = dpsi_0 + psi_weights(cell_dofs(jr))*basis_grads(:,jr)
       dby = dby + by_weights_loc(jr)*basis_grads(:,jr)
     END DO
+    IF (hyp_on) THEN
+      Wv = 0.d0; dW = 0.d0
+      DO jr=1,oft_blagrange%nce
+        Wv = Wv + W_weights_loc(:,jr)*basis_vals(jr)
+        dW(:,1) = dW(:,1) + W_weights_loc(:,jr)*basis_grads(1,jr)
+        dW(:,3) = dW(:,3) + W_weights_loc(:,jr)*basis_grads(3,jr)
+      END DO
+    END IF
     IF (incomp) THEN
       DO jr=1,oft_blagrange_p%nce
         T = T + T_weights_loc(jr)*basis_vals_p(jr)
@@ -1063,6 +1102,12 @@ DO i=1,mesh%nc
       nu = self%parent_sim%nu_n(mesh%reg(i))/n
       nu1 = nu/(1.d0+self%parent_sim%nu2_ratio)
       nu2 = nu1*self%parent_sim%nu2_ratio
+    END IF
+    IF (hyp_on) THEN !< Hyperviscosity coefficient (fixed dynamic value nu4_n/n if allocated); not SOL-boosted
+      nu4q = self%parent_sim%nu4(mesh%reg(i))
+      IF (ALLOCATED(self%parent_sim%nu4_n)) nu4q = self%parent_sim%nu4_n(mesh%reg(i))/n
+      rfac = 1.d0
+      IF (cyl_flag) rfac = coords(1)
     END IF
     IF (self%parent_sim%visc_sol_mult /= 1.d0) THEN !< Cold-plasma (SOL) viscosity boost
       IF (eta_lag) THEN
@@ -1254,6 +1299,25 @@ DO i=1,mesh%nc
         res_loc(jr,2) = res_loc(jr,2) + self%parent_sim%drag_rate*self%dt*basis_vals(jr)*vel(1)*int_factor
         res_loc(jr,4) = res_loc(jr,4) + self%parent_sim%drag_rate*self%dt*basis_vals(jr)*vel(3)*int_factor
       END IF
+      !---Hyperviscosity, -nu4*grad^4(v) = -nu4*w_scale*(vector Laplacian of W): the viscous operator of nu1
+      !   (same density weighting and hoop terms) applied to W with coefficient -nu4*w_scale. Then the W rows,
+      !   W = (vector Laplacian of v)/w_scale, assembled only for dt > 0 (as xmhd.F90's N2), so they are 0 in the RHS
+      IF(hyp_on)THEN
+        DO k=1,3
+          IF(self%parent_sim%w_ind(k)==0)CYCLE
+          res_loc(jr,k+1) = res_loc(jr,k+1) &
+            - nu4q*self%parent_sim%w_scale*self%dt*(DOT_PRODUCT(basis_grads(:,jr),dW(k,:)) &
+            - basis_vals(jr)*DOT_PRODUCT(dn,dW(k,:))/n)*int_factor*rfac
+          IF(cyl_flag.AND.(k<3))res_loc(jr,k+1) = res_loc(jr,k+1) &
+            - nu4q*self%parent_sim%w_scale*self%dt*basis_vals(jr)*Wv(k)*int_factor/(coords(1)+gs_epsilon)
+          IF(self%dt>0.d0)THEN
+            resW_loc(jr,k) = resW_loc(jr,k) + basis_vals(jr)*Wv(k)*int_factor*rfac &
+              + DOT_PRODUCT(basis_grads(:,jr),dvel(k,:))*int_factor*rfac/self%parent_sim%w_scale
+            IF(cyl_flag.AND.(k<3))resW_loc(jr,k) = resW_loc(jr,k) &
+              + basis_vals(jr)*vel(k)*int_factor/((coords(1)+gs_epsilon)*self%parent_sim%w_scale)
+          END IF
+        END DO
+      END IF
       !---Psi
       tmp1 = cross_product(B_0,vel)
       IF(cyl_flag)THEN
@@ -1317,12 +1381,22 @@ DO i=1,mesh%nc
     !$omp atomic
     by_res(cell_dofs(jr)) = by_res(cell_dofs(jr)) + res_loc(jr,7)
   END DO
+  IF (hyp_on) THEN
+    DO jr=1,oft_blagrange%nce
+      DO k=1,3
+        IF(self%parent_sim%w_ind(k)==0)CYCLE
+        !$omp atomic
+        W_res(k,cell_dofs(jr)) = W_res(k,cell_dofs(jr)) + resW_loc(jr,k)
+      END DO
+    END DO
+  END IF
 END DO
 !---Cleanup thread-local storage
 DEALLOCATE(basis_vals,basis_grads, n_weights_loc,T_weights_loc,&
           vel_weights_loc, psi_weights_loc, by_weights_loc,cell_dofs, res_loc)
 IF (eta_lag) DEALLOCATE(T_eta_loc, n_eta_loc)
 IF (ohm_on) DEALLOCATE(ohm_q_loc, ohm_by_loc)
+IF (hyp_on) DEALLOCATE(W_weights_loc, resW_loc)
 IF (incomp) DEALLOCATE(basis_vals_p, basis_grads_p, cell_dofs_p)
 !$omp end parallel
 END BLOCK
@@ -1346,7 +1420,30 @@ CALL b%restore_local(vely_res,3,add=.TRUE.,wait=.TRUE.)
 CALL b%restore_local(velz_res,4,add=.TRUE.,wait=.TRUE.)
 CALL b%restore_local(T_res,5,add=.TRUE.,wait=.TRUE.)
 CALL b%restore_local(psi_res,6,add=.TRUE.,wait=.TRUE.)
-CALL b%restore_local(by_res,7,add=.TRUE.)
+CALL b%restore_local(by_res,7,add=.TRUE.,wait=hyp_on)
+IF(hyp_on)THEN
+  !---W rows: W = 0 wherever the matching velocity component is Dirichlet
+  BLOCK
+  LOGICAL, CONTIGUOUS, POINTER, DIMENSION(:) :: wbc
+  REAL(r8), POINTER, DIMENSION(:) :: wres, wwt
+  INTEGER(i4) :: klast
+  klast = MAXLOC(self%parent_sim%w_ind,DIM=1)
+  DO l=1,3
+    IF(self%parent_sim%w_ind(l)==0)CYCLE
+    SELECT CASE(l)
+    CASE(1); wbc=>self%parent_sim%velx_bc
+    CASE(2); wbc=>self%parent_sim%vely_bc
+    CASE DEFAULT; wbc=>self%parent_sim%velz_bc
+    END SELECT
+    ALLOCATE(wres(oft_blagrange%ne), wwt(oft_blagrange%ne))
+    wres = W_res(l,:); wwt = W_weights(l,:)
+    CALL fem_dirichlet_vec(oft_blagrange,wwt,wres,wbc)
+    CALL b%restore_local(wres,self%parent_sim%w_ind(l),add=.TRUE.,wait=(l/=klast))
+    DEALLOCATE(wres, wwt)
+  END DO
+  END BLOCK
+  DEALLOCATE(W_weights, W_res)
+END IF
 self%diag_vals=oft_mpi_sum(diag_vals,5)
 !---Cleanup remaining storage
 DEALLOCATE(n_res,velx_res,vely_res, velz_res, T_res, psi_res, by_res, &
@@ -1835,6 +1932,7 @@ REAL(r8) :: k_boltz=elec_charge
 REAL(r8) :: m_i = proton_mass
 REAL(r8) :: chi, eta(2), nu, nu1, nu2, D_diff, gamma, B_0(3), diag_vals(7), dt_fac
 REAL(r8) :: T_visc, visc_fac, psiN_visc
+LOGICAL :: hyp_on
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights, psi_weights, by_weights, vtmp
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
 REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights, T_eta_weights, n_eta_weights
@@ -1871,6 +1969,7 @@ incomp = self%incomp
 dt_fac = self%jac_dt
 use_kappa = ALLOCATED(self%kappa)
 use_nu_n = ALLOCATED(self%nu_n)
+hyp_on = (self%w_ind(1) > 0)
 convect_fac = MERGE(0.d0, 1.d0, self%drop_convection)
 pres_fac = MERGE(1.d0, 0.d0, self%evolve_pressure)
 !---Match the resistivity used by nlfun_apply (frozen snapshot when T is evolved)
@@ -1893,6 +1992,7 @@ REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dby(3),dvel(3,3),div_vel
 REAL(r8) :: jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),tmp2(3),tmp3(3),coords(3),kappa_T(3,3)
 REAL(r8) :: dT_dpsi, deta_dT(2), r_geo, d6_eta, d7_eta, T_eta_val, n_eta_val
 REAL(r8) :: sink_term, dsink_dT, visc_row(3)
+REAL(r8) :: nu4q, rfac
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals, basis_vals_p,n_weights_loc,T_weights_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: psi_weights_loc,by_weights_loc,res_loc,T_eta_loc,n_eta_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grads_p
@@ -1902,6 +2002,7 @@ type(oft_local_mat), allocatable, dimension(:,:) :: jac_loc
 !$omp n_weights_loc,psi_weights_loc, by_weights_loc,vel_weights_loc,res_loc,jac_mat, &
 !$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dby,dvel,div_vel,btmp,tmp1,tmp2,tmp3,kappa_T, iloc, jac_loc, &
 !$omp dT_dpsi,deta_dT,r_geo,d6_eta,d7_eta,T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, dsink_dT, &
+!$omp nu4q, rfac, &
 !$omp chi, m_i, eta, nu, nu1, nu2, visc_row, T_visc, visc_fac, psiN_visc, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 IF (incomp) ALLOCATE(basis_vals_p(oft_blagrange_p%nce),basis_grads_p(3,oft_blagrange_p%nce))
@@ -1922,7 +2023,11 @@ DO ik=1,self%fe_rep%nfields
    iloc(ik)%v=>cell_dofs
 END DO
 IF (incomp) iloc(5)%v => cell_dofs_p
-CALL self%fe_rep%mat_setup_local(jac_loc)
+IF (ALLOCATED(self%jac_mask)) THEN
+  CALL self%fe_rep%mat_setup_local(jac_loc,self%jac_mask)
+ELSE
+  CALL self%fe_rep%mat_setup_local(jac_loc)
+END IF
 ! Unordered: atomic adds (vectors) and row locks (matrix); summation order varies in the last digits.
 ! Dynamic chunks: the cells a loop skips (other regions) are clustered in the cell numbering, so
 ! static blocks leave threads idle
@@ -2575,6 +2680,33 @@ DO i=1,mesh%nc
         END IF
       END DO
     END DO
+    !---Hyperviscosity blocks (exact; the n-dependence of the hyperviscous term is left out of this approximate Jacobian)
+    IF (hyp_on) THEN
+      nu4q = self%nu4(mesh%reg(i))
+      IF (ALLOCATED(self%nu4_n)) nu4q = self%nu4_n(mesh%reg(i))/n
+      rfac = 1.d0
+      IF (cyl_flag) rfac = coords(1)
+      DO jr=1,oft_blagrange%nce
+        DO jc=1,oft_blagrange%nce
+          DO k=1,3
+            l = self%w_ind(k)
+            IF(l==0)CYCLE
+            jac_loc(k+1,l)%m(jr,jc) = jac_loc(k+1,l)%m(jr,jc) &
+              - dt_fac*nu4q*self%w_scale*(DOT_PRODUCT(basis_grads(:,jr),basis_grads(:,jc)) &
+              - basis_vals(jr)*DOT_PRODUCT(dn,basis_grads(:,jc))/n)*int_factor*rfac
+            jac_loc(l,k+1)%m(jr,jc) = jac_loc(l,k+1)%m(jr,jc) &
+              + DOT_PRODUCT(basis_grads(:,jr),basis_grads(:,jc))*int_factor*rfac/self%w_scale
+            jac_loc(l,l)%m(jr,jc) = jac_loc(l,l)%m(jr,jc) + basis_vals(jr)*basis_vals(jc)*int_factor*rfac
+            IF (cyl_flag.AND.(k<3)) THEN
+              jac_loc(k+1,l)%m(jr,jc) = jac_loc(k+1,l)%m(jr,jc) &
+                - dt_fac*nu4q*self%w_scale*basis_vals(jr)*basis_vals(jc)*int_factor/(coords(1)+gs_epsilon)
+              jac_loc(l,k+1)%m(jr,jc) = jac_loc(l,k+1)%m(jr,jc) &
+                + basis_vals(jr)*basis_vals(jc)*int_factor/((coords(1)+gs_epsilon)*self%w_scale)
+            END IF
+          END DO
+        END DO
+      END DO
+    END IF
   END DO
   DO jr = 1,7
     jac_loc(1, jr)%m = jac_loc(1, jr)%m / self%den_scale
@@ -2592,6 +2724,11 @@ DO i=1,mesh%nc
   CALL self%fe_rep%mat_zero_local_rows(jac_loc,self%velz_bc(cell_dofs), 4)
   CALL self%fe_rep%mat_zero_local_rows(jac_loc,self%psi_bc(cell_dofs),6)
   CALL self%fe_rep%mat_zero_local_rows(jac_loc,self%by_bc(cell_dofs), 7)
+  IF (hyp_on) THEN
+    IF(self%w_ind(1)>0)CALL self%fe_rep%mat_zero_local_rows(jac_loc,self%velx_bc(cell_dofs),self%w_ind(1))
+    IF(self%w_ind(2)>0)CALL self%fe_rep%mat_zero_local_rows(jac_loc,self%vely_bc(cell_dofs),self%w_ind(2))
+    IF(self%w_ind(3)>0)CALL self%fe_rep%mat_zero_local_rows(jac_loc,self%velz_bc(cell_dofs),self%w_ind(3))
+  END IF
   !----Add local contributions to matrix
   CALL self%fe_rep%mat_add_local(self%jacobian,jac_loc,iloc,tlocks)
 END DO
@@ -2620,6 +2757,9 @@ ELSE
 END IF
 CALL fem_dirichlet_diag(oft_blagrange,self%jacobian,self%psi_bc,6)
 CALL fem_dirichlet_diag(oft_blagrange,self%jacobian,self%by_bc,7)
+IF(self%w_ind(1)>0)CALL fem_dirichlet_diag(oft_blagrange,self%jacobian,self%velx_bc,self%w_ind(1))
+IF(self%w_ind(2)>0)CALL fem_dirichlet_diag(oft_blagrange,self%jacobian,self%vely_bc,self%w_ind(2))
+IF(self%w_ind(3)>0)CALL fem_dirichlet_diag(oft_blagrange,self%jacobian,self%velz_bc,self%w_ind(3))
 !
 call self%fe_rep%vec_create(tmp)
 call self%jacobian%assemble(tmp)
@@ -2695,6 +2835,28 @@ END IF
 IF(oft_debug_print(1))WRITE(*,'(2X,A)')'Creating FE type'
 ALLOCATE(self%fe_rep)
 self%fe_rep%nfields=7
+IF(self%hyper_visc)THEN
+  self%w_ind = 0
+  self%w_ind(1) = 8
+  IF(self%hyper_visc_pol)THEN
+    self%w_ind(3) = 9
+  ELSE
+    self%w_ind(2) = 9; self%w_ind(3) = 10
+  END IF
+  self%fe_rep%nfields = MAXVAL(self%w_ind)
+  ALLOCATE(self%jac_mask(self%fe_rep%nfields,self%fe_rep%nfields))
+  self%jac_mask = 0
+  self%jac_mask(1:7,1:7) = 1
+  BLOCK
+  INTEGER(i4) :: k
+  DO k=1,3
+    IF(self%w_ind(k)==0)CYCLE
+    self%jac_mask(k+1,self%w_ind(k)) = 1
+    self%jac_mask(self%w_ind(k),k+1) = 1
+    self%jac_mask(self%w_ind(k),self%w_ind(k)) = 1
+  END DO
+  END BLOCK
+END IF
 ALLOCATE(self%fe_rep%fields(self%fe_rep%nfields))
 ALLOCATE(self%fe_rep%field_tags(self%fe_rep%nfields))
 self%fe_rep%fields(1)%fe=>oft_blagrange
@@ -2717,6 +2879,20 @@ self%fe_rep%fields(6)%fe=>oft_blagrange
 self%fe_rep%field_tags(6)='psi'
 self%fe_rep%fields(7)%fe=>oft_blagrange
 self%fe_rep%field_tags(7)='by'
+IF(self%hyper_visc)THEN
+  BLOCK
+  CHARACTER(LEN=4), PARAMETER :: wtags(3) = ['W_R ','W_ph','W_Z ']
+  INTEGER(i4) :: k
+  DO k=1,3
+    IF(self%w_ind(k)==0)CYCLE
+    self%fe_rep%fields(self%w_ind(k))%fe=>oft_blagrange
+    self%fe_rep%field_tags(self%w_ind(k))=wtags(k)
+  END DO
+  END BLOCK
+  self%w_scale = (REAL(order,8)/mesh%hrms)**2
+  IF(oft_env%head_proc)WRITE(*,'(A,I3,A,ES11.3)')' Hyperviscosity: auxiliary fields',COUNT(self%w_ind>0), &
+    ', w_scale (order/hrms)^2 =',self%w_scale
+END IF
 !---Create solution vector
 CALL self%fe_rep%vec_create(self%u)
 CALL self%fe_rep%vec_create(self%u0)
@@ -2733,7 +2909,11 @@ IF(.NOT.self%incomp)THEN
   self%T_eta_valid=.FALSE.
 END IF
 !---Create Jacobian matrix
-CALL self%fe_rep%mat_create(self%jacobian)
+IF(ALLOCATED(self%jac_mask))THEN
+  CALL self%fe_rep%mat_create(self%jacobian,mask=self%jac_mask)
+ELSE
+  CALL self%fe_rep%mat_create(self%jacobian)
+END IF
 
 !-- Set material properties not already set
 IF (.NOT. ALLOCATED(self%nu)) THEN
@@ -2743,6 +2923,10 @@ END IF
 IF (.NOT. ALLOCATED(self%D_diff)) THEN
   ALLOCATE(self%D_diff(mesh%nreg))
   self%D_diff = -1.d0
+END IF
+IF (.NOT. ALLOCATED(self%nu4)) THEN
+  ALLOCATE(self%nu4(mesh%nreg))
+  self%nu4 = 0.d0
 END IF
 IF (.NOT. ALLOCATED(self%chi)) THEN
   ALLOCATE(self%chi(mesh%nreg))
@@ -3032,7 +3216,21 @@ character(LEN=*), intent(in) :: path !< Path to store solution vector in file
 real(r8), optional, intent(out) :: t !< Time of loaded solution
 real(r8), optional, intent(out) :: dt !< Timestep at loaded time
 DEBUG_STACK_PUSH
-CALL self%fe_rep%vec_load(u,filename,path)
+IF(self%w_ind(1) > 0)THEN
+  !---Restart files written without hyperviscosity have no W fields: they follow the physical fields
+  !   (indices 8..), which are read first, and are left at 0 (Newton solves them on the first iteration)
+  BLOCK
+  INTEGER(i4) :: ierr
+  CALL u%set(0.d0)
+  ierr = 0
+  CALL self%fe_rep%vec_load(u,filename,path,err_flag=ierr)
+  IF((ierr /= 0).AND.(ierr /= -self%w_ind(1)))CALL oft_abort('Error reading restart file','rst_load',__FILE__)
+  IF((ierr == -self%w_ind(1)).AND.oft_env%head_proc)WRITE(*,'(2A)')' rst_load: no hyperviscosity fields in ', &
+    'restart file, starting them from 0'
+  END BLOCK
+ELSE
+  CALL self%fe_rep%vec_load(u,filename,path)
+END IF
 IF(PRESENT(t))CALL hdf5_read(t,filename,'t')
 IF(PRESENT(dt))CALL hdf5_read(dt,filename,'dt')
 DEBUG_STACK_POP

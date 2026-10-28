@@ -71,6 +71,8 @@ REAL(r8) :: kappa_kick = 1.542d22 !< DUMMY: perpendicular thermal conductivity k
 REAL(r8) :: kappa_base = 1.542d20 !< DUMMY: baseline (pre-/post-kick) perpendicular thermal conductivity kappa=chi*n [1/(m s)] in the plasma (sets kappa_reg(1) below)
 REAL(r8) :: visc_kick = 500.d0 !< Kinematic viscosity [m^2/s] in the plasma during the pre-kick and kick phases (sets visc_reg(1) below)
 REAL(r8) :: visc_post = 200.d0 !< Kinematic viscosity [m^2/s] in the plasma after the kick
+REAL(r8) :: visc_hyper = 0.d0 !< Post-kick hyperviscosity nu4 [m^4/s] in the plasma, -nu4*grad^4(v) (xmhd_2d hyper_visc; > 0 adds the auxiliary W fields, 0 = off and no extra fields). With visc_dynamic it is the value at visc_nref (nu4 = visc_hyper*visc_nref/n). Grid damping rate ~ nu4*(pi/h)^4
+LOGICAL :: visc_hyper_pol = .FALSE. !< With visc_hyper: hyperviscosity on v_R and v_Z only (2 auxiliary fields instead of 3)
 REAL(r8) :: visc_bulk_ratio = 2.d0 !< Ratio of bulk (compressional, grad(div v)) to shear viscosity (mug%nu2_ratio; setup_mhd's default is 2, 0 turns bulk viscosity off). visc_kick/visc_post are the TOTAL viscosity, so shear = visc/(1+visc_bulk_ratio) and bulk = shear*visc_bulk_ratio
 REAL(r8) :: visc_sol_mult = 1.d0 !< Post-kick only: multiply the viscosity in cold (SOL) plasma by up to visc_sol_mult, nu -> nu*(1+(visc_sol_mult-1)*(1-tanh((T-visc_sol_T0)/visc_sol_dT))/2), leaving the hot core at visc_post; 1 = off (see xmhd_2d visc_sol_mult)
 REAL(r8) :: visc_sol_T0 = 50.d0 !< Middle of the visc_sol_mult transition [eV]
@@ -142,7 +144,7 @@ NAMELIST/sparc_vde_options/force_rst,rst_start,visc_kick,visc_post,mass_scale_ki
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,lin_rtol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile, &
-  T_floor,kappa_par
+  T_floor,kappa_par,visc_hyper,visc_hyper_pol
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -294,6 +296,9 @@ b_sim%rst_freq = 1
 ! per-field block-Jacobi drops). Needed for good linear convergence in the stiff,
 ! near-ideal (physical eta) regime; costs more memory.
 b_sim%use_full_lu = .TRUE.
+! Hyperviscosity adds fields, so it is switched on before setup_mhd (coefficient set post-kick below)
+b_sim%hyper_visc = (visc_hyper > 0.d0)
+b_sim%hyper_visc_pol = visc_hyper_pol
 ! Region 1 as MHD: n and T seeded from the TokaMaker n/T profiles (see n_scale etc.);
 ! n held fixed (evolve_n) and T evolved, Spitzer eta(n,T), and plasma ion mass inflated by mass_scale.
 ! kappa_reg(1) below sets the baseline (pre-/post-kick) kappa_perp=kappa_base; the VDE is driven
@@ -383,6 +388,11 @@ IF(visc_dynamic)THEN
   ALLOCATE(b_sim%mug%nu_n(SIZE(b_sim%mug%nu)))
   b_sim%mug%nu_n = b_sim%mug%nu*visc_nref
 END IF
+IF(b_sim%hyper_visc .AND. visc_dynamic)THEN
+  ALLOCATE(b_sim%mug%nu4_n(SIZE(b_sim%mug%nu)))
+  b_sim%mug%nu4_n = 0.d0
+END IF
+IF(b_sim%hyper_visc)WRITE(*,'(A,ES12.4,A,L2)')' Hyperviscosity (post-kick) nu4 [m^4/s] =',visc_hyper,'  poloidal only =',visc_hyper_pol
 WRITE(*,'(A,L2,A,ES12.4,A,F6.2)')' Viscosity: dynamic (uniform m_i*n*nu) =',visc_dynamic, &
   '  n_ref [m^-3] =',visc_nref,'  bulk/shear ratio =',visc_bulk_ratio
 b_sim%mug%visc_sol_T0 = visc_sol_T0
@@ -445,6 +455,10 @@ IF(force_rst(1) > 0)THEN
   b_sim%mug%visc_sol_mult = visc_sol_mult
   b_sim%mug%m_i(1) = m_i_plasma*mass_scale_post
   b_sim%mug%drag_rate = drag_rate
+  IF(b_sim%hyper_visc)THEN
+    b_sim%mug%nu4(1) = visc_hyper
+    IF(visc_dynamic) b_sim%mug%nu4_n(1) = visc_hyper*visc_nref
+  END IF
   b_sim%mug%evolve_pressure = .TRUE.
   IF(visc_dynamic) b_sim%mug%nu_n(1) = b_sim%mug%nu(1)*visc_nref
   DO ifr=1,SIZE(force_rst)
@@ -516,6 +530,10 @@ DO i=rst_start+1,nstep_total
       b_sim%mug%visc_sol_mult = visc_sol_mult
       b_sim%mug%m_i(1) = m_i_plasma*mass_scale_post ! switch to the post-kick mass enhancement
       b_sim%mug%drag_rate = drag_rate
+      IF(b_sim%hyper_visc)THEN
+        b_sim%mug%nu4(1) = visc_hyper
+        IF(visc_dynamic) b_sim%mug%nu4_n(1) = visc_hyper*visc_nref ! nu4 = visc_hyper*visc_nref/n
+      END IF
       b_sim%mug%evolve_pressure = .TRUE.
       b_sim%pre_freq = pre_freq ! slower post-kick evolution: reuse the LU factorization
       b_sim%pre_adapt = pre_adapt

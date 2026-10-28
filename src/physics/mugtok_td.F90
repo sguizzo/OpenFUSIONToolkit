@@ -60,6 +60,8 @@ LOGICAL, ALLOCATABLE, DIMENSION(:) :: plasma_flag !< True for DOFs in or on the 
 REAL(r8) :: psi_limiting = 0.d0 !< Edge (LCFS) poloidal flux captured the first time the plasma is limited (not diverted); set once and never overwritten thereafter. See mugtok_update_psi_limiting/mugtok_apply_sink
 LOGICAL :: psi_limiting_set = .FALSE. !< True once `psi_limiting` has been captured
 INTEGER(i4) :: F0_node = 0 !< Index of the first plasma_flag=.TRUE. DOF, used to evolve F0 (0 if none)
+LOGICAL :: hyper_visc = .FALSE. !< Hyperviscosity in the MHD plasma (xmhd_2d hyper_visc: adds the auxiliary W fields); set before setup_mhd
+LOGICAL :: hyper_visc_pol = .FALSE. !< With hyper_visc: poloidal components only (xmhd_2d hyper_visc_pol); set before setup_mhd
 INTEGER(i4) :: coil_ind = 8 !< Block index of the coil currents in the augmented vector (fe_rep%nfields+1, set in setup)
 REAL(r8) :: f_scale_prev = 1.d0 !< FF' scale (tkmr%f_scale) from previous timestep
 CLASS(flux_func), POINTER :: I_prev => NULL() !< FF' profile (gs_equil%I) from previous timestep
@@ -304,6 +306,8 @@ mhd_sim%cyl_flag = .TRUE.
 mhd_sim%dt = dt
 mhd_sim%den_scale = 1.d0
 
+mhd_sim%hyper_visc = self%hyper_visc
+mhd_sim%hyper_visc_pol = self%hyper_visc_pol
 CALL mhd_sim%setup(mg_mesh, lag_rep%order, fe_rep_in =lag_rep)
 mhd_sim%sink_func => mugtok_apply_sink
 
@@ -492,7 +496,11 @@ CALL self%tkmr%gs_device%fe_rep%vec_create(tmp_vec)
 !------------------------------------------------------------------------------
 ! Setup structure of approximate Jacobian matrix used for preconditioning
 !------------------------------------------------------------------------------
-CALL fem_graph_create(self%fe_rep, fe_graphs, known_graphs, nkgraphs) !Setup graphs for base finite element fields
+IF(ALLOCATED(self%mug%jac_mask))THEN !Hyperviscosity: W fields couple only to their own velocity component
+    CALL fem_graph_create(self%fe_rep, fe_graphs, known_graphs, nkgraphs, self%mug%jac_mask)
+ELSE
+    CALL fem_graph_create(self%fe_rep, fe_graphs, known_graphs, nkgraphs) !Setup graphs for base finite element fields
+END IF
 
 !Allocate overall matrix of graphs
 IF (self%tkmr%gs_device%ncoils > 0) THEN
@@ -504,6 +512,7 @@ END IF
 !Populate graphs with the finite element graphs
 DO i = 1, self%fe_rep%nfields
     DO j = 1, self%fe_rep%nfields
+        IF(.NOT.ASSOCIATED(fe_graphs(i,j)%g))CYCLE !Block masked out (jac_mask)
         ALLOCATE(graphs(i,j)%g)
         graphs(i,j)%g%nnz=fe_graphs(i,j)%g%nnz
         graphs(i,j)%g%nr=fe_graphs(i,j)%g%nr
@@ -811,6 +820,8 @@ mhd_sim%dt = dt
 mhd_sim%den_scale = 1.d20
 IF (ASSOCIATED(self%n_prof)) mhd_sim%den_scale = self%n_scale
 
+mhd_sim%hyper_visc = self%hyper_visc
+mhd_sim%hyper_visc_pol = self%hyper_visc_pol
 CALL mhd_sim%setup(mg_mesh, lag_rep%order, fe_rep_in=lag_rep)
 mhd_sim%sink_func => mugtok_apply_sink
 !---Temperature sink term for DOFs left behind as the plasma boundary recedes
@@ -2090,6 +2101,7 @@ END IF
 !Copy MUG Jacobian for all fields 
 DO row_block = 1, M%ni
     DO col_block = 1, M%nj
+        IF(.NOT.ASSOCIATED(M%map(row_block,col_block)%ext))CYCLE !Block masked out (jac_mask)
         DO i = 1, M%i_map(row_block)%n
             jp=M%map(row_block,col_block)%ext(1,i)
             jn=M%map(row_block,col_block)%ext(2,i)
@@ -2217,7 +2229,7 @@ DEBUG_STACK_POP
 end subroutine
 
 !------------------------------------------------------------------------------
-!> Save the current solution (fields 1-7 of the augmented vector) to
+!> Save the current solution (the MUG fields of the augmented vector) to
 !> a restart file 'mugtok_NNNNN.rst', indexed by the step counter
 !------------------------------------------------------------------------------
 subroutine mugtok_rst_save(self, t)
@@ -2228,9 +2240,9 @@ real(r8), pointer :: tmp(:)
 character(LEN=TDIFF_RST_LEN) :: rst_char
 integer(i4) :: i
 NULLIFY(mug_vec, tmp)
-!---Copy fields (1-7) out of the augmented solution vector
+!---Copy the MUG fields (1-7, plus the hyperviscosity W fields if any) out of the augmented solution vector
 CALL self%mug%fe_rep%vec_create(mug_vec)
-DO i=1,7
+DO i=1,self%mug%fe_rep%nfields
     NULLIFY(tmp)
     CALL self%u%get_local(tmp, i)
     CALL mug_vec%restore_local(tmp, i)
@@ -2276,8 +2288,8 @@ CALL self%mug%psi_vac%get_local(pvac)
 tmp = tmp - pvac
 CALL mug_vec%restore_local(tmp, 6)
 DEALLOCATE(tmp, pvac)
-!---Copy fields (1-7) into the augmented solution vector (field 8, the coil currents, is kept)
-DO i=1,7
+!---Copy the MUG fields (1-7, plus W if any) into the augmented solution vector (the coil currents are kept)
+DO i=1,self%mug%fe_rep%nfields
   NULLIFY(tmp)
   CALL mug_vec%get_local(tmp, i)
   CALL self%u%restore_local(tmp, i)
