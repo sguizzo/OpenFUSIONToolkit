@@ -130,6 +130,8 @@ REAL(r8) :: spitzer_fac = 1.d0 !< Factor on the Spitzer resistivity coefficient 
 REAL(r8) :: nl_tol = 1.d-6 !< Absolute tolerance on the Newton residual |F| (set in oft.in group sparc_vde_options). Newton stalls at a round-off floor that rises at lower mass_scale (~5e-7 at mass_scale 1000, ~1-3e-6 at 100 for dt 0.5 ms); if nl_tol is below that floor every step fails and is retried with dt halved
 REAL(r8) :: mf_b0 = 1.d-3 !< Relative finite-difference step of the matrix-free Jacobian-vector product (oft_mf_matrix%b0; mugtok_td sets 1e-3, other OFT solvers 1e-5)
 REAL(r8) :: T_clip = -1.d0 !< Hard temperature floor [eV] on the accepted state after every step (oft_mugtok_td%T_clip); <= 0 disables
+REAL(r8) :: T_floor_cap = 2.d0 !< Cap on the per-cell floor source amplitude (relative deficit (T_floor-T)/T_floor; xmhd_2d T_floor_cap; 2 = xmhd.F90)
+REAL(r8) :: T_floor_rate = 0.25d0 !< Floor heating per step: dT = T_floor_rate*min(cap,deficit)*T_floor (xmhd_2d T_floor_rate; 0.25 = xmhd.F90)
 REAL(r8) :: T_floor = -1.d0 !< Temperature floor [eV], per-cell scheme of the 3D xmhd.F90 (xmhd_2d T_floor): max(T,T_floor) in every term but dT/dt, plus a lagged per-cell heating source in cells that dropped below it; <= 0 disables
 CHARACTER(LEN=7) :: lu_package = '' !< If set, LU package of the full-LU preconditioner ('mumps', 'umfpack', 'super', ...); empty = OFT's build default (UMFPACK if built, else MUMPS, else SuperLU)
 REAL (r8):: coords(3), psi(1), q(1)
@@ -144,7 +146,7 @@ NAMELIST/sparc_vde_options/force_rst,rst_start,visc_kick,visc_post,mass_scale_ki
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,lin_rtol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile, &
-  T_floor,kappa_par,visc_hyper,visc_hyper_pol
+  T_floor,kappa_par,visc_hyper,visc_hyper_pol,T_floor_cap,T_floor_rate
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -410,6 +412,9 @@ WRITE(*,'(A,ES10.2)')' Matrix-free Jacobian: finite-difference step mf_b0 =',mf_
 b_sim%T_clip = T_clip
 WRITE(*,'(A,F8.2,A)')' Hard temperature floor T_clip =',T_clip,' eV (<= 0: off)'
 b_sim%mug%T_floor = T_floor
+b_sim%mug%T_floor_cap = T_floor_cap
+b_sim%mug%T_floor_rate = T_floor_rate
+IF(T_floor > 0.d0)WRITE(*,'(A,F8.2,A,F8.3)')' T_floor source cap =',T_floor_cap,'  rate (fraction of T_floor per step) =',T_floor_rate
 WRITE(*,'(A,F8.2,A)')' Temperature floor T_floor (per-cell, xmhd.F90 scheme) =',T_floor,' eV (<= 0: off)'
 WRITE(*,'(A,I4,A)')' dt recovery: double dt after',dt_grow_steps,' clean steps (0: off)'
 WRITE(*,'(A,ES12.4,A)')' Post-kick nominal dt (dt_post) =',dt_post,' s'

@@ -153,6 +153,8 @@ TYPE, public :: oft_xmhd_2d_sim
   REAL(r8) :: T_sink = -1.d0 !< Temperature the sink term relaxes towards where `sink_func` returns true, dT/dt = -(T-T_sink)/tau_sink. Only meaningful when `tau_sink>0`
   REAL(r8) :: tau_sink = -1.d0 !< Relaxation timescale for the temperature sink term. The sink term is disabled unless explicitly set to a positive value
   REAL(r8) :: T_floor = -1.d0 !< Temperature floor [eV], per-cell scheme of the 3D xmhd.F90 (temp_floor): (1) every term except the dT/dt mass term uses max(T,T_floor); (2) cells where T < T_floor at any quadrature point are flagged (T_floor_flag = max (T_floor-T)/T_floor); at each step start the per-cell source T_floor_src = max(T_floor_src/2, min(2,flag)) (dropped below 1e-2) adds heating dT/dt = +T_floor_src*T_floor/(4 dt) in that cell (explicit, no Jacobian term). <= 0 disables; compressible, evolved T only
+  REAL(r8) :: T_floor_cap = 2.d0 !< Cap on the per-cell floor source amplitude T_floor_src (the flag is the relative deficit (T_floor-T)/T_floor); 2 = xmhd.F90
+  REAL(r8) :: T_floor_rate = 0.25d0 !< Floor heating per step as a fraction of T_floor*T_floor_src: dT/dt = T_floor_rate*T_floor_src*T_floor/dt (0.25 = xmhd.F90's 1/4)
   REAL(r8), ALLOCATABLE :: T_floor_flag(:) !< Per cell: max (T_floor-T)/T_floor seen since the last source update (see T_floor)
   REAL(r8), ALLOCATABLE :: T_floor_src(:) !< Per cell: floor heating amplitude for the current step (see T_floor)
   LOGICAL :: use_spitzer = .FALSE. !< If true (compressible only), override the region eta with Spitzer resistivity eta(n,T) at each quadrature point
@@ -1073,7 +1075,7 @@ DO i=1,mesh%nc
         T = self%parent_sim%T_floor
       END IF
       IF ((self%parent_sim%T_floor_src(i)>0.d0) .AND. (self%dt>0.d0)) sink_term = sink_term &
-        - self%parent_sim%T_floor_src(i)*self%parent_sim%T_floor/(4.d0*self%dt*(gamma-1.d0))
+        - self%parent_sim%T_floor_rate*self%parent_sim%T_floor_src(i)*self%parent_sim%T_floor/(self%dt*(gamma-1.d0))
     END IF
     !---Spitzer resistivity: override the region eta with a T-dependent value.
     !   When T is evolved, eta uses the frozen snapshot (eta_lag) so that it is
@@ -1469,7 +1471,7 @@ IF(.NOT.retry)THEN
   self%T_floor_src = self%T_floor_src/2.d0
   WHERE(self%T_floor_src<1.d-2) self%T_floor_src = 0.d0
 END IF
-WHERE(self%T_floor_flag>0.d0) self%T_floor_src = MAX(self%T_floor_src, MIN(2.d0, self%T_floor_flag))
+WHERE(self%T_floor_flag>0.d0) self%T_floor_src = MAX(self%T_floor_src, MIN(self%T_floor_cap, self%T_floor_flag))
 IF(oft_env%head_proc.AND.(.NOT.retry))WRITE(*,'(A,I8,A,ES10.2)')' T-FLOOR cells ',COUNT(self%T_floor_src>0.d0), &
   ', max source',MAXVAL(self%T_floor_src)
 self%T_floor_flag = 0.d0
@@ -1479,7 +1481,7 @@ END SUBROUTINE xmhd_2d_floor_update
 !! terms, as nodal accelerations [m/s^2] obtained from the same weak forms as nlfun_apply (cylindrical only),
 !! lumped-mass normalised: a_term(i) = -(weak term at test function i)/(int phi_i R dA). Terms: 1 JxB (incl.
 !! the compressible grad(n) pieces and the 1/R row terms), 2 -grad p, 3 convection -(v.grad)v, 4 shear
-!! viscosity, 5 bulk viscosity, 6 linear drag; dv/dt = sum of all six. Same coefficients as the residual
+!! viscosity, 5 bulk viscosity, 6 linear drag, 7 hyperviscosity (0 without W fields); dv/dt = sum of all seven. Same coefficients as the residual
 !! (nu_n/n, cold-plasma boost from the frozen T, T_floor clip), evaluated at the state, not over a step.
 !! Each term is written with rst_save as force_<name>_<tag>.rst: fields 2-4 = (a_R, a_phi, a_Z), field 1 =
 !! the lumped mass int phi_i R dA, other fields zero (field 6 then holds psi_vac, as rst_save adds it).
@@ -1489,15 +1491,16 @@ CLASS(oft_xmhd_2d_sim), INTENT(inout) :: self
 CLASS(oft_vector), INTENT(inout) :: a !< State (fields 1-7 used)
 REAL(r8), INTENT(in) :: t_out !< Time written to the output files
 CHARACTER(LEN=*), INTENT(in) :: tag !< File tag
-INTEGER(i4), PARAMETER :: NT = 6
-CHARACTER(LEN=8), PARAMETER :: tname(NT) = [CHARACTER(LEN=8) :: 'JxB', 'gradp', 'convect', 'visc', 'bulk', 'drag']
+INTEGER(i4), PARAMETER :: NT = 7
+CHARACTER(LEN=8), PARAMETER :: tname(NT) = [CHARACTER(LEN=8) :: 'JxB', 'gradp', 'convect', 'visc', 'bulk', 'drag', 'hyper']
 type(oft_quad_type), pointer :: quad
 LOGICAL :: eta_lag, use_nu_n, curved
 INTEGER(i4) :: i, m, jr, k, it
 REAL(r8) :: k_boltz, m_i, nu, nu1, nu2, n, vel(3), T, psi, by, dT(3), dn(3), dpsi(3), dby(3), dvel(3,3), &
-  div_vel, jac_mat(3,4), jac_det, int_factor, btmp(3), coords(3), R, T_visc, visc_fac, psiN_visc, B2, f(3,NT)
+  div_vel, jac_mat(3,4), jac_det, int_factor, btmp(3), coords(3), R, T_visc, visc_fac, psiN_visc, B2, f(3,NT), &
+  nu4q, Wv(3), dW(3,3)
 REAL(r8), POINTER, DIMENSION(:) :: n_w, T_w, psi_w, by_w, vtmp, pvac_w, T_eta_w, out_tmp
-REAL(r8), POINTER, DIMENSION(:,:) :: vel_w
+REAL(r8), POINTER, DIMENSION(:,:) :: vel_w, W_w
 REAL(r8), ALLOCATABLE :: basis_vals(:), basis_grads(:,:), acc(:,:,:), mass(:), T_eta_loc(:)
 INTEGER(i4), ALLOCATABLE :: cell_dofs(:)
 CLASS(oft_vector), POINTER :: v
@@ -1512,6 +1515,12 @@ vtmp => vel_w(2,:); CALL a%get_local(vtmp,3)
 vtmp => vel_w(3,:); CALL a%get_local(vtmp,4)
 CALL a%get_local(T_w,5); CALL a%get_local(psi_w,6); CALL a%get_local(by_w,7)
 CALL self%psi_vac%get_local(pvac_w)
+!---Hyperviscosity auxiliary fields (term 7 'hyper'; zero without hyperviscosity)
+ALLOCATE(W_w(3,oft_blagrange%ne)); W_w = 0.d0
+DO k=1,3
+  IF(self%w_ind(k)==0)CYCLE
+  vtmp => W_w(k,:); CALL a%get_local(vtmp,self%w_ind(k))
+END DO
 use_nu_n = ALLOCATED(self%nu_n)
 eta_lag = self%use_spitzer .AND. (.NOT.self%incomp) .AND. (.NOT.ASSOCIATED(self%T_func)) .AND. self%T_eta_valid
 IF(eta_lag)CALL self%T_eta%get_local(T_eta_w)
@@ -1551,9 +1560,23 @@ DO i=1,mesh%nc
       T = T + T_w(k)*basis_vals(jr)
       dT = dT + T_w(k)*basis_grads(:,jr)
     END DO
+    Wv = 0.d0; dW = 0.d0
+    IF(self%w_ind(1)>0)THEN
+      DO jr=1,oft_blagrange%nce
+        k = cell_dofs(jr)
+        Wv = Wv + W_w(:,k)*basis_vals(jr)
+        dW(:,1) = dW(:,1) + W_w(:,k)*basis_grads(1,jr)
+        dW(:,3) = dW(:,3) + W_w(:,k)*basis_grads(3,jr)
+      END DO
+    END IF
     n = n*self%den_scale; dn = dn*self%den_scale
     IF(self%T_floor>0.d0) T = MAX(T, self%T_floor)
     R = coords(1)+gs_epsilon
+    nu4q = 0.d0
+    IF(self%w_ind(1)>0)THEN
+      nu4q = self%nu4(mesh%reg(i))
+      IF(ALLOCATED(self%nu4_n)) nu4q = self%nu4_n(mesh%reg(i))/n
+    END IF
     div_vel = dvel(1,1) + vel(1)/R + dvel(3,3)
     btmp = cross_product(dpsi/R, [0.d0,1.d0,0.d0]) + by*[0.d0,1.d0,0.d0]/R + self%B_0
     B2 = DOT_PRODUCT(btmp,btmp)
@@ -1603,6 +1626,13 @@ DO i=1,mesh%nc
       !---6: linear drag
       f(1,6) = self%drag_rate*basis_vals(jr)*vel(1)*coords(1)
       f(3,6) = self%drag_rate*basis_vals(jr)*vel(3)*coords(1)
+      !---7: hyperviscosity (as nlfun_apply: the shear operator applied to W with -nu4*w_scale)
+      DO k=1,3
+        IF(self%w_ind(k)==0)CYCLE
+        f(k,7) = -nu4q*self%w_scale*(DOT_PRODUCT(basis_grads(:,jr),dW(k,:)) &
+          - basis_vals(jr)*DOT_PRODUCT(dn,dW(k,:))/n)*coords(1)
+        IF(k<3) f(k,7) = f(k,7) - nu4q*self%w_scale*basis_vals(jr)*Wv(k)/R
+      END DO
       k = cell_dofs(jr)
       acc(k,:,:) = acc(k,:,:) - f*int_factor
       mass(k) = mass(k) + basis_vals(jr)*coords(1)*int_factor
@@ -1623,7 +1653,7 @@ DO it=1,NT
   CALL self%rst_save(v, t_out, 0.d0, 'force_'//TRIM(tname(it))//'_'//TRIM(tag)//'.rst', 'U')
 END DO
 CALL v%delete; DEALLOCATE(v)
-DEALLOCATE(out_tmp, acc, mass, basis_vals, basis_grads, cell_dofs, T_eta_loc, vel_w, n_w, T_w, psi_w, by_w, pvac_w)
+DEALLOCATE(out_tmp, acc, mass, basis_vals, basis_grads, cell_dofs, T_eta_loc, vel_w, W_w, n_w, T_w, psi_w, by_w, pvac_w)
 IF(ASSOCIATED(T_eta_w))DEALLOCATE(T_eta_w)
 END SUBROUTINE xmhd_2d_force_terms
 !---------------------------------------------------------------------------
