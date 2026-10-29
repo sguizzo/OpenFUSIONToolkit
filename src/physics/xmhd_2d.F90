@@ -3216,17 +3216,17 @@ character(LEN=*), intent(in) :: path !< Path to store solution vector in file
 real(r8), optional, intent(out) :: t !< Time of loaded solution
 real(r8), optional, intent(out) :: dt !< Timestep at loaded time
 DEBUG_STACK_PUSH
-IF(self%w_ind(1) > 0)THEN
-  !---Restart files written without hyperviscosity have no W fields: they follow the physical fields
-  !   (indices 8..), which are read first, and are left at 0 (Newton solves them on the first iteration)
+IF((self%w_ind(1) > 0).AND.(.NOT.hdf5_field_exist(filename,TRIM(path)//'_'//TRIM(self%fe_rep%field_tags(self%w_ind(1))))))THEN
+  !---Restart file written without hyperviscosity: no W fields. They follow the physical fields (indices 8..),
+  !   which are read first, and are left at 0 (Newton solves them on the first iteration). err_flag is only set
+  !   by vec_load on a failure, so it is checked here only after the dataset test above
   BLOCK
   INTEGER(i4) :: ierr
   CALL u%set(0.d0)
   ierr = 0
   CALL self%fe_rep%vec_load(u,filename,path,err_flag=ierr)
-  IF((ierr /= 0).AND.(ierr /= -self%w_ind(1)))CALL oft_abort('Error reading restart file','rst_load',__FILE__)
-  IF((ierr == -self%w_ind(1)).AND.oft_env%head_proc)WRITE(*,'(2A)')' rst_load: no hyperviscosity fields in ', &
-    'restart file, starting them from 0'
+  IF(ierr /= -self%w_ind(1))CALL oft_abort('Error reading restart file','rst_load',__FILE__)
+  IF(oft_env%head_proc)WRITE(*,'(2A)')' rst_load: no hyperviscosity fields in restart file, starting them from 0'
   END BLOCK
 ELSE
   CALL self%fe_rep%vec_load(u,filename,path)
