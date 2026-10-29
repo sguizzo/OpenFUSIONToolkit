@@ -153,6 +153,8 @@ TYPE, public :: oft_xmhd_2d_sim
   REAL(r8) :: T_sink = -1.d0 !< Temperature the sink term relaxes towards where `sink_func` returns true, dT/dt = -(T-T_sink)/tau_sink. Only meaningful when `tau_sink>0`
   REAL(r8) :: tau_sink = -1.d0 !< Relaxation timescale for the temperature sink term. The sink term is disabled unless explicitly set to a positive value
   REAL(r8) :: T_floor = -1.d0 !< Temperature floor [eV], per-cell scheme of the 3D xmhd.F90 (temp_floor): (1) every term except the dT/dt mass term uses max(T,T_floor); (2) cells where T < T_floor at any quadrature point are flagged (T_floor_flag = max (T_floor-T)/T_floor); at each step start the per-cell source T_floor_src = max(T_floor_src/2, min(2,flag)) (dropped below 1e-2) adds heating dT/dt = +T_floor_src*T_floor/(4 dt) in that cell (explicit, no Jacobian term). <= 0 disables; compressible, evolved T only
+  REAL(r8) :: p_floor_T = -1.d0 !< Momentum-only pressure floor [eV]: the pressure force in the momentum equation uses p_m = 2 n k T_m with T_m = smooth max(T, p_floor_T) (so grad p_m = 2k (T_m grad n + s grad T), s = dT_m/dT in [0,1]); the temperature equation is unchanged. <= 0 disables
+  REAL(r8) :: p_floor_dT = 1.d0 !< Width [eV] of the smooth max for p_floor_T: T_m = (T + p_floor_T + sqrt((T-p_floor_T)^2 + p_floor_dT^2))/2
   REAL(r8) :: T_floor_cap = 2.d0 !< Cap on the per-cell floor source amplitude T_floor_src (the flag is the relative deficit (T_floor-T)/T_floor); 2 = xmhd.F90
   REAL(r8) :: T_floor_rate = 0.25d0 !< Floor heating per step as a fraction of T_floor*T_floor_src: dT/dt = T_floor_rate*T_floor_src*T_floor/dt (0.25 = xmhd.F90's 1/4)
   REAL(r8), ALLOCATABLE :: T_floor_flag(:) !< Per cell: max (T_floor-T)/T_floor seen since the last source update (see T_floor)
@@ -921,7 +923,7 @@ INTEGER(i4), ALLOCATABLE, DIMENSION(:) :: cell_dofs, cell_dofs_p
 REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dpsi_0(3),dby(3),T_eta_val,n_eta_val
 REAL(r8) :: dvel(3,3),div_vel,jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),coords(3),kappa_T(3,3)
 REAL(r8) :: sink_term, T_mass, q_ohm, dby_ohm(3), heat_ohm, n_ohm
-REAL(r8) :: nu4q, rfac, Wv(3), dW(3,3)
+REAL(r8) :: nu4q, rfac, Wv(3), dW(3,3), Tm, sm, qpf
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: W_weights_loc, resW_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals,basis_vals_p,T_weights_loc,n_weights_loc,psi_weights_loc,by_weights_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: T_eta_loc, n_eta_loc, ohm_q_loc, ohm_by_loc
@@ -931,7 +933,7 @@ REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grad
 !$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dpsi_0,dby,dvel,div_vel,btmp, tmp1, kappa_T, &
 !$omp T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, T_mass, &
 !$omp ohm_q_loc, ohm_by_loc, q_ohm, dby_ohm, heat_ohm, n_ohm, &
-!$omp nu4q, rfac, Wv, dW, W_weights_loc, resW_loc, &
+!$omp nu4q, rfac, Wv, dW, W_weights_loc, resW_loc, Tm, sm, qpf, &
 !$omp chi, m_i, eta, nu, nu1, nu2, T_visc, visc_fac, psiN_visc, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 ALLOCATE(n_weights_loc(oft_blagrange%nce),&
@@ -1076,6 +1078,13 @@ DO i=1,mesh%nc
       END IF
       IF ((self%parent_sim%T_floor_src(i)>0.d0) .AND. (self%dt>0.d0)) sink_term = sink_term &
         - self%parent_sim%T_floor_rate*self%parent_sim%T_floor_src(i)*self%parent_sim%T_floor/(self%dt*(gamma-1.d0))
+    END IF
+    !---Momentum-only pressure floor (p_floor_T): smooth max of T and its derivative, used only in grad p below
+    Tm = T; sm = 1.d0
+    IF (self%parent_sim%p_floor_T > 0.d0) THEN
+      qpf = SQRT((T-self%parent_sim%p_floor_T)**2 + self%parent_sim%p_floor_dT**2)
+      Tm = 0.5d0*(T + self%parent_sim%p_floor_T + qpf)
+      sm = 0.5d0*(1.d0 + (T-self%parent_sim%p_floor_T)/qpf)
     END IF
     !---Spitzer resistivity: override the region eta with a T-dependent value.
     !   When T is evolved, eta uses the frozen snapshot (eta_lag) so that it is
@@ -1240,8 +1249,8 @@ DO i=1,mesh%nc
           res_loc(jr, 2:4) = res_loc(jr, 2:4) &
           - self%dt*basis_vals(jr)*DOT_PRODUCT(dn,btmp)*btmp*int_factor*coords(1)/(mu0*m_i*n**2) &
           + self%dt*basis_vals(jr)*DOT_PRODUCT(btmp,btmp)*dn*int_factor*coords(1)/(2*mu0*m_i*n**2) &
-          + self%dt*basis_vals(jr)*2.d0*k_boltz*dT*int_factor*coords(1)/m_i &
-          + self%dt*basis_vals(jr)*2.d0*k_boltz*T*dn*int_factor*coords(1)/(m_i*n)
+          + self%dt*basis_vals(jr)*2.d0*k_boltz*sm*dT*int_factor*coords(1)/m_i &
+          + self%dt*basis_vals(jr)*2.d0*k_boltz*Tm*dn*int_factor*coords(1)/(m_i*n)
         END IF
         DO k=1,3
           res_loc(jr,k+1) = res_loc(jr, k+1) &
@@ -1281,8 +1290,8 @@ DO i=1,mesh%nc
           res_loc(jr,2:4) = res_loc(jr,2:4) &
           - self%dt*basis_vals(jr)*DOT_PRODUCT(dn,btmp)*btmp*int_factor/(mu0*m_i*n**2) &
           + self%dt*basis_vals(jr)*DOT_PRODUCT(btmp,btmp)*dn*int_factor/(2*mu0*m_i*n**2) &
-          + self%dt*basis_vals(jr)*2.d0*k_boltz*dT*int_factor/m_i &
-          + self%dt*basis_vals(jr)*2.d0*k_boltz*T*dn*int_factor/(m_i*n)
+          + self%dt*basis_vals(jr)*2.d0*k_boltz*sm*dT*int_factor/m_i &
+          + self%dt*basis_vals(jr)*2.d0*k_boltz*Tm*dn*int_factor/(m_i*n)
         END IF
         DO k=1,3
           res_loc(jr,k+1) = res_loc(jr, k+1) &
@@ -1606,7 +1615,13 @@ DO i=1,mesh%nc
       f(1,1) = f(1,1) + basis_vals(jr)*(btmp(2)**2-btmp(1)**2-btmp(3)**2)/(2.d0*mu0*m_i*n)
       f(2,1) = f(2,1) - basis_vals(jr)*btmp(1)*btmp(2)/(mu0*m_i*n)
       !---2: pressure gradient
-      f(:,2) = basis_vals(jr)*2.d0*k_boltz*dT*coords(1)/m_i + basis_vals(jr)*2.d0*k_boltz*T*dn*coords(1)/(m_i*n)
+      IF(self%p_floor_T > 0.d0)THEN !< momentum-only pressure floor, as nlfun_apply
+        f(:,2) = basis_vals(jr)*2.d0*k_boltz*0.5d0*(1.d0+(T-self%p_floor_T)/SQRT((T-self%p_floor_T)**2+self%p_floor_dT**2))*dT &
+          *coords(1)/m_i + basis_vals(jr)*2.d0*k_boltz*0.5d0*(T+self%p_floor_T+SQRT((T-self%p_floor_T)**2+self%p_floor_dT**2)) &
+          *dn*coords(1)/(m_i*n)
+      ELSE
+        f(:,2) = basis_vals(jr)*2.d0*k_boltz*dT*coords(1)/m_i + basis_vals(jr)*2.d0*k_boltz*T*dn*coords(1)/(m_i*n)
+      END IF
       !---3: convection
       DO k=1,3
         f(k,3) = basis_vals(jr)*DOT_PRODUCT(vel,dvel(k,:))*coords(1)
@@ -2022,7 +2037,7 @@ REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dby(3),dvel(3,3),div_vel
 REAL(r8) :: jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),tmp2(3),tmp3(3),coords(3),kappa_T(3,3)
 REAL(r8) :: dT_dpsi, deta_dT(2), r_geo, d6_eta, d7_eta, T_eta_val, n_eta_val
 REAL(r8) :: sink_term, dsink_dT, visc_row(3)
-REAL(r8) :: nu4q, rfac
+REAL(r8) :: nu4q, rfac, Tm, sm, dsm, qpf
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals, basis_vals_p,n_weights_loc,T_weights_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: psi_weights_loc,by_weights_loc,res_loc,T_eta_loc,n_eta_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grads_p
@@ -2032,7 +2047,7 @@ type(oft_local_mat), allocatable, dimension(:,:) :: jac_loc
 !$omp n_weights_loc,psi_weights_loc, by_weights_loc,vel_weights_loc,res_loc,jac_mat, &
 !$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dby,dvel,div_vel,btmp,tmp1,tmp2,tmp3,kappa_T, iloc, jac_loc, &
 !$omp dT_dpsi,deta_dT,r_geo,d6_eta,d7_eta,T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, dsink_dT, &
-!$omp nu4q, rfac, &
+!$omp nu4q, rfac, Tm, sm, dsm, qpf, &
 !$omp chi, m_i, eta, nu, nu1, nu2, visc_row, T_visc, visc_fac, psiN_visc, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 IF (incomp) ALLOCATE(basis_vals_p(oft_blagrange_p%nce),basis_grads_p(3,oft_blagrange_p%nce))
@@ -2211,6 +2226,14 @@ DO i=1,mesh%nc
       nu2 = nu1*self%nu2_ratio
     END IF
     kappa_T = chi_tensor(chi, self%chi_par_mult, self%chi_aniso, btmp)
+    !---Momentum-only pressure floor (p_floor_T), as nlfun_apply; dsm = d(sm)/dT
+    Tm = T; sm = 1.d0; dsm = 0.d0
+    IF (self%p_floor_T > 0.d0) THEN
+      qpf = SQRT((T-self%p_floor_T)**2 + self%p_floor_dT**2)
+      Tm = 0.5d0*(T + self%p_floor_T + qpf)
+      sm = 0.5d0*(1.d0 + (T-self%p_floor_T)/qpf)
+      dsm = 0.5d0*self%p_floor_dT**2/qpf**3
+    END IF
     diag_vals = diag_vals + [n, vel(1), vel(2), vel(3), T, psi, by]*int_factor
     !---Compute local matrix contributions
     ! p, vel
@@ -2291,10 +2314,10 @@ DO i=1,mesh%nc
           DO l=1,3
             jac_loc(l+1,1)%m(jr,jc) = jac_loc(l+1,1)%m(jr,jc) &
             ! grad T terms
-            + dt_fac*basis_vals(jr)*2.d0*k_boltz*basis_vals(jc)*dT(l)*int_factor*coords(1)/(m_i*n) & !
-            + dt_fac*basis_vals(jr)*2.d0*k_boltz*T*basis_grads(l,jc)*int_factor*coords(1)/(m_i*n) &
-            - dt_fac*basis_vals(jr)*2.d0*k_boltz*basis_vals(jc)*n*dT(l)*int_factor*coords(1)/(m_i*n**2.d0) &
-            - dt_fac*basis_vals(jr)*2.d0*k_boltz*basis_vals(jc)*dn(l)*T*int_factor*coords(1)/(m_i*n**2.d0) &
+            + dt_fac*basis_vals(jr)*2.d0*k_boltz*basis_vals(jc)*sm*dT(l)*int_factor*coords(1)/(m_i*n) & !
+            + dt_fac*basis_vals(jr)*2.d0*k_boltz*Tm*basis_grads(l,jc)*int_factor*coords(1)/(m_i*n) &
+            - dt_fac*basis_vals(jr)*2.d0*k_boltz*basis_vals(jc)*n*sm*dT(l)*int_factor*coords(1)/(m_i*n**2.d0) &
+            - dt_fac*basis_vals(jr)*2.d0*k_boltz*basis_vals(jc)*dn(l)*Tm*int_factor*coords(1)/(m_i*n**2.d0) &
             ! dyadic b terms
             - dt_fac*basis_vals(jc)*DOT_PRODUCT(basis_grads(:,jr), btmp)*btmp(l)*int_factor*coords(1)/(mu0*m_i*n**2.d0) &
             - dt_fac*basis_vals(jr)*DOT_PRODUCT(basis_grads(:,jc), btmp)*btmp(l)*int_factor*coords(1)/(mu0*m_i*n**2.d0) &
@@ -2345,10 +2368,10 @@ DO i=1,mesh%nc
             DO l=1,3
               jac_loc(l+1,1)%m(jr,jc) = jac_loc(l+1,1)%m(jr,jc) &
               ! grad T terms
-              + dt_fac*basis_vals(jr)*2.d0*k_boltz*basis_vals(jc)*dT(l)*int_factor/(m_i*n) & !
-              + dt_fac*basis_vals(jr)*2.d0*k_boltz*T*basis_grads(l,jc)*int_factor/(m_i*n) &
-              - dt_fac*basis_vals(jr)*2.d0*k_boltz*basis_vals(jc)*n*dT(l)*int_factor/(m_i*n**2.d0) &
-              - dt_fac*basis_vals(jr)*2.d0*k_boltz*basis_vals(jc)*dn(l)*T*int_factor/(m_i*n**2.d0) &
+              + dt_fac*basis_vals(jr)*2.d0*k_boltz*basis_vals(jc)*sm*dT(l)*int_factor/(m_i*n) & !
+              + dt_fac*basis_vals(jr)*2.d0*k_boltz*Tm*basis_grads(l,jc)*int_factor/(m_i*n) &
+              - dt_fac*basis_vals(jr)*2.d0*k_boltz*basis_vals(jc)*n*sm*dT(l)*int_factor/(m_i*n**2.d0) &
+              - dt_fac*basis_vals(jr)*2.d0*k_boltz*basis_vals(jc)*dn(l)*Tm*int_factor/(m_i*n**2.d0) &
               ! dyadic b terms
               - dt_fac*basis_vals(jc)*DOT_PRODUCT(basis_grads(:,jr), btmp)*btmp(l)*int_factor/(mu0*m_i*n**2.d0) &
               - dt_fac*basis_vals(jr)*DOT_PRODUCT(basis_grads(:,jc), btmp)*btmp(l)*int_factor/(mu0*m_i*n**2.d0) &
@@ -2440,14 +2463,16 @@ DO i=1,mesh%nc
           IF (cyl_flag) THEN
             DO l=1,3
               jac_loc(l+1,5)%m(jr,jc) = jac_loc(l+1,5)%m(jr,jc) &
-              + dt_fac*basis_vals(jr)*2*k_boltz*dn(l)*basis_vals(jc)*int_factor*coords(1)/(m_i*n) &
-              + dt_fac*basis_vals(jr)*2*k_boltz*basis_grads(l,jc)*int_factor*coords(1)/(m_i) 
+              + dt_fac*basis_vals(jr)*2*k_boltz*sm*dn(l)*basis_vals(jc)*int_factor*coords(1)/(m_i*n) &
+              + dt_fac*basis_vals(jr)*2*k_boltz*sm*basis_grads(l,jc)*int_factor*coords(1)/(m_i) &
+              + dt_fac*basis_vals(jr)*2*k_boltz*dsm*dT(l)*basis_vals(jc)*int_factor*coords(1)/(m_i) 
             END DO
           ELSE
             DO l=1,3
               jac_loc(l+1,5)%m(jr,jc) = jac_loc(l+1,5)%m(jr,jc) &
-              + dt_fac*basis_vals(jr)*2*k_boltz*dn(l)*basis_vals(jc)*int_factor/(m_i*n) &
-              + dt_fac*basis_vals(jr)*2*k_boltz*basis_grads(l,jc)*int_factor/(m_i) 
+              + dt_fac*basis_vals(jr)*2*k_boltz*sm*dn(l)*basis_vals(jc)*int_factor/(m_i*n) &
+              + dt_fac*basis_vals(jr)*2*k_boltz*sm*basis_grads(l,jc)*int_factor/(m_i) &
+              + dt_fac*basis_vals(jr)*2*k_boltz*dsm*dT(l)*basis_vals(jc)*int_factor/(m_i) 
             END DO
           END IF
         END IF
