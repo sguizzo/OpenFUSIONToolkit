@@ -43,7 +43,7 @@ TYPE(gs_factory), TARGET :: machine
 TYPE(oft_tmaker_td) :: tokamaker
 REAL(r8), POINTER, DIMENSION(:) :: tmp_arr
 !---Runtime options
-INTEGER(i4) :: order = 3
+INTEGER(i4) :: order = 3 !< Element order, set from the equilibrium file's tokamaker/FE_ORDER
 INTEGER(i4) :: nsteps = 1
 INTEGER(i4) :: rst_freq = 1
 INTEGER(i4) :: ndims, nl_its, l_its, nretry
@@ -164,7 +164,10 @@ CALL multigrid_construct_surf(mg_mesh)
 filename_eq = mesh_filename
 IF(TRIM(filename_eq)=='none')CALL oft_abort('No mesh/equilibrium file in "native_mesh_options"','sparc_vde_beta_kick',__FILE__)
 
-order = 3
+! Element order = the order TokaMaker solved the equilibrium at (tokamaker/FE_ORDER), so PSI's nodes match
+CALL hdf5_read(order,TRIM(filename_eq),"tokamaker/FE_ORDER",success)
+IF(.NOT.success)CALL oft_abort('No "tokamaker/FE_ORDER" in the equilibrium file','sparc_vde_beta_kick',__FILE__)
+WRITE(*,'(A,I2)')' Element order (tokamaker/FE_ORDER):',order
 CALL oft_lag_setup(mg_mesh,order,ML_blag_obj=ML_blagrange,minlev=-1)
 IF(.NOT.oft_2D_lagrange_cast(blagrange,ML_blagrange%current_level))CALL oft_abort("Invalid lagrange FE object","setup",__FILE__)
 !---------------------------------------------------------------------------
@@ -172,6 +175,8 @@ IF(.NOT.oft_2D_lagrange_cast(blagrange,ML_blagrange%current_level))CALL oft_abor
 !---------------------------------------------------------------------------
 CALL hdf5_field_get_sizes(TRIM(filename_eq),"tokamaker/PSI",ndims,dim_sizes)
 npoints = dim_sizes(1)
+IF(npoints /= blagrange%ne)CALL oft_abort('tokamaker/PSI size does not match the order-FE_ORDER Lagrange space', &
+  'sparc_vde_beta_kick',__FILE__)
 ALLOCATE(psi_eq(npoints))
 CALL hdf5_read(psi_eq,TRIM(filename_eq),"tokamaker/PSI",success)
 
