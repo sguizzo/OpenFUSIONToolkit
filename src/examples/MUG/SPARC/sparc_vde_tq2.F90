@@ -79,6 +79,9 @@ INTEGER(i4) :: reg_id_tmp, coil_id_tmp, nturns_tmp, cond_id_tmp
 REAL(r8) :: eta_tmp
 REAL(r8), allocatable, dimension(:,:) :: eta_reg !< Resistivity [in-plane (poloidal), out-of-plane (toroidal)] by region, in units of mu0
 REAL(r8) :: eta_plate_pol = 6.93d-7 !< Poloidal (in-plane) resistivity [Ohm*m] of the PLATE_* conductors; their toroidal resistivity is left at the file value
+REAL(r8) :: eta_gap_pol = -1.d0 !< Poloidal (in-plane) resistivity [Ohm*m] for the F (= R B_phi) equation in the regions listed in gap_regs (e.g. the gap between limiter and inner vessel shell and the space between the shells), which then conduct poloidal current but no toroidal current (psi there stays vacuum). <= 0 (default): mugtok_td's vacuum fallback 0.1 Ohm*m. M3D-C1: 1.94e-3
+INTEGER(i4) :: gap_regs(16) = 0 !< Region ids that get eta_gap_pol (0 = unused); core02 meshes: 3 (between the shells), 4, 33, 34 (limiter to inner shell)
+REAL(r8) :: eta_vac_pol = -1.d0 !< Poloidal (in-plane) resistivity [Ohm*m] for the F (= R B_phi) equation in the non-plasma, non-conductor regions (vacuum, the gap between limiter and inner shell, between the shells, outside); <= 0 keeps mugtok_td's fallback 0.1 Ohm*m. M3D-C1 uses eta_vac = 1.94e-3 there. psi is unaffected (only the in-plane component is set)
 REAL(r8), allocatable, dimension(:) :: coil_currs_fixed !< Fixed coil currents passed to every step (step() overwrites equil%coil_currs internally, so a separate reference copy is needed)
 INTEGER(i4) :: nstep_total = 10000 !< Number of time steps (dt*nstep should approach the wall time ~ms)
 REAL(r8) :: t_kick_start = 1.d-6 !< Time at which the kappa_perp kick begins (let the system settle first) [s]
@@ -171,7 +174,7 @@ NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_sc
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,lin_rtol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile, &
-  T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq,eta_implicit,spitzer_smooth,eta_implicit_jac,ohmic_eta_implicit,visc_hyper,visc_hyper_pol,dt_tq2_adapt,dt_tq2_max
+  T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq,eta_implicit,spitzer_smooth,eta_implicit_jac,ohmic_eta_implicit,eta_gap_pol,gap_regs,eta_vac_pol,visc_hyper,visc_hyper_pol,dt_tq2_adapt,dt_tq2_max
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -372,6 +375,20 @@ DO i=1,SIZE(cond_names)
   WRITE(*,'(2A,I4,2(A,ES12.4))')' ',TRIM(cond_names(i)),reg_id_tmp, &
     '  eta_pol [Ohm*m] = ',eta_reg(reg_id_tmp,1)*mu0,'  eta_tor [Ohm*m] = ',eta_reg(reg_id_tmp,2)*mu0
 END DO
+IF(eta_gap_pol > 0.d0)THEN ! gaps conduct poloidal current only (in-plane eta for the F equation; psi unchanged)
+  DO i=1,SIZE(gap_regs)
+    IF(gap_regs(i) <= 1 .OR. gap_regs(i) > machine%mesh%nreg)CYCLE
+    IF(eta_reg(gap_regs(i),1) > 0.d0) CALL oft_abort('gap_regs lists a conductor region','driver',__FILE__)
+    eta_reg(gap_regs(i),1) = eta_gap_pol/mu0
+    WRITE(*,'(A,I4,A,ES12.4,A)')' Gap region',gap_regs(i),': poloidal eta =',eta_gap_pol,' Ohm*m (toroidal: vacuum)'
+  END DO
+END IF
+IF(eta_vac_pol > 0.d0)THEN ! poloidal resistivity of the non-plasma, non-conductor regions (F equation only)
+  DO i=2,machine%mesh%nreg
+    IF(eta_reg(i,1) <= 0.d0) eta_reg(i,1) = eta_vac_pol/mu0
+  END DO
+END IF
+WRITE(*,'(A,ES12.4,A)')' Poloidal resistivity of vacuum/gap regions (eta_vac_pol) = ',eta_vac_pol,' Ohm*m (<= 0: fallback 0.1)'
 b_sim%fix_F_boundary = fix_F_boundary
 WRITE(*,'(A,L2)')' Fixed F = R*B_phi on the outer boundary (fix_F_boundary): ',fix_F_boundary
 b_sim%pre_nlocal = pre_nlocal
