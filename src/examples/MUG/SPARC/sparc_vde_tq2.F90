@@ -118,7 +118,9 @@ REAL(r8) :: dt_phase = 0.d0 !< Starting (nominal) dt of the current kick phase, 
 REAL(r8) :: kappa_tq2 = 3.084d25 !< kappa_perp [1/(m s)] from the second thermal quench on (M3D-C1: 0.2 normalized)
 REAL(r8) :: tq2_t_start = -1.d0 !< Start of the second thermal quench [s]; <= 0: the restart time
 REAL(r8) :: tq2_dur = 2.d-5 !< Length of the short-step quench phase [s]
-REAL(r8) :: dt_tq2 = 5.d-7 !< Timestep during the quench phase [s]
+REAL(r8) :: dt_tq2 = 5.d-7 !< Timestep during the quench phase [s] (with dt_tq2_adapt: the starting dt of that phase)
+LOGICAL :: dt_tq2_adapt = .FALSE. !< Adaptive dt (oft_mugtok_td dt_adapt, lin_its_target) also in the quench phase (3), starting from dt_tq2 and capped at dt_tq2_max; .FALSE. = fixed dt_tq2 there (retries halve it and it does not grow back), as before 2026-11-10
+REAL(r8) :: dt_tq2_max = -1.d0 !< With dt_tq2_adapt: cap on dt in the quench phase [s]; <= 0: dt_cq
 REAL(r8) :: dt_cq = 2.5d-4 !< Largest timestep in the current-quench phase [s]
 REAL(r8) :: mass_scale_tq2 = -1.d0 !< Ion mass enhancement in the quench phase (3); <= 0: mass_scale_post
 REAL(r8) :: mass_scale_cq = -1.d0 !< Ion mass enhancement in the current-quench phase (4); <= 0: mass_scale_post
@@ -168,7 +170,7 @@ NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_sc
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,lin_rtol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile, &
-  T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq,eta_implicit,spitzer_smooth,eta_implicit_jac,visc_hyper,visc_hyper_pol
+  T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq,eta_implicit,spitzer_smooth,eta_implicit_jac,visc_hyper,visc_hyper_pol,dt_tq2_adapt,dt_tq2_max
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -497,6 +499,7 @@ IF(mass_scale_cq <= 0.d0) mass_scale_cq = mass_scale_post
 WRITE(*,'(A,ES12.4,A,ES12.4,A,ES12.4,A,ES12.4,A,ES12.4)')' Second thermal quench: kappa_tq2 =',kappa_tq2, &
   ' from t =',tq2_t_start,' for',tq2_dur,' s at dt =',dt_tq2,'; then current quench, dt up to',dt_cq
 WRITE(*,'(A,ES12.4,A,I3,A)')'   kappa_par/kappa_perp =',kappa_par/kappa_tq2,'; dt doubles after',dt_grow_steps,' clean steps'
+IF(dt_tq2_adapt)WRITE(*,'(A,ES12.4,A,ES12.4)')'   quench-phase dt adaptive (dt_tq2_adapt) from',dt_tq2,' up to',MERGE(dt_tq2_max, dt_cq, dt_tq2_max > 0.d0)
 WRITE(*,'(A,F10.2,A,F10.2,A,F10.2)')'   mass scale: before the quench',mass_scale_post,', quench',mass_scale_tq2, &
   ', current quench',mass_scale_cq
 DO i=rst_start+1,nstep_total
@@ -537,9 +540,12 @@ DO i=rst_start+1,nstep_total
       b_sim%mug%m_i(1) = m_i_plasma*mass_scale_tq2
       dt = dt_tq2
       dt_phase = dt_tq2
+      IF(dt_tq2_adapt)THEN ! adaptive from dt_tq2 up to dt_tq2_max (dt_min_frac still refers to dt_tq2)
+        b_sim%dt_max = MERGE(dt_tq2_max, dt_cq, dt_tq2_max > 0.d0)
+      END IF
       b_sim%pre_freq = 1
       b_sim%pre_adapt = .FALSE.
-      b_sim%dt_adapt = .FALSE.
+      b_sim%dt_adapt = dt_tq2_adapt
     CASE(4) ! current quench: keep kappa_perp, let dt grow from the quench dt to dt_cq
       b_sim%mug%kappa(1) = kappa_tq2
       b_sim%mug%m_i(1) = m_i_plasma*mass_scale_cq
