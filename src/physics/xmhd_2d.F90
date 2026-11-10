@@ -163,6 +163,8 @@ TYPE, public :: oft_xmhd_2d_sim
   CLASS(oft_vector), POINTER :: T_eta => NULL() !< Snapshot of the temperature field used to evaluate the Spitzer resistivity when T is evolved. Frozen once per timestep by `xmhd_2d_freeze_eta_temp` so that eta is identical in the RHS (dt=0) and LHS (dt>0) evaluations of the residual; see that routine for why this matters
   CLASS(oft_vector), POINTER :: n_eta => NULL() !< Snapshot of the (normalized) density field used with `T_eta` for the Spitzer resistivity; frozen alongside it by `xmhd_2d_freeze_eta_temp`
   LOGICAL :: T_eta_valid = .FALSE. !< True once `T_eta` (and `n_eta`) hold a valid snapshot
+  LOGICAL :: eta_implicit = .FALSE. !< Backward-Euler Spitzer resistivity (evolved T): eta = eta(n,T) of the current iterate in both residual passes instead of the `T_eta` snapshot. The psi equation (divided by eta) then uses (psi - psi^n)/eta with psi^n the `psi_n` snapshot, so its RHS (dt=0) pass contributes nothing on the plasma cells and no grad(eta) term arises; F uses eta inside its diffusion flux. Ohmic heating uses the same implicit eta. Jacobian: d(eta)/dT couplings in the (psi,T) and (F,T) blocks
+  CLASS(oft_vector), POINTER :: psi_n => NULL() !< Snapshot of psi (field 6, without psi_vac) at the start of the step, taken with `T_eta` by `xmhd_2d_freeze_eta_temp`; used by `eta_implicit`
   LOGICAL :: ohmic = .FALSE. !< Ohmic heating eta*J^2 in the temperature equation (compressible, evolved T only). The current is frozen once per timestep by `xmhd_2d_freeze_ohmic` (explicit source, no Jacobian term); eta and n are the same frozen values as for the Spitzer resistivity
   CLASS(oft_vector), POINTER :: ohm_q => NULL() !< Frozen q = Delta*psi/R (cylindrical; lap(psi) otherwise) from a mass-matrix projection, so that mu0*J_phi = -q
   CLASS(oft_vector), POINTER :: ohm_by => NULL() !< Frozen F (= R B_phi, field 7), for J_pol = grad(F) x grad(phi)/mu0
@@ -829,7 +831,7 @@ class(xmhd_2d_nlfun), intent(inout) :: self !< NL function object
 class(oft_vector), target, intent(inout) :: a !< Source field
 class(oft_vector), intent(inout) :: b !< Result of metric function
 type(oft_quad_type), pointer :: quad
-LOGICAL :: linear,cyl_flag, incomp, eta_lag, use_kappa, use_nu_n
+LOGICAL :: linear,cyl_flag, incomp, eta_lag, eta_impl, use_kappa, use_nu_n
 INTEGER(i4) :: i,l
 REAL(r8) :: k_boltz = elec_charge
 REAL(r8) :: m_i=proton_mass
@@ -838,7 +840,7 @@ REAL(r8) :: T_visc, visc_fac, psiN_visc
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights,psi_weights,by_weights, T_res, &
                               n_res, psi_res, by_res, vtmp, velx_res, vely_res, velz_res
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
-REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights, T_eta_weights, n_eta_weights
+REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights, T_eta_weights, n_eta_weights, psi_n_weights
 REAL(r8), POINTER, DIMENSION(:) :: ohm_q_weights, ohm_by_weights
 LOGICAL :: ohm_on !< Ohmic heating active (frozen current snapshot available)
 LOGICAL :: hyp_on !< Hyperviscosity auxiliary fields present (w_ind)
@@ -893,6 +895,10 @@ eta_lag = self%parent_sim%use_spitzer .AND. (.NOT.incomp) &
           .AND. (.NOT.ASSOCIATED(self%parent_sim%T_func)) .AND. self%parent_sim%T_eta_valid
 IF(eta_lag)CALL self%parent_sim%T_eta%get_local(T_eta_weights)
 IF(eta_lag)CALL self%parent_sim%n_eta%get_local(n_eta_weights)
+!---Implicit (backward-Euler) eta: eta from the current iterate, psi time derivative against psi^n
+eta_impl = eta_lag .AND. self%parent_sim%eta_implicit
+NULLIFY(psi_n_weights)
+IF(eta_impl)CALL self%parent_sim%psi_n%get_local(psi_n_weights)
 !---Ohmic heating: current frozen at the start of the step (see xmhd_2d_freeze_ohmic)
 NULLIFY(ohm_q_weights, ohm_by_weights)
 ohm_on = self%parent_sim%ohmic .AND. self%parent_sim%ohm_valid .AND. (.NOT.incomp) &
@@ -920,18 +926,18 @@ BLOCK
 LOGICAL :: curved
 INTEGER(i4) :: k,m,jr
 INTEGER(i4), ALLOCATABLE, DIMENSION(:) :: cell_dofs, cell_dofs_p
-REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dpsi_0(3),dby(3),T_eta_val,n_eta_val
+REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dpsi_0(3),dby(3),T_eta_val,n_eta_val,psi_dt
 REAL(r8) :: dvel(3,3),div_vel,jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),coords(3),kappa_T(3,3)
 REAL(r8) :: sink_term, T_mass, q_ohm, dby_ohm(3), heat_ohm, n_ohm
 REAL(r8) :: nu4q, rfac, Wv(3), dW(3,3), Tm, sm, qpf
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: W_weights_loc, resW_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals,basis_vals_p,T_weights_loc,n_weights_loc,psi_weights_loc,by_weights_loc
-REAL(r8), ALLOCATABLE, DIMENSION(:) :: T_eta_loc, n_eta_loc, ohm_q_loc, ohm_by_loc
+REAL(r8), ALLOCATABLE, DIMENSION(:) :: T_eta_loc, n_eta_loc, ohm_q_loc, ohm_by_loc, psi_n_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grads_p, res_loc
 !$omp parallel private(k,m,jr,curved,coords,cell_dofs,cell_dofs_p,basis_vals,basis_grads, basis_vals_p, basis_grads_p, T_weights_loc, &
 !$omp n_weights_loc,psi_weights_loc, by_weights_loc,vel_weights_loc,res_loc,jac_mat, &
 !$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dpsi_0,dby,dvel,div_vel,btmp, tmp1, kappa_T, &
-!$omp T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, T_mass, &
+!$omp T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, T_mass, psi_n_loc, psi_dt, &
 !$omp ohm_q_loc, ohm_by_loc, q_ohm, dby_ohm, heat_ohm, n_ohm, &
 !$omp nu4q, rfac, Wv, dW, W_weights_loc, resW_loc, Tm, sm, qpf, &
 !$omp chi, m_i, eta, nu, nu1, nu2, T_visc, visc_fac, psiN_visc, gamma, D_diff) reduction(+:diag_vals)
@@ -945,6 +951,7 @@ ELSE
   ALLOCATE(T_weights_loc(oft_blagrange%nce))
 END IF
 IF (eta_lag) ALLOCATE(T_eta_loc(oft_blagrange%nce), n_eta_loc(oft_blagrange%nce))
+IF (eta_impl) ALLOCATE(psi_n_loc(oft_blagrange%nce))
 IF (ohm_on) ALLOCATE(ohm_q_loc(oft_blagrange%nce), ohm_by_loc(oft_blagrange%nce))
 ALLOCATE(cell_dofs(oft_blagrange%nce), res_loc(oft_blagrange%nce,7))
 IF (hyp_on) ALLOCATE(W_weights_loc(3,oft_blagrange%nce), resW_loc(oft_blagrange%nce,3))
@@ -974,6 +981,7 @@ DO i=1,mesh%nc
   END IF
   IF (eta_lag) T_eta_loc = T_eta_weights(cell_dofs)
   IF (eta_lag) n_eta_loc = n_eta_weights(cell_dofs)
+  IF (eta_impl) psi_n_loc = psi_n_weights(cell_dofs) + psi_vac_weights(cell_dofs)
   IF (ohm_on) ohm_q_loc = ohm_q_weights(cell_dofs)
   IF (ohm_on) ohm_by_loc = ohm_by_weights(cell_dofs)
 
@@ -1090,8 +1098,12 @@ DO i=1,mesh%nc
     !   When T is evolved, eta uses the frozen snapshot (eta_lag) so that it is
     !   the same coefficient in the RHS and LHS passes of a timestep; otherwise
     !   it uses the temperature above (the closure value when T_func is set).
+    !   With eta_implicit it uses the current iterate, and the psi time derivative is
+    !   taken against the psi^n snapshot (psi_dt), so the RHS pass gives 0 for psi.
+    psi_dt = psi
+    IF (eta_impl) psi_dt = psi - DOT_PRODUCT(psi_n_loc, basis_vals)
     IF ((.NOT.incomp) .AND. self%parent_sim%use_spitzer) THEN
-      IF (eta_lag) THEN
+      IF (eta_lag .AND. (.NOT.eta_impl)) THEN
         T_eta_val = 0.d0; n_eta_val = 0.d0
         DO jr=1,oft_blagrange%nce
           T_eta_val = T_eta_val + T_eta_loc(jr)*basis_vals(jr)
@@ -1333,13 +1345,13 @@ DO i=1,mesh%nc
       tmp1 = cross_product(B_0,vel)
       IF(cyl_flag)THEN
         res_loc(jr, 6) = res_loc(jr, 6) &
-        + basis_vals(jr)*psi*int_factor/(eta(2)*(coords(1)+gs_epsilon)) &
+        + basis_vals(jr)*psi_dt*int_factor/(eta(2)*(coords(1)+gs_epsilon)) &
         + basis_vals(jr)*self%dt*DOT_PRODUCT(vel, dpsi)*int_factor/(eta(2)*(coords(1)+gs_epsilon)) &
         + basis_vals(jr)*self%dt*tmp1(2)*int_factor/(eta(2)*(coords(1)+gs_epsilon)) &
         + self%dt*DOT_PRODUCT(basis_grads(:,jr), dpsi_0)*int_factor/(coords(1)+gs_epsilon)
       ELSE
         res_loc(jr, 6) = res_loc(jr, 6) &
-        + basis_vals(jr)*psi*int_factor/eta(2) &
+        + basis_vals(jr)*psi_dt*int_factor/eta(2) &
         + basis_vals(jr)*self%dt*DOT_PRODUCT(vel, dpsi)*int_factor/eta(2) &
         + basis_vals(jr)*self%dt*tmp1(2)*int_factor/eta(2) &
         + self%dt*DOT_PRODUCT(basis_grads(:,jr), dpsi_0)*int_factor
@@ -1406,6 +1418,7 @@ END DO
 DEALLOCATE(basis_vals,basis_grads, n_weights_loc,T_weights_loc,&
           vel_weights_loc, psi_weights_loc, by_weights_loc,cell_dofs, res_loc)
 IF (eta_lag) DEALLOCATE(T_eta_loc, n_eta_loc)
+IF (eta_impl) DEALLOCATE(psi_n_loc)
 IF (ohm_on) DEALLOCATE(ohm_q_loc, ohm_by_loc)
 IF (hyp_on) DEALLOCATE(W_weights_loc, resW_loc)
 IF (incomp) DEALLOCATE(basis_vals_p, basis_grads_p, cell_dofs_p)
@@ -1464,6 +1477,7 @@ IF(ASSOCIATED(T_eta_weights))DEALLOCATE(T_eta_weights)
 IF(ASSOCIATED(n_eta_weights))DEALLOCATE(n_eta_weights)
 IF(ASSOCIATED(ohm_q_weights))DEALLOCATE(ohm_q_weights)
 IF(ASSOCIATED(ohm_by_weights))DEALLOCATE(ohm_by_weights)
+IF(ASSOCIATED(psi_n_weights))DEALLOCATE(psi_n_weights)
 END SUBROUTINE nlfun_apply
 !---------------------------------------------------------------------------------
 !> Update the per-cell temperature-floor heating source (xmhd.F90 scheme, see T_floor).
@@ -1834,6 +1848,10 @@ IF(self%use_spitzer.AND.(.NOT.self%incomp).AND.(.NOT.ASSOCIATED(self%T_func)))TH
   CALL u%get_local(t_vals,1)
   CALL self%n_eta%restore_local(t_vals)
   DEALLOCATE(t_vals)
+  NULLIFY(t_vals)
+  CALL u%get_local(t_vals,6)
+  CALL self%psi_n%restore_local(t_vals) ! psi^n for eta_implicit
+  DEALLOCATE(t_vals)
   self%T_eta_valid=.TRUE.
 END IF
 DEBUG_STACK_POP
@@ -1971,7 +1989,7 @@ end subroutine xmhd_2d_freeze_ohmic
 subroutine build_approx_jacobian(self,a)
 class(oft_xmhd_2d_sim), intent(inout) :: self
 class(oft_vector), intent(inout) :: a !< Solution for computing jacobian
-LOGICAL :: cyl_flag, linear, incomp, eta_lag, use_kappa, use_nu_n
+LOGICAL :: cyl_flag, linear, incomp, eta_lag, eta_impl, use_kappa, use_nu_n
 INTEGER(i4) :: i
 REAL(r8) :: k_boltz=elec_charge
 REAL(r8) :: m_i = proton_mass
@@ -1980,7 +1998,7 @@ REAL(r8) :: T_visc, visc_fac, psiN_visc
 LOGICAL :: hyp_on
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights, psi_weights, by_weights, vtmp
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
-REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights, T_eta_weights, n_eta_weights
+REAL(r8), POINTER, DIMENSION(:) :: psi_vac_weights, T_eta_weights, n_eta_weights, psi_n_weights
 REAL(r8) :: convect_fac !< Zeroes the convective derivative term's Jacobian contributions below when drop_convection=.TRUE.
 REAL(r8) :: pres_fac !< Enables the Jacobian of the pressure-conserving density diffusion term when evolve_pressure=.TRUE.
 integer(KIND=omp_lock_kind), allocatable, dimension(:) :: tlocks
@@ -2023,6 +2041,9 @@ eta_lag = self%use_spitzer .AND. (.NOT.incomp) .AND. (.NOT.ASSOCIATED(self%T_fun
           .AND. self%T_eta_valid
 IF(eta_lag)CALL self%T_eta%get_local(T_eta_weights)
 IF(eta_lag)CALL self%n_eta%get_local(n_eta_weights)
+eta_impl = eta_lag .AND. self%eta_implicit
+NULLIFY(psi_n_weights)
+IF(eta_impl)CALL self%psi_n%get_local(psi_n_weights)
 !--Setup thread locks
 ALLOCATE(tlocks(self%fe_rep%nfields))
 DO i=1,self%fe_rep%nfields
@@ -2035,18 +2056,18 @@ INTEGER(i4) :: k, l, m, ik, jr, jc
 INTEGER(i4), POINTER, DIMENSION(:) :: cell_dofs, cell_dofs_p
 REAL(r8) :: n,vel(3),T,psi,by,dT(3),dn(3),dpsi(3),dby(3),dvel(3,3),div_vel
 REAL(r8) :: jac_mat(3,4),jac_det,int_factor,btmp(3),tmp1(3),tmp2(3),tmp3(3),coords(3),kappa_T(3,3)
-REAL(r8) :: dT_dpsi, deta_dT(2), r_geo, d6_eta, d7_eta, T_eta_val, n_eta_val
+REAL(r8) :: dT_dpsi, deta_dT(2), r_geo, d6_eta, d7_eta, T_eta_val, n_eta_val, psi_dt
 REAL(r8) :: sink_term, dsink_dT, visc_row(3)
 REAL(r8) :: nu4q, rfac, Tm, sm, dsm, qpf
 REAL(r8), ALLOCATABLE, DIMENSION(:) :: basis_vals, basis_vals_p,n_weights_loc,T_weights_loc
-REAL(r8), ALLOCATABLE, DIMENSION(:) :: psi_weights_loc,by_weights_loc,res_loc,T_eta_loc,n_eta_loc
+REAL(r8), ALLOCATABLE, DIMENSION(:) :: psi_weights_loc,by_weights_loc,res_loc,T_eta_loc,n_eta_loc,psi_n_loc
 REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grads_p
 TYPE(oft_1d_int), ALLOCATABLE, DIMENSION(:) :: iloc
 type(oft_local_mat), allocatable, dimension(:,:) :: jac_loc
 !$omp parallel private(ik, k, l, m,jr,jc,curved,coords,cell_dofs,cell_dofs_p,basis_vals,basis_vals_p,basis_grads,basis_grads_p,T_weights_loc, &
 !$omp n_weights_loc,psi_weights_loc, by_weights_loc,vel_weights_loc,res_loc,jac_mat, &
 !$omp jac_det,int_factor,T,n,psi,by,vel,dT,dn,dpsi,dby,dvel,div_vel,btmp,tmp1,tmp2,tmp3,kappa_T, iloc, jac_loc, &
-!$omp dT_dpsi,deta_dT,r_geo,d6_eta,d7_eta,T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, dsink_dT, &
+!$omp dT_dpsi,deta_dT,r_geo,d6_eta,d7_eta,T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, dsink_dT, psi_n_loc, psi_dt, &
 !$omp nu4q, rfac, Tm, sm, dsm, qpf, &
 !$omp chi, m_i, eta, nu, nu1, nu2, visc_row, T_visc, visc_fac, psiN_visc, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
@@ -2062,6 +2083,7 @@ END IF
 ALLOCATE(cell_dofs(oft_blagrange%nce))
 IF (incomp) ALLOCATE(cell_dofs_p(oft_blagrange_p%nce))
 IF (eta_lag) ALLOCATE(T_eta_loc(oft_blagrange%nce), n_eta_loc(oft_blagrange%nce))
+IF (eta_impl) ALLOCATE(psi_n_loc(oft_blagrange%nce))
 ALLOCATE(jac_loc(self%fe_rep%nfields,self%fe_rep%nfields))
 ALLOCATE(iloc(self%fe_rep%nfields))
 DO ik=1,self%fe_rep%nfields
@@ -2094,6 +2116,7 @@ DO i=1,mesh%nc
   by_weights_loc = by_weights(cell_dofs)
   IF (eta_lag) T_eta_loc = T_eta_weights(cell_dofs)
   IF (eta_lag) n_eta_loc = n_eta_weights(cell_dofs)
+  IF (eta_impl) psi_n_loc = psi_n_weights(cell_dofs) + psi_vac_weights(cell_dofs)
 
   !Set material properties
   chi = self%chi(mesh%reg(i))
@@ -2178,8 +2201,10 @@ DO i=1,mesh%nc
     !---Temperature floor, matching nlfun_apply: coefficients use max(T,T_floor); the per-cell
     !   source is explicit (constant within a step), so it adds nothing to the Jacobian
     IF ((.NOT.incomp) .AND. (.NOT.ASSOCIATED(self%T_func)) .AND. (self%T_floor>0.d0)) T = MAX(T, self%T_floor)
+    psi_dt = psi
+    IF (eta_impl) psi_dt = psi - DOT_PRODUCT(psi_n_loc, basis_vals)
     IF ((.NOT.incomp) .AND. self%use_spitzer) THEN
-      IF (eta_lag) THEN
+      IF (eta_lag .AND. (.NOT.eta_impl)) THEN
         !---eta is frozen over the step, so it contributes no Jacobian sensitivity
         T_eta_val = 0.d0; n_eta_val = 0.d0
         DO jr=1,oft_blagrange%nce
@@ -2733,6 +2758,20 @@ DO i=1,mesh%nc
           jac_loc(7, 6)%m(jr,jc) = jac_loc(7, 6)%m(jr,jc) &
             + d7_eta*deta_dT(1)*dT_dpsi*basis_vals(jc)
         END IF
+        !-- Implicit Spitzer eta(T) with evolved T (eta_implicit): the psi(6) and F(7) residuals
+        !   depend on T through eta, d(res)/d(T_col) = d(res)/d(eta)*d(eta)/dT*basis_vals(jc),
+        !   with the psi time derivative taken against psi^n (psi_dt), as in nlfun_apply
+        IF (eta_impl) THEN
+          tmp1 = cross_product(B_0, vel)
+          r_geo = 1.d0
+          IF(cyl_flag) r_geo = coords(1) + gs_epsilon
+          d6_eta = -( basis_vals(jr)*psi_dt &
+                      + dt_fac*basis_vals(jr)*(DOT_PRODUCT(vel,dpsi) + tmp1(2)) ) &
+                   *int_factor/(eta(2)**2 * r_geo)
+          d7_eta = dt_fac*DOT_PRODUCT(basis_grads(:,jr), dby)*int_factor/r_geo
+          jac_loc(6, 5)%m(jr,jc) = jac_loc(6, 5)%m(jr,jc) + d6_eta*deta_dT(2)*basis_vals(jc)
+          jac_loc(7, 5)%m(jr,jc) = jac_loc(7, 5)%m(jr,jc) + d7_eta*deta_dT(1)*basis_vals(jc)
+        END IF
       END DO
     END DO
     !---Hyperviscosity blocks (exact; the n-dependence of the hyperviscous term is left out of this approximate Jacobian)
@@ -2792,6 +2831,7 @@ CALL self%fe_rep%mat_destroy_local(jac_loc)
 DEALLOCATE(basis_vals,basis_grads,T_weights_loc,vel_weights_loc, &
           n_weights_loc, psi_weights_loc, by_weights_loc, cell_dofs,jac_loc,iloc)
 IF (eta_lag) DEALLOCATE(T_eta_loc, n_eta_loc)
+IF (eta_impl) DEALLOCATE(psi_n_loc)
 IF (incomp) DEALLOCATE(basis_vals_p, basis_grads_p, cell_dofs_p)
 !$omp end parallel
 END BLOCK
@@ -2824,6 +2864,7 @@ DEALLOCATE(tmp,n_weights,vel_weights, T_weights, &
 DEALLOCATE(psi_vac_weights)
 IF(ASSOCIATED(T_eta_weights))DEALLOCATE(T_eta_weights)
 IF(ASSOCIATED(n_eta_weights))DEALLOCATE(n_eta_weights)
+IF(ASSOCIATED(psi_n_weights))DEALLOCATE(psi_n_weights)
 end subroutine build_approx_jacobian
 
 !---------------------------------------------------------------------------
@@ -2961,6 +3002,8 @@ IF(.NOT.self%incomp)THEN
   CALL self%T_eta%set(0.d0)
   CALL oft_blagrange%vec_create(self%n_eta)
   CALL self%n_eta%set(0.d0)
+  CALL oft_blagrange%vec_create(self%psi_n)
+  CALL self%psi_n%set(0.d0)
   self%T_eta_valid=.FALSE.
 END IF
 !---Create Jacobian matrix
