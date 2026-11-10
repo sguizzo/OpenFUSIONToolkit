@@ -211,6 +211,7 @@ TYPE, public :: oft_xmhd_2d_sim
   PROCEDURE :: rst_load => rst_load
 END TYPE oft_xmhd_2d_sim
 TYPE(oft_xmhd_2d_sim), POINTER :: current_sim => NULL() !Active 2D MHD simulation
+LOGICAL, PUBLIC :: spitzer_smooth = .FALSE. !< Smooth cap in spitzer_eta: eta = 1/(sigma_Spitzer + 1/eta_cap) (conductivities add) instead of min(eta_Spitzer, eta_cap). Removes the kink (d(eta)/dT jumping from 0 to its steepest value at the cap, T - T_off = (spitzer_fac*C/eta_cap)^(2/3), 0.31 eV for spitzer_fac = 1) that makes Newton non-smooth with eta_implicit. Same limits: eta -> eta_cap below T_off, -> eta_Spitzer far above; at the old cap point eta is eta_cap/2
 REAL(r8), PUBLIC :: spitzer_fac = 1.d0 !< Factor on the Spitzer coefficient in spitzer_eta (applied before the cap). 1 = the perpendicular coefficient 1.03e-4*Z*lnLam used so far; 0.511 = parallel Spitzer (the 0.51 Spitzer-Harm factor for Z=1), which is what M3D-C1's eta field shows (eta_C1 = 0.511 x this formula, 2026-10-27)
 !
 CLASS(multigrid_mesh), POINTER :: mg_mesh => NULL() !< Multigrid mesh object
@@ -1753,10 +1754,26 @@ real(r8), parameter :: lnLam = 17.d0     ! M3D-C1 lambda_coulomb (default)
 real(r8), parameter :: T_off = 7.5d0     ! M3D-C1 eta_te_offset [eV]
 real(r8), parameter :: eta_cap = 1.0d-2  ! M3D-C1 eta_max = eta_vac [Ohm*m]
 real(r8), parameter :: C_sp = 1.03d-4*Zi*lnLam ! perpendicular Spitzer coefficient [Ohm*m*eV^1.5]
-real(r8) :: dT, eta_phys, deta_phys_dT
+real(r8) :: dT, eta_phys, deta_phys_dT, sig_sp, dsig_dT
 LOGICAL :: capped
-!---Offset Spitzer, capped at eta_cap (cap is reached for T < T_off + ~0.01 eV)
+!---Offset Spitzer, capped at eta_cap (the hard cap is reached for T < T_off + (spitzer_fac*C_sp/eta_cap)**(2/3),
+!   0.31 eV for spitzer_fac = 1); with spitzer_smooth the conductivities add instead (smooth, no kink)
 dT = T - T_off
+IF(spitzer_smooth)THEN
+  sig_sp = 0.d0; dsig_dT = 0.d0
+  IF(dT > 0.d0)THEN
+    sig_sp = dT**1.5d0/(spitzer_fac*C_sp)
+    dsig_dT = 1.5d0*SQRT(dT)/(spitzer_fac*C_sp)
+  END IF
+  eta_phys = 1.d0/(sig_sp + 1.d0/eta_cap)
+  eta(1) = eta_phys/mu0
+  eta(2) = eta_phys/mu0
+  IF(PRESENT(deta_dT))THEN
+    deta_dT(1) = -eta_phys**2*dsig_dT/mu0
+    deta_dT(2) = deta_dT(1)
+  END IF
+  RETURN
+END IF
 capped = .TRUE.
 eta_phys = eta_cap
 IF(dT > 0.d0)THEN
