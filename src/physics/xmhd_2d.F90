@@ -164,6 +164,7 @@ TYPE, public :: oft_xmhd_2d_sim
   CLASS(oft_vector), POINTER :: n_eta => NULL() !< Snapshot of the (normalized) density field used with `T_eta` for the Spitzer resistivity; frozen alongside it by `xmhd_2d_freeze_eta_temp`
   LOGICAL :: T_eta_valid = .FALSE. !< True once `T_eta` (and `n_eta`) hold a valid snapshot
   LOGICAL :: eta_implicit = .FALSE. !< Backward-Euler Spitzer resistivity (evolved T): eta = eta(n,T) of the current iterate in both residual passes instead of the `T_eta` snapshot. The psi equation (divided by eta) then uses (psi - psi^n)/eta with psi^n the `psi_n` snapshot, so its RHS (dt=0) pass contributes nothing on the plasma cells and no grad(eta) term arises; F uses eta inside its diffusion flux. Ohmic heating uses the same implicit eta. Jacobian: d(eta)/dT couplings in the (psi,T) and (F,T) blocks
+  LOGICAL :: eta_implicit_jac = .TRUE. !< With eta_implicit: add the d(eta)/dT couplings to the (psi,T) and (F,T) blocks of the approximate Jacobian (preconditioner only; the matrix-free Newton product always has them). .FALSE. leaves them out, for testing whether they help the preconditioner
   CLASS(oft_vector), POINTER :: psi_n => NULL() !< Snapshot of psi (field 6, without psi_vac) at the start of the step, taken with `T_eta` by `xmhd_2d_freeze_eta_temp`; used by `eta_implicit`
   LOGICAL :: ohmic = .FALSE. !< Ohmic heating eta*J^2 in the temperature equation (compressible, evolved T only). The current is frozen once per timestep by `xmhd_2d_freeze_ohmic` (explicit source, no Jacobian term); eta and n are the same frozen values as for the Spitzer resistivity
   CLASS(oft_vector), POINTER :: ohm_q => NULL() !< Frozen q = Delta*psi/R (cylindrical; lap(psi) otherwise) from a mass-matrix projection, so that mu0*J_phi = -q
@@ -2778,7 +2779,7 @@ DO i=1,mesh%nc
         !-- Implicit Spitzer eta(T) with evolved T (eta_implicit): the psi(6) and F(7) residuals
         !   depend on T through eta, d(res)/d(T_col) = d(res)/d(eta)*d(eta)/dT*basis_vals(jc),
         !   with the psi time derivative taken against psi^n (psi_dt), as in nlfun_apply
-        IF (eta_impl) THEN
+        IF (eta_impl .AND. self%eta_implicit_jac) THEN
           tmp1 = cross_product(B_0, vel)
           r_geo = 1.d0
           IF(cyl_flag) r_geo = coords(1) + gs_epsilon
