@@ -97,6 +97,8 @@ REAL(r8) :: visc_sol_dpsiN = 0.002d0 !< Width of the psi-keyed transition (norma
 LOGICAL :: fix_F_boundary = .TRUE. !< Hold F = R B_phi at its initial value on the outer mesh boundary (fixed TF current, as M3D-C1's default iconst_bz=1; default); .FALSE. = the natural condition that conserves the domain's toroidal flux (runs before 2026-10-26)
 LOGICAL :: ohmic_heating = .FALSE. !< Ohmic heating eta*J^2 in the temperature equation (xmhd_2d option ohmic; current frozen once per step, explicit source). Default off (runs before 2026-10-26 have none)
 LOGICAL :: eta_implicit = .FALSE. !< Backward-Euler Spitzer resistivity (xmhd_2d eta_implicit): eta from the current Newton iterate instead of the start-of-step T, with the psi time derivative against the psi^n snapshot. Default off (lagged eta, as before 2026-11-09)
+REAL(r8) :: visc_hyper = 0.d0 !< Hyperviscosity nu4 [m^4/s] in the plasma from the post-kick phase on (all phases here), -nu4*grad^4(v) (xmhd_2d hyper_visc; > 0 adds the auxiliary W fields, 0 = off). With visc_dynamic it is the value at visc_nref (nu4 = visc_hyper*visc_nref/n)
+LOGICAL :: visc_hyper_pol = .FALSE. !< With visc_hyper: hyperviscosity on v_R and v_Z only (2 auxiliary fields instead of 3)
 LOGICAL :: eta_implicit_jac = .TRUE. !< With eta_implicit: d(eta)/dT couplings in the approximate Jacobian (xmhd_2d eta_implicit_jac); .FALSE. = leave them out (preconditioner test)
 LOGICAL :: lu_reanalyze = .FALSE. !< Redo the LU symbolic analysis at every preconditioner rebuild (mugtok_td lu_reanalyze; default: only at the first factorization). .TRUE. reproduces runs before 2026-10-26
 INTEGER(i4) :: pre_nlocal = 0 !< If > 0: spatial block-Jacobi preconditioner with pre_nlocal METIS subdomains, one LU (package lu_package) each, instead of the full LU (mugtok_td pre_nlocal); 0 = full LU
@@ -166,7 +168,7 @@ NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_sc
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,lin_rtol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile, &
-  T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq,eta_implicit,spitzer_smooth,eta_implicit_jac
+  T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq,eta_implicit,spitzer_smooth,eta_implicit_jac,visc_hyper,visc_hyper_pol
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -182,7 +184,10 @@ CALL multigrid_construct_surf(mg_mesh)
 filename_eq = mesh_filename
 IF(TRIM(filename_eq)=='none')CALL oft_abort('No mesh/equilibrium file in "native_mesh_options"','sparc_vde_beta_kick',__FILE__)
 
-order = 3
+! Element order = the order TokaMaker solved the equilibrium at (tokamaker/FE_ORDER), so PSI's nodes match
+CALL hdf5_read(order,TRIM(filename_eq),"tokamaker/FE_ORDER",success)
+IF(.NOT.success)CALL oft_abort('No "tokamaker/FE_ORDER" in the equilibrium file','sparc_vde_tq2',__FILE__)
+WRITE(*,'(A,I2)')' Element order (tokamaker/FE_ORDER):',order
 CALL oft_lag_setup(mg_mesh,order,ML_blag_obj=ML_blagrange,minlev=-1)
 IF(.NOT.oft_2D_lagrange_cast(blagrange,ML_blagrange%current_level))CALL oft_abort("Invalid lagrange FE object","setup",__FILE__)
 !---------------------------------------------------------------------------
@@ -190,6 +195,8 @@ IF(.NOT.oft_2D_lagrange_cast(blagrange,ML_blagrange%current_level))CALL oft_abor
 !---------------------------------------------------------------------------
 CALL hdf5_field_get_sizes(TRIM(filename_eq),"tokamaker/PSI",ndims,dim_sizes)
 npoints = dim_sizes(1)
+IF(npoints /= blagrange%ne)CALL oft_abort('tokamaker/PSI size does not match the order-FE_ORDER Lagrange space', &
+  'sparc_vde_tq2',__FILE__)
 ALLOCATE(psi_eq(npoints))
 CALL hdf5_read(psi_eq,TRIM(filename_eq),"tokamaker/PSI",success)
 
@@ -312,6 +319,8 @@ mhd_flag(1) = .TRUE.
 
 equil%device => machine
 b_sim%pm = pm               ! solver progress output (copied to oft_env%pm in setup_mhd)
+b_sim%hyper_visc = (visc_hyper > 0.d0) ! auxiliary W fields are created in setup_mhd
+b_sim%hyper_visc_pol = visc_hyper_pol
 b_sim%save_rst = .NOT.plot_only ! optional; default off (off in plot-only mode so setup doesn't overwrite mugtok_00000.rst)
 b_sim%rst_freq = 1
 ! Use a complete LU of the coupled Jacobian (keeps the psi-velocity coupling that
@@ -413,6 +422,11 @@ IF(visc_dynamic)THEN
   ALLOCATE(b_sim%mug%nu_n(SIZE(b_sim%mug%nu)))
   b_sim%mug%nu_n = b_sim%mug%nu*visc_nref
 END IF
+IF(b_sim%hyper_visc .AND. visc_dynamic)THEN
+  ALLOCATE(b_sim%mug%nu4_n(SIZE(b_sim%mug%nu)))
+  b_sim%mug%nu4_n = 0.d0
+END IF
+IF(b_sim%hyper_visc)WRITE(*,'(A,ES12.4,A,L2)')' Hyperviscosity nu4 [m^4/s] =',visc_hyper,'  poloidal only =',visc_hyper_pol
 WRITE(*,'(A,L2,A,ES12.4,A,F6.2)')' Viscosity: dynamic (uniform m_i*n*nu) =',visc_dynamic, &
   '  n_ref [m^-3] =',visc_nref,'  bulk/shear ratio =',visc_bulk_ratio
 b_sim%mug%visc_sol_T0 = visc_sol_T0
@@ -497,6 +511,10 @@ DO i=rst_start+1,nstep_total
   END IF
   IF(kick_phase /= kick_phase_prev)THEN
     b_sim%mug%nu(1) = visc_post
+    IF(b_sim%hyper_visc)THEN
+      b_sim%mug%nu4(1) = visc_hyper
+      IF(visc_dynamic) b_sim%mug%nu4_n(1) = visc_hyper*visc_nref ! nu4 = visc_hyper*visc_nref/n
+    END IF
     b_sim%mug%visc_sol_mult = visc_sol_mult
     b_sim%mug%m_i(1) = m_i_plasma*mass_scale_post
     b_sim%mug%evolve_pressure = .TRUE.
