@@ -1167,7 +1167,7 @@ DO i=1,mesh%nc
         dby_ohm = dby_ohm + ohm_by_loc(jr)*basis_grads(:,jr)
       END DO
       n_ohm = n
-      IF (eta_lag) n_ohm = n_eta_val*self%parent_sim%den_scale
+      IF (eta_lag .AND. (.NOT.eta_impl)) n_ohm = n_eta_val*self%parent_sim%den_scale ! n_eta_val is only set in the frozen-eta branch
       IF (cyl_flag) THEN
         heat_ohm = (eta(1)*DOT_PRODUCT(dby_ohm,dby_ohm)/(coords(1)+gs_epsilon)**2 + eta(2)*q_ohm**2)/mu0
       ELSE
