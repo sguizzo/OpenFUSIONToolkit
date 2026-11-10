@@ -100,6 +100,7 @@ LOGICAL :: eta_implicit = .FALSE. !< Backward-Euler Spitzer resistivity (xmhd_2d
 REAL(r8) :: visc_hyper = 0.d0 !< Hyperviscosity nu4 [m^4/s] in the plasma from the post-kick phase on (all phases here), -nu4*grad^4(v) (xmhd_2d hyper_visc; > 0 adds the auxiliary W fields, 0 = off). With visc_dynamic it is the value at visc_nref (nu4 = visc_hyper*visc_nref/n)
 LOGICAL :: visc_hyper_pol = .FALSE. !< With visc_hyper: hyperviscosity on v_R and v_Z only (2 auxiliary fields instead of 3)
 LOGICAL :: eta_implicit_jac = .TRUE. !< With eta_implicit: d(eta)/dT couplings in the approximate Jacobian (xmhd_2d eta_implicit_jac); .FALSE. = leave them out (preconditioner test)
+LOGICAL :: ohmic_eta_implicit = .FALSE. !< With ohmic heating and lagged eta: eta in the Ohmic source from the current Newton iterate (xmhd_2d ohmic_eta_implicit; psi/F keep the frozen eta). Cures the step-to-step T / Ohmic-power alternation of the explicit source in the cold quench plasma
 LOGICAL :: lu_reanalyze = .FALSE. !< Redo the LU symbolic analysis at every preconditioner rebuild (mugtok_td lu_reanalyze; default: only at the first factorization). .TRUE. reproduces runs before 2026-10-26
 INTEGER(i4) :: pre_nlocal = 0 !< If > 0: spatial block-Jacobi preconditioner with pre_nlocal METIS subdomains, one LU (package lu_package) each, instead of the full LU (mugtok_td pre_nlocal); 0 = full LU
 LOGICAL :: pre_overlap = .FALSE. !< With pre_nlocal > 0: overlap the subdomains by one layer of unknowns (additive Schwarz)
@@ -170,7 +171,7 @@ NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_sc
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,lin_rtol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile, &
-  T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq,eta_implicit,spitzer_smooth,eta_implicit_jac,visc_hyper,visc_hyper_pol,dt_tq2_adapt,dt_tq2_max
+  T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq,eta_implicit,spitzer_smooth,eta_implicit_jac,ohmic_eta_implicit,visc_hyper,visc_hyper_pol,dt_tq2_adapt,dt_tq2_max
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -385,6 +386,7 @@ CALL b_sim%setup_mhd(equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg, e
 b_sim%mug%ohmic = ohmic_heating
 b_sim%mug%eta_implicit = eta_implicit
 b_sim%mug%eta_implicit_jac = eta_implicit_jac
+b_sim%mug%ohmic_eta_implicit = ohmic_eta_implicit
 b_sim%lu_reanalyze = lu_reanalyze
 WRITE(*,'(A,L2)')' Redo the LU symbolic analysis at every rebuild (lu_reanalyze): ',lu_reanalyze
 b_sim%dt_refactor_tol = dt_refactor_tol
@@ -400,6 +402,7 @@ WRITE(*,'(A,L2,A,I4,A,I4)')' Adaptive dt (dt_adapt):',dt_adapt,'  lin_its_target
 WRITE(*,'(A,L2)')' Ohmic heating in the temperature equation (ohmic_heating): ',ohmic_heating
 WRITE(*,'(A,L2)')' Implicit (backward-Euler) Spitzer resistivity (eta_implicit): ',eta_implicit
 WRITE(*,'(A,L2)')' d(eta)/dT couplings in the approximate Jacobian (eta_implicit_jac): ',eta_implicit_jac
+WRITE(*,'(A,L2)')' Ohmic heating with eta from the current iterate (ohmic_eta_implicit): ',ohmic_eta_implicit
 
 ! Compare the seeded 2*k*n*T with the equilibrium pressure on axis (psihat=1, where the
 ! normalized n/T profiles are 1)
