@@ -113,10 +113,13 @@ REAL(r8) :: pre_its_ratio = 1.5d0 !< With pre_adapt: also rebuild once a reused-
 REAL(r8) :: dt_refactor_tol = 0.d0 !< dt changes within this relative distance of the preconditioner's dt rebuild only the vacuum operator (oft_mugtok_td%dt_refactor_tol; 0: every dt change rebuilds)
 LOGICAL :: dt_adapt = .FALSE. !< Adaptive dt in the phases with a nominal dt cap (oft_mugtok_td%dt_adapt; replaces dt_grow_steps there): dt targets lin_its_target GMRES iterations per step, at most the phase's nominal dt. dt_min_frac then also stops a run whose controller drives dt below dt_min_frac x that cap
 INTEGER(i4) :: lin_its_target = 20 !< With dt_adapt: target GMRES iterations per step
+LOGICAL :: kick_dt_adapt = .FALSE. !< Adaptive dt during the kick (phase 1) too: starts at 1e-5 s, then targets lin_its_target GMRES iterations per step, capped at dt_kick_max; the last kick step is shortened to end exactly at t_kick_start+t_kick_dur. Off: fixed 1e-5 s kick steps
+REAL(r8) :: dt_kick_max = 1.d-4 !< With kick_dt_adapt: dt cap during the kick [s]
 INTEGER(i4) :: dt_hist = 5 !< With dt_adapt: steps in the dt/GMRES history
 LOGICAL :: step_profile = .FALSE. !< Print a per-step profile of wall and CPU time by part of the step (oft_mugtok_td%step_profile)
 LOGICAL :: newton_backtrack = .FALSE. !< Turn on backtracking (step halving while |F| grows) in the Newton solver; mugtok_td switches it off by default
 LOGICAL :: resid_dump = .FALSE. !< Write the Newton residual of failed Newton attempts to the XDMF group mugtok_resid (oft_mugtok_td%resid_dump; at most 8)
+LOGICAL :: dt_clipped = .FALSE. !< This step's dt was shortened to end on the kick end (kick_dt_adapt)
 INTEGER(i4) :: n_clean = 0 !< Consecutive steps without a retry (for dt_grow_steps)
 INTEGER(i4) :: force_rst(32) = 0 !< Diagnostic: if force_rst(1) > 0, load each listed restart file, write its momentum-equation terms (force_<term>_NNNNN.rst, see xmhd_2d_force_terms) with the post-kick settings, and stop
 INTEGER(i4) :: ifr
@@ -156,7 +159,7 @@ CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/force_rst,rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,lin_rtol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
-  dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile, &
+  dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile,kick_dt_adapt,dt_kick_max, &
   T_floor,kappa_par,visc_hyper,visc_hyper_pol,T_floor_cap,T_floor_rate,p_floor_T,p_floor_dT,eta_implicit,spitzer_smooth,eta_implicit_jac,ohmic_eta_implicit,eta_gap_pol,gap_regs,pol_mult_regs,pol_mult,eta_vac_pol
 !------------------------------------------------------------------------------
 ! Initialize enviroment
@@ -406,6 +409,7 @@ WRITE(*,'(A,L2)')' Per-step profile (step_profile):',step_profile
 WRITE(*,'(A,L2,A,I4,A,F6.2,A,ES10.2)')' Cost-based preconditioner refresh (pre_adapt):',pre_adapt,'  pre_max_age',pre_max_age, &
   '  pre_its_ratio',pre_its_ratio,'  dt_refactor_tol',dt_refactor_tol
 WRITE(*,'(A,L2,A,I4,A,I4)')' Adaptive dt (dt_adapt):',dt_adapt,'  lin_its_target',lin_its_target,'  dt_hist',dt_hist
+WRITE(*,'(A,L2,A,ES10.2,A)')' Adaptive dt during the kick (kick_dt_adapt):',kick_dt_adapt,'  dt_kick_max',dt_kick_max,' s'
 WRITE(*,'(A,L2)')' Ohmic heating in the temperature equation (ohmic_heating): ',ohmic_heating
 WRITE(*,'(A,L2)')' Implicit (backward-Euler) Spitzer resistivity (eta_implicit): ',eta_implicit
 WRITE(*,'(A,L2)')' d(eta)/dT couplings in the approximate Jacobian (eta_implicit_jac): ',eta_implicit_jac
@@ -536,9 +540,11 @@ DO i=rst_start+1,nstep_total
   ! dumping stored thermal energy/beta through enhanced cross-field transport.
   ! Timed off the simulation clock `t` (not the step index), so the kick window is
   ! independent of dt.
+  ! With kick_dt_adapt the last kick step ends exactly at the kick end: a relative tolerance keeps
+  ! round-off in t from adding a sliver step
   IF(t < t_kick_start)THEN
     kick_phase = 0
-  ELSE IF(t < t_kick_start+t_kick_dur)THEN
+  ELSE IF(t < t_kick_start+t_kick_dur-MERGE(1.d-9*t_kick_dur,0.d0,kick_dt_adapt))THEN
     kick_phase = 1
   ELSE
     kick_phase = 2
@@ -572,7 +578,8 @@ DO i=rst_start+1,nstep_total
       b_sim%mug%evolve_pressure = .FALSE.
       b_sim%pre_freq = 1 ! state changes too fast to reuse the preconditioner
       b_sim%pre_adapt = .FALSE.
-      b_sim%dt_adapt = .FALSE.
+      b_sim%dt_adapt = kick_dt_adapt ! fresh preconditioner every step (pre_freq 1), as the controller assumes
+      b_sim%dt_max = dt_kick_max
     CASE(2) ! post-kick: restore kappa_perp, continue evolving the VDE, and make
             ! density diffusion pressure-conserving (-(T/n)*D*lap(n) in the T equation)
       dt = dt_post
@@ -602,6 +609,16 @@ DO i=rst_start+1,nstep_total
     b_sim%dt_nhist = 0
     b_sim%pre_force_update = .TRUE. ! nu/m_i/kappa changed: rebuild the preconditioner
   END IF
+  ! Adaptive kick: never step past the kick end; split a last step that would leave a sliver into two equal ones
+  dt_clipped = .FALSE.
+  IF(kick_phase == 1 .AND. kick_dt_adapt)THEN
+    dt_clipped = (dt >= t_kick_start+t_kick_dur-t) .OR. (t_kick_start+t_kick_dur-t < 1.5d0*dt)
+    IF(dt >= t_kick_start+t_kick_dur-t)THEN
+      dt = t_kick_start+t_kick_dur-t
+    ELSE IF(t_kick_start+t_kick_dur-t < 1.5d0*dt)THEN
+      dt = 0.5d0*(t_kick_start+t_kick_dur-t)
+    END IF
+  END IF
   write(*,*) "Step: ", i, "  t = ", t, "  kick_phase = ", kick_phase, "  kappa(1) = ", b_sim%mug%kappa(1), &
     "  kappa_par = ", b_sim%mug%kappa(1)*b_sim%mug%chi_par_mult, &
     "  nu(1) = ", b_sim%mug%nu(1), "  mass_scale = ", b_sim%mug%m_i(1)/m_i_plasma, &
@@ -612,7 +629,8 @@ DO i=rst_start+1,nstep_total
   CALL b_sim%step(coil_currs_fixed, t, dt, nl_its, l_its, nretry)
   ! Stop once solver-failure retries have cut dt too far below this phase's starting dt
   ! (convergence has broken down); the restart file for this step is already written
-  IF(dt_min_frac > 0.d0 .AND. dt < dt_min_frac*dt_phase*(1.d0-1.d-8))THEN
+  ! (not for a kick step shortened only to land on the kick end)
+  IF(dt_min_frac > 0.d0 .AND. dt < dt_min_frac*dt_phase*(1.d0-1.d-8) .AND. .NOT.(dt_clipped .AND. nretry == 0))THEN
     WRITE(*,'(A,ES12.4,A,ES12.4,A,I2,A,I7)')' Stopping: dt = ',dt,' is below dt_min_frac*phase dt = ', &
       dt_min_frac*dt_phase,' (kick_phase',kick_phase,') at step ',i
     EXIT
