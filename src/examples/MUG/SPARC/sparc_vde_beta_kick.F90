@@ -113,12 +113,13 @@ REAL(r8) :: pre_its_ratio = 1.5d0 !< With pre_adapt: also rebuild once a reused-
 REAL(r8) :: dt_refactor_tol = 0.d0 !< dt changes within this relative distance of the preconditioner's dt rebuild only the vacuum operator (oft_mugtok_td%dt_refactor_tol; 0: every dt change rebuilds)
 LOGICAL :: dt_adapt = .FALSE. !< Adaptive dt in the phases with a nominal dt cap (oft_mugtok_td%dt_adapt; replaces dt_grow_steps there): dt targets lin_its_target GMRES iterations per step, at most the phase's nominal dt. dt_min_frac then also stops a run whose controller drives dt below dt_min_frac x that cap
 INTEGER(i4) :: lin_its_target = 20 !< With dt_adapt: target GMRES iterations per step
-LOGICAL :: kick_dt_adapt = .FALSE. !< Adaptive dt during the kick (phase 1) too: starts at 1e-5 s, then targets lin_its_target GMRES iterations per step, capped at dt_kick_max; the last kick step is shortened to end exactly at t_kick_start+t_kick_dur. Off: fixed 1e-5 s kick steps
+LOGICAL :: kick_dt_adapt = .FALSE. !< Adaptive dt during the kick (phase 1) too: starts at 1e-5 s, then targets lin_its_target GMRES iterations per step, capped at dt_kick_max; the last kick step is shortened to end exactly at t_kick_start+t_kick_dur, and the post-kick phase continues from the kick's last dt (ramping to dt_post) instead of starting at dt_post. Off: fixed 1e-5 s kick steps
 REAL(r8) :: dt_kick_max = 1.d-4 !< With kick_dt_adapt: dt cap during the kick [s]
 INTEGER(i4) :: dt_hist = 5 !< With dt_adapt: steps in the dt/GMRES history
 LOGICAL :: step_profile = .FALSE. !< Print a per-step profile of wall and CPU time by part of the step (oft_mugtok_td%step_profile)
 LOGICAL :: newton_backtrack = .FALSE. !< Turn on backtracking (step halving while |F| grows) in the Newton solver; mugtok_td switches it off by default
 LOGICAL :: resid_dump = .FALSE. !< Write the Newton residual of failed Newton attempts to the XDMF group mugtok_resid (oft_mugtok_td%resid_dump; at most 8)
+REAL(r8) :: dt_kick_last = 0.d0 !< dt in use when the kick ends (kick_dt_adapt: first post-kick dt)
 LOGICAL :: dt_clipped = .FALSE. !< This step's dt was shortened to end on the kick end (kick_dt_adapt)
 INTEGER(i4) :: n_clean = 0 !< Consecutive steps without a retry (for dt_grow_steps)
 INTEGER(i4) :: force_rst(32) = 0 !< Diagnostic: if force_rst(1) > 0, load each listed restart file, write its momentum-equation terms (force_<term>_NNNNN.rst, see xmhd_2d_force_terms) with the post-kick settings, and stop
@@ -554,6 +555,7 @@ DO i=rst_start+1,nstep_total
   ! actually used (possibly halved by a solver-failure retry), and re-imposing the
   ! phase's nominal dt here every iteration would silently discard that reduction.
   IF(kick_phase /= kick_phase_prev)THEN
+    dt_kick_last = dt ! with kick_dt_adapt: the controller's dt at the end of the kick
     SELECT CASE(kick_phase)
     CASE(0) ! pre-kick: let the system settle
       dt = 1.0d-6
@@ -601,6 +603,9 @@ DO i=rst_start+1,nstep_total
     END SELECT
     IF(visc_dynamic) b_sim%mug%nu_n(1) = b_sim%mug%nu(1)*visc_nref ! nu = nu(1)*visc_nref/n
     dt_phase = dt ! reference for the dt_min_frac stop (the phase's nominal dt, even when resuming)
+    ! Adaptive kick run straight into the post-kick phase: continue from the kick's last dt and let the
+    ! controller ramp toward dt_post (as a restart from the end of the kick does), instead of jumping to dt_post
+    IF(kick_dt_adapt .AND. kick_phase == 2 .AND. kick_phase_prev == 1) dt = dt_kick_last
     ! When resuming, keep the dt actually in use when the restart file was written
     ! (possibly reduced by step() retries) rather than the phase's nominal dt
     IF(kick_phase_prev < 0 .AND. rst_start > 0) dt = dt_rst
