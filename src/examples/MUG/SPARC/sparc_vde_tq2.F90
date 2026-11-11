@@ -81,6 +81,8 @@ REAL(r8), allocatable, dimension(:,:) :: eta_reg !< Resistivity [in-plane (poloi
 REAL(r8) :: eta_plate_pol = 6.93d-7 !< Poloidal (in-plane) resistivity [Ohm*m] of the PLATE_* conductors; their toroidal resistivity is left at the file value
 REAL(r8) :: eta_gap_pol = -1.d0 !< Poloidal (in-plane) resistivity [Ohm*m] for the F (= R B_phi) equation in the regions listed in gap_regs (e.g. the gap between limiter and inner vessel shell and the space between the shells), which then conduct poloidal current but no toroidal current (psi there stays vacuum). <= 0 (default): mugtok_td's vacuum fallback 0.1 Ohm*m. M3D-C1: 1.94e-3
 INTEGER(i4) :: gap_regs(16) = 0 !< Region ids that get eta_gap_pol (0 = unused); core02 meshes: 3 (between the shells), 4, 33, 34 (limiter to inner shell)
+INTEGER(i4) :: pol_mult_regs(16) = 0 !< Conductor regions whose poloidal (in-plane) resistivity is multiplied by pol_mult (0 = unused); e.g. 5, 6 = inner, outer vessel shell
+REAL(r8) :: pol_mult(16) = 1.d0 !< Factors on the in-plane eta of pol_mult_regs (toroidal eta unchanged). Test: emulate M3D-C1's apparent shell poloidal resistivity (inner ~13x, outer ~5x)
 REAL(r8) :: eta_vac_pol = -1.d0 !< Poloidal (in-plane) resistivity [Ohm*m] for the F (= R B_phi) equation in the non-plasma, non-conductor regions (vacuum, the gap between limiter and inner shell, between the shells, outside); <= 0 keeps mugtok_td's fallback 0.1 Ohm*m. M3D-C1 uses eta_vac = 1.94e-3 there. psi is unaffected (only the in-plane component is set)
 REAL(r8), allocatable, dimension(:) :: coil_currs_fixed !< Fixed coil currents passed to every step (step() overwrites equil%coil_currs internally, so a separate reference copy is needed)
 INTEGER(i4) :: nstep_total = 10000 !< Number of time steps (dt*nstep should approach the wall time ~ms)
@@ -174,7 +176,7 @@ NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_sc
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,lin_rtol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile, &
-  T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq,eta_implicit,spitzer_smooth,eta_implicit_jac,ohmic_eta_implicit,eta_gap_pol,gap_regs,eta_vac_pol,visc_hyper,visc_hyper_pol,dt_tq2_adapt,dt_tq2_max
+  T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq,eta_implicit,spitzer_smooth,eta_implicit_jac,ohmic_eta_implicit,eta_gap_pol,gap_regs,pol_mult_regs,pol_mult,eta_vac_pol,visc_hyper,visc_hyper_pol,dt_tq2_adapt,dt_tq2_max
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -374,6 +376,12 @@ DO i=1,SIZE(cond_names)
   eta_reg(reg_id_tmp,1) = eta_plate_pol/mu0
   WRITE(*,'(2A,I4,2(A,ES12.4))')' ',TRIM(cond_names(i)),reg_id_tmp, &
     '  eta_pol [Ohm*m] = ',eta_reg(reg_id_tmp,1)*mu0,'  eta_tor [Ohm*m] = ',eta_reg(reg_id_tmp,2)*mu0
+END DO
+DO i=1,SIZE(pol_mult_regs) ! multiply the poloidal (in-plane) eta of listed conductor regions
+  IF(pol_mult_regs(i) <= 1 .OR. pol_mult_regs(i) > machine%mesh%nreg)CYCLE
+  IF(eta_reg(pol_mult_regs(i),1) <= 0.d0) CALL oft_abort('pol_mult_regs lists a non-conductor region','driver',__FILE__)
+  eta_reg(pol_mult_regs(i),1) = eta_reg(pol_mult_regs(i),1)*pol_mult(i)
+  WRITE(*,'(A,I4,A,F8.2,A,ES12.4,A)')' Region',pol_mult_regs(i),': poloidal eta x',pol_mult(i),' =',eta_reg(pol_mult_regs(i),1)*mu0,' Ohm*m'
 END DO
 IF(eta_gap_pol > 0.d0)THEN ! gaps conduct poloidal current only (in-plane eta for the F equation; psi unchanged)
   DO i=1,SIZE(gap_regs)
