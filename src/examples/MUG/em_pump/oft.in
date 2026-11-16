@@ -1,5 +1,6 @@
 &runtime_options
   ppn=1
+  omp_nthreads=4
   debug=0
 /
 
