@@ -50,7 +50,7 @@ CLASS(oft_bmesh), POINTER :: smesh
 !==============================================================================
 INTEGER(i4) :: order     = 2       !< FE order
 INTEGER(i4) :: n_seg     = 24      !< Coil segments (must match the mesh)
-INTEGER(i4) :: n_per_lam = 12      !< Segments per wavelength; sets the phase step
+REAL(r8) :: n_per_lam = 12      !< Segments per wavelength; sets the phase step
 INTEGER(i4) :: nsteps    = 2000    !< Timesteps to take
 INTEGER(i4) :: rst_freq  = 50      !< Restart output frequency [steps]
 REAL(r8) :: dt        = 5.d-4      !< Timestep [s]
@@ -252,7 +252,7 @@ eta_reg  = -1.d0    ; eta_reg(1,:) = eta_fluid/mu0
 eta_reg(first_wall_region,:) = eta_wall/mu0   ! not MHD, but add_f_terms wants a real eta
 eta_reg(second_wall_region,:) = eta_wall/mu0   ! not MHD, but add_f_terms wants a real eta
 
-lambda = REAL(n_per_lam,8)*seg_pitch
+lambda = n_per_lam*seg_pitch
 v_sync = lambda*freq
 WRITE(*,'(A)')         '=== EM pump drive ==='
 WRITE(*,'(A,ES11.3,A)')'  pipe radius        = ',pipe_rout,' m'
