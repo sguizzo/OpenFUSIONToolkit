@@ -36,8 +36,9 @@ pump_len      = 0.95    # axial length of the coil stack, i.e. the active pump s
 iron_len      = 0.95    # axial length of the stator; >= pump_len, the excess becoming end teeth
 
 # --- Winding -----------------------------------------------------------------
-n_seg         = 6      # number of coil segments
-seg_gap       = 0.050   # insulating gap between adjacent segments; this IS the stator tooth width
+n_seg         = int(sys.argv[3]) if len(sys.argv) > 3 else 6      # number of coil segments
+print(f"using {n_seg} coil segments")
+seg_gap       = 0.35/(n_seg+1)   # insulating gap between adjacent segments; this IS the stator tooth width
                         # (tooth = seg_pitch - seg_h).  5 mm teeth saturate to mu_r ~ 10 at I0 = 4e4
 
 # --- Materials ---------------------------------------------------------------
@@ -47,7 +48,7 @@ eta_wall      = 1.2e-6  # duct wall resistivity [Ohm-m]; 316 stainless-ish
 fluid_dx      = fluid_rad_thickness/4   # channel
 wall_dx       = 0.007   # duct wall
 coil_dx       = 0.024   # coils
-iron_dx       = 0.016   # iron; must resolve the tooth, so keep it below seg_gap
+iron_dx       = seg_gap/3.125   # iron; must resolve the tooth, so keep it below seg_gap
 vac_dx        = 0.024   # vacuum
 airgap_dx     = 0.007   # airgap
 
