@@ -24,7 +24,7 @@ CLASS(oft_bmesh), POINTER :: smesh
 !==============================================================================
 INTEGER(i4) :: order     = 2       !< FE order
 INTEGER(i4) :: n_seg     = 24      !< Coil segments (must match the mesh)
-INTEGER(i4) :: n_per_lam = 12      !< Segments per wavelength; sets the phase step
+REAL(r8) :: n_per_lam = 12.d0      !< Segments per wavelength; sets the phase step (real, so magnet-number scans need not divide evenly)
 INTEGER(i4) :: coil_reg0 = 5       !< Mesh region of coil segment 0; segments are contiguous
 REAL(r8) :: freq      = 50.d0      !< Drive frequency [Hz]
 REAL(r8) :: I0        = 1.d4       !< Peak current per coil segment [A]
@@ -41,8 +41,11 @@ REAL(r8) :: nu_fluid  = 3.d-5      !< Kinematic viscosity [m^2/s]
 REAL(r8) :: v_inlet   = 1.d0       !< Mean axial velocity imposed at the inlet [m/s]
 REAL(r8) :: lin_tol   = 1.d-7      !< Linear solver tolerance
 REAL(r8) :: nl_tol    = 1.d-6      !< Nonlinear solver tolerance
-INTEGER(i4) :: wall_region = 4     !< Mesh region of the duct wall
+INTEGER(i4) :: first_wall_region = 4  !< Mesh region of the duct wall
+INTEGER(i4) :: second_wall_region = 0 !< Mesh region of an outer tube wall around the duct (0 = none)
 INTEGER(i4) :: iron_region = 3     !< Mesh region of the iron yoke (0 = no iron)
+INTEGER(i4) :: iron_core_region = 0 !< Mesh region of an iron core inside an annular duct (0 = none)
+INTEGER(i4) :: iron_core_wall_region = 0 !< Mesh region of the conducting wall around the iron core (0 = none)
 LOGICAL :: cyl = .TRUE.            !< Cylindrical (R,Z) geometry; .FALSE. for a slab (x,z)
 LOGICAL :: iron_jac_lift = .FALSE. !< Include the (nu - 1) iron lift in the preconditioner (empump_td%iron_jac_lift); off by default, it tripled the GMRES iterations on this mesh
 LOGICAL :: iron_jac_deriv = .FALSE. !< Include the d(mu)/d|B| term in the preconditioner (empump_td%iron_jac_deriv); off by default, it caused failed Newton solves on this mesh
@@ -50,8 +53,9 @@ LOGICAL :: flow_on = .FALSE.        !< Solve the flow. .FALSE. pins velocity and
 LOGICAL :: solver_pm = .FALSE.     !< Print solver convergence histories
 LOGICAL :: psi_outer_dirichlet = .TRUE. !< psi = 0 on the outer mesh boundary (perfect conductor); .FALSE. makesdpsi/dn = 0 (perfect insulator)
 NAMELIST/em_pump_options/order,n_seg,n_per_lam,nsteps,rst_freq,dt,freq,I0,ramp_time, &
-  rho_fluid,eta_fluid,eta_wall,eta_vac,nu_fluid,v_inlet,lin_tol,nl_tol,wall_region,iron_region, &
-  coil_reg0,cyl,iron_jac_lift,iron_jac_deriv,flow_on,mf_b0,solver_pm,psi_outer_dirichlet
+  rho_fluid,eta_fluid,eta_wall,eta_vac,nu_fluid,v_inlet,lin_tol,nl_tol,first_wall_region, &
+  second_wall_region,iron_region,iron_core_region,iron_core_wall_region,coil_reg0,cyl,iron_jac_lift,iron_jac_deriv, &
+  flow_on,mf_b0,solver_pm,psi_outer_dirichlet
 
 !==============================================================================
 ! Other variables we need
@@ -145,11 +149,14 @@ dens_reg = 1.d0     ; dens_reg(1) = rho_fluid
 visc_reg = 0.d0     ; visc_reg(1) = nu_fluid
 eta_reg = eta_vac
 eta_reg(1,:) = eta_fluid/mu0
-eta_reg(wall_region,:) = eta_wall/mu0
+eta_reg(first_wall_region,:) = eta_wall/mu0
+IF(second_wall_region > 0) eta_reg(second_wall_region,:) = eta_wall/mu0
 iron_reg = .FALSE.
 IF(iron_region > 0) iron_reg(iron_region) = .TRUE.   ! nonlinear B-H permeability
+IF(iron_core_region > 0) iron_reg(iron_core_region) = .TRUE.
+IF(iron_core_wall_region > 0) eta_reg(iron_core_wall_region,:) = eta_wall/mu0
 
-lambda = REAL(n_per_lam,8)*seg_pitch
+lambda = n_per_lam*seg_pitch
 v_sync = lambda*freq
 WRITE(*,'(A)')         '=== EM pump drive (xmhd_2d / empump_td) ==='
 WRITE(*,'(A,L2)')      '  cylindrical        = ',cyl
@@ -344,7 +351,7 @@ REAL(r8), INTENT(in) :: time
 INTEGER(i4) :: jc
 REAL(r8) :: omega,dphi,env
 omega = 2.d0*pi*freq
-dphi = 2.d0*pi/REAL(n_per_lam,8)
+dphi = 2.d0*pi/n_per_lam
 env = 1.d0
 IF(ramp_time > 0.d0) env = MIN(1.d0,time/ramp_time)
 pump_sim%j_coil = 0.d0

@@ -179,5 +179,5 @@ for name, rid in sorted(ids.items(), key=lambda kv: kv[1]):
     if not name.startswith("COIL_"):
         print(f"  {rid:3d}  {name}")
 print(f"  {ids['COIL_00']:3d} .. {ids[f'COIL_{n_seg-1:02d}']:<3d}  COIL_00 .. COIL_{n_seg-1:02d}")
-print(f"\n&em_pump_options:  cyl=F  wall_region={ids['WALL']}  iron_region={ids['IRON_YOKE']}"
+print(f"\n&em_pump_options:  cyl=F  first_wall_region={ids['WALL']}  iron_region={ids['IRON_YOKE']}"
       f"  coil_reg0={ids['COIL_00']}  n_seg={n_seg}")
