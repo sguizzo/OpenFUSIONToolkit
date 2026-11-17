@@ -5,35 +5,36 @@ Usage:  python3 pump_force.py RUNDIR
 
 WHAT IT READS
 -------------
-`oft_xdmf.0001.h5`, written by pump_sim%plot() at the end of the run.  Each frame
-holds `psi` and `B*R` on the order-2 Lagrange DOFs.  `B*R` is the L2-projected
-poloidal gradient -- (-dpsi/dZ, F, dpsi/dR).
+`oft.in` for the geometry (cyl), eta_fluid, freq and the mesh file name.
+`all/oft_xdmf.0001.h5`, written by pump_sim%plot() at the end of the run.  Each
+frame holds `psi` and `B*R` (cylindrical) or `B` (slab) on the order-2 Lagrange
+DOFs; that field is the L2-projected poloidal gradient -- (-dpsi/dZ, dpsi/dR, B_y (F)).
 
 EQUATION
 -------------------------------
-Everything is axisymmetric and the only current is toroidal, so with
+The only current is out of plane, so with
 
-    B_R = -(1/R) dpsi/dZ        B_Z = (1/R) dpsi/dR
+    cylindrical:  B_R = -(1/R) dpsi/dZ        B_Z = (1/R) dpsi/dR
+    slab:         B_x = -dpsi/dz              B_z = dpsi/dx
 
-the axial Lorentz force density is
+the axial Lorentz force density is (J x B)_Z = -J_phi B_R (cylindrical) or
+-J_y B_x (slab). Integrating over dV = 2*pi*R dR dZ in the cylinder (the R
+cancels), or over dx dz per metre of depth in the slab:
 
-    (J x B)_Z = -J_phi B_R = J_phi (1/R) dpsi/dZ
-
-Integrating over dV = 2*pi*R dR dZ, the R cancels:
-
-    F_Z = -2*pi * INT J_phi (R B_R) dR dZ        [R*B_R is B*R component 0]
+    cylindrical:  F_Z = -2*pi * INT J_phi (R B_R) dR dZ   [N]     [R*B_R is B*R component 0]
+    slab:         F_z = -INT J_y B_x dx dz                [N/m]   [B_x is B component 0]
 
 With the flow frozen the fluid carries only induced current, so Ohm's law gives
-J_phi straight from psi -- no need to evaluate the Grad-Shafranov operator:
+J straight from psi:
 
-    E_phi = -dA_phi/dt = -(1/R) dpsi/dt      J_phi = E_phi/eta = -(1/(eta R)) dpsi/dt
-
-    F_Z = -(2*pi/eta) * INT (1/R) (dpsi/dt)(dpsi/dZ) dR dZ
+    cylindrical:  J_phi = -(1/(eta R)) dpsi/dt     F_Z = -(2*pi/eta) * INT (1/R) (dpsi/dt)(dpsi/dZ) dR dZ
+    slab:         J_y   = -(1/eta) dpsi/dt         F_z = -(1/eta) * INT (dpsi/dt)(dpsi/dz) dx dz
 
 """
 
 import sys
 import os
+import re
 
 import numpy as np
 import h5py
@@ -41,20 +42,45 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-def volume_avg(radii, areas, values):
+GS_EPSILON = 1.0e-12          # same guard the Fortran uses
+
+
+def read_option(run_dir, group, key, default):
+    '''Reads `key` from namelist `group` in the run's oft.in, returning `default` if it is absent'''
+    oft_in = open(os.path.join(run_dir, "oft.in")).read()
+    block = re.search(r"&" + group + r"\b(.*?)^\s*/", oft_in, re.S | re.M | re.I).group(1)
+    m = re.search(r"^\s*" + key + r"\s*=\s*([^\s!,]+)", block, re.M | re.I)
+    return m.group(1).strip('"\'') if m else default
+
+
+def read_run_options(run_dir="."):
+    '''Returns (cyl, eta, freq, mesh_file) from the run's oft.in'''
+    cyl = read_option(run_dir, "em_pump_options", "cyl", "T").strip(".").upper().startswith("T")
+    eta = float(read_option(run_dir, "em_pump_options", "eta_fluid", "1.625E-3"))   # fluid resistivity [Ohm-m]
+    freq = float(read_option(run_dir, "em_pump_options", "freq", "50.0"))          # drive frequency [Hz]
+    mesh_file = read_option(run_dir, "native_mesh_options", "filename", "cyl_pump_mesh_native.h5")
+    return cyl, eta, freq, mesh_file
+
+
+def volume_avg(radii, areas, values, cyl=True):
     '''returns volume average of a given value'''
-    #volume from one triangle is approx area*2pi*r, 2pis will cancel in the fraction
-    return (radii*areas*values).sum()/(radii*areas).sum()
+    # in the cylinder the volume of one triangle is approx area*2pi*r, and the 2pis cancel in the
+    # fraction; in the slab every cell has the same depth, so the weight is just the area
+    weights = radii * areas if cyl else areas
+    return (weights * values).sum() / weights.sum()
 
-def abs_volume_avg(radii, areas, values):
+
+def abs_volume_avg(radii, areas, values, cyl=True):
     '''returns volume average of absolute values of value'''
-    return volume_avg(radii, areas, abs(values))
+    return volume_avg(radii, areas, abs(values), cyl=cyl)
 
 
-def read_mesh(run_dir = ".", fluid_region = 1):
-    '''Reads 'pump_mesh_native.h5' in the given run_dir, returns (n_node, nodes, fluid_tris)'''
-    mesh = h5py.File(os.path.join(run_dir, "pump_mesh_native.h5"), "r")
-    nodes = mesh["mesh/R"][:]              # (npoint, 2) as (R, Z)
+def read_mesh(run_dir=".", fluid_region=1, mesh_file=None):
+    '''Reads the run's mesh file (from oft.in if not given), returns (n_node, nodes, fluid_tris)'''
+    if mesh_file is None:
+        mesh_file = read_run_options(run_dir)[3]
+    mesh = h5py.File(os.path.join(run_dir, mesh_file), "r")
+    nodes = mesh["mesh/R"][:]              # (npoint, 2) as (R, Z), or (x, z) in the slab
     tris = mesh["mesh/LC"][:] - 1          # 1-based in the file
     region = mesh["mesh/REG"][:]
     fluid_tris = tris[region == fluid_region]
@@ -62,98 +88,121 @@ def read_mesh(run_dir = ".", fluid_region = 1):
 
     return n_node, nodes, fluid_tris
 
+
 def get_areas_radii(fluid_tris, nodes):
-    '''Returns areas, radii of given fluid_tris. Per-cell area and centroid radius. '''
+    '''Returns areas, radii of given fluid_tris. Per-cell area and centroid radius (x in the slab).'''
     areas, radii = [], []
     for tri in fluid_tris:
         (r0, z0), (r1, z1), (r2, z2) = nodes[tri]
         edges = np.array([[r1 - r0, z1 - z0],
-                        [r2 - r0, z2 - z0]])
+                          [r2 - r0, z2 - z0]])
         areas.append(0.5 * abs(np.linalg.det(edges)))
         radii.append((r0 + r1 + r2) / 3.0)
     areas = np.array(areas)
     radii = np.array(radii)
     return areas, radii
 
-def axial_force(rb_r, dpsi_dt, fluid_tris, radii, areas, eta):
-    """F_Z = (2 pi / eta) INT (1/R) (dpsi/dt) (R B_R) dR dZ, summed over cells."""
-    cell_rb_r = rb_r[fluid_tris].mean(axis=1)
-    cell_dpsi_dt = dpsi_dt[fluid_tris].mean(axis=1)
-    return (2.0 * np.pi / eta) * np.sum(cell_dpsi_dt * cell_rb_r / radii * areas)
 
-def get_current_B_fields_force_density(run_dir=".", eta=1.625e-3, freq=50, fluid_region = 1, plot_frame = -1, fluid_length = 0.950, fluid_radius = 0.040, plot_fields=True, give_areas_radii=False):
-    # --- Read Mesh --------------------------------------------------------------------
-    n_node, nodes, fluid_tris = read_mesh(run_dir=run_dir, fluid_region=fluid_region)
-
-    # Per-cell area and centroid radius, computed once.
-    areas, radii = get_areas_radii(fluid_tris, nodes)
-
-    # --- Read psi(t) and the projected R*B_R from the plot file ------------------
-    plot = h5py.File(os.path.join(run_dir, "oft_xdmf.0001.h5"), "r")["mugtok_td/smesh"]
+def read_frames(run_dir, n_node, cyl):
+    '''Reads psi(t) and the projected R*B_R (B_x in the slab) from the plot file.
+    Returns (plot group, frame names, times, psis, RB_R).'''
+    b_name = "B*R" if cyl else "B"
+    plot = h5py.File(os.path.join(run_dir, "all", "oft_xdmf.0001.h5"), "r")["xmhd_2d/smesh"]
     frames = sorted(k for k in plot if isinstance(plot[k], h5py.Group) and "TIME" in plot[k])
     if len(frames) < 3:
         raise SystemExit(f"need at least 3 plot frames, found {len(frames)}; lower rst_freq")
     times = np.array([float(plot[k]["TIME"][0]) for k in frames])
     psis = np.array([plot[k]["psi"][:n_node] for k in frames])
-    RB_R = np.array([plot[k]["B*R"][:n_node, 0] for k in frames])
+    RB_R = np.array([plot[k][b_name][:n_node, 0] for k in frames])     # R*B_R, or B_x in the slab
+    return plot, frames, times, psis, RB_R
+
+
+def axial_force(rb_r, dpsi_dt, fluid_tris, radii, areas, eta, cyl=True):
+    """Cylindrical: F_Z = (2 pi / eta) INT (1/R) (dpsi/dt) (R B_R) dR dZ.
+    Slab: F_z = (1 / eta) INT (dpsi/dt) B_x dx dz. Summed over cells."""
+    cell_rb_r = rb_r[fluid_tris].mean(axis=1)
+    cell_dpsi_dt = dpsi_dt[fluid_tris].mean(axis=1)
+    if cyl:
+        return (2.0 * np.pi / eta) * np.sum(cell_dpsi_dt * cell_rb_r / radii * areas)
+    return (1.0 / eta) * np.sum(cell_dpsi_dt * cell_rb_r * areas)
+
+
+def get_current_B_fields_force_density(run_dir=".", eta=None, freq=None, fluid_region=1, plot_frame=-1,
+                                       fluid_length=0.950, fluid_radius=0.040, plot_fields=True,
+                                       give_areas_radii=False, cyl=None):
+    '''Cell-centred J, B and axial force density in the fluid at one plot frame.
+    eta, freq and cyl default to the values in the run's oft.in.
+    Returns (J_phi, B_R, B_Z, f_Z), which are (J_y, B_x, B_z, f_z) in the slab.'''
+    opt_cyl, opt_eta, opt_freq, mesh_file = read_run_options(run_dir)
+    cyl = opt_cyl if cyl is None else cyl
+    eta = opt_eta if eta is None else eta
+
+    # --- Read Mesh --------------------------------------------------------------------
+    n_node, nodes, fluid_tris = read_mesh(run_dir=run_dir, fluid_region=fluid_region, mesh_file=mesh_file)
+
+    # Per-cell area and centroid radius, computed once.
+    areas, radii = get_areas_radii(fluid_tris, nodes)
+
+    plot, frames, times, psis, RB_R = read_frames(run_dir, n_node, cyl)
 
     import matplotlib.tri as mtri
     from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
 
-    GS_EPSILON = 1.0e-12          # same guard the Fortran uses
-    if plot_fields:
-        DIVERGING = LinearSegmentedColormap.from_list(
-            "bl_gy_or", ["#184f95", "#2a78d6", "#9ec5f4", "#e8e8e6", "#f6b596", "#eb6834", "#a83c15"])
-
     # psi_dot needs a neighbour on each side, so index the frames the force uses
     iframe = range(1, len(frames) - 1)[plot_frame]
     psi_dot = (psis[iframe + 1] - psis[iframe - 1]) / (times[iframe + 1] - times[iframe - 1])
-    RB_Z = plot[frames[iframe]]["B*R"][:n_node, 2]
+    RB_Z = plot[frames[iframe]]["B*R" if cyl else "B"][:n_node, 1]     # R*B_Z, or B_z in the slab
 
-    # Node fields -> cell values, then divide by the centroid radius
+    # Node fields -> cell values, then divide by the centroid radius in the cylinder
     cell_psi_dot = psi_dot[fluid_tris].mean(axis=1)
     cell_RB_R = RB_R[iframe][fluid_tris].mean(axis=1)
     cell_RB_Z = RB_Z[fluid_tris].mean(axis=1)
 
-    J_phi = -cell_psi_dot / (eta * (radii + GS_EPSILON))       # A/m^2
-    B_R = cell_RB_R / (radii + GS_EPSILON)                     # T
-    B_Z = cell_RB_Z / (radii + GS_EPSILON)                     # T
+    rfac = radii + GS_EPSILON if cyl else 1.0
+    J_phi = -cell_psi_dot / (eta * rfac)                       # A/m^2  (J_y in the slab)
+    B_R = cell_RB_R / rfac                                     # T      (B_x in the slab)
+    B_Z = cell_RB_Z / rfac                                     # T      (B_z in the slab)
     f_Z = -J_phi * B_R                                         # N/m^3
-
-    # print(f"  mean abs B_Z         {abs_volume_avg(radii, areas, B_Z)} T   ")
-    # print(f"  mean abs B_R         {abs_volume_avg(radii, areas, B_R)} T   ")
 
     if plot_fields:
         print("Plotting fields")
+        DIVERGING = LinearSegmentedColormap.from_list(
+            "bl_gy_or", ["#184f95", "#2a78d6", "#9ec5f4", "#e8e8e6", "#f6b596", "#eb6834", "#a83c15"])
         tri_plot = mtri.Triangulation(nodes[:, 1], nodes[:, 0], triangles=fluid_tris)
-        panels = [(J_phi, "toroidal current density  J_phi  [A/m$^2$]"),
-                (B_R,   "radial field  $B_R$  [T]"),
-                (B_Z,   "axial field  $B_Z$  [T]"),
-                (f_Z,   "axial force density  $(J\timesB)_Z$  [N/m$^3$]")]
+        if cyl:
+            panels = [(J_phi, "toroidal current density  $J_\\phi$  [A/m$^2$]"),
+                      (B_R,   "radial field  $B_R$  [T]"),
+                      (B_Z,   "axial field  $B_Z$  [T]"),
+                      (f_Z,   "axial force density  $(J \\times B)_Z$  [N/m$^3$]")]
+        else:
+            panels = [(J_phi, "out-of-plane current density  $J_y$  [A/m$^2$]"),
+                      (B_R,   "transverse field  $B_x$  [T]"),
+                      (B_Z,   "axial field  $B_z$  [T]"),
+                      (f_Z,   "axial force density  $(J \\times B)_z$  [N/m$^3$]")]
         fig, axes = plt.subplots(len(panels), 1, figsize=(11, 9), facecolor="#fcfcfb")
         for ax, (field, label) in zip(axes, panels):
             lim = np.percentile(np.abs(field), 99.5)
             # flat shading: one value per cell, no interpolation back onto the axis
             img = ax.tripcolor(tri_plot, facecolors=field, cmap=DIVERGING,
-                            norm=TwoSlopeNorm(vmin=-lim, vcenter=0.0, vmax=lim))
+                               norm=TwoSlopeNorm(vmin=-lim, vcenter=0.0, vmax=lim))
             bar = fig.colorbar(img, ax=ax, pad=0.01)
             bar.ax.tick_params(colors="#52514e", labelsize=8)
             bar.outline.set_visible(False)
             ax.axvline(-fluid_length/2, color="#52514e", lw=1, ls="--")     # coil stack ends
             ax.axvline(+fluid_length/2, color="#52514e", lw=1, ls="--")
             ax.set_xlim(-(fluid_length/2)-0.05, (fluid_length/2)+0.05)
-            ax.set_ylim(0.0, nodes[fluid_tris][:, :, 0].max())
+            ax.set_ylim(nodes[fluid_tris][:, :, 0].min(), nodes[fluid_tris][:, :, 0].max())
             ax.set_facecolor("#fcfcfb")
             for side in ("top", "right"):
                 ax.spines[side].set_visible(False)
             for side in ("left", "bottom"):
                 ax.spines[side].set_color("#e4e3df")
             ax.tick_params(colors="#52514e", labelsize=9)
-            ax.set_ylabel("R [m]", color="#52514e")
+            ax.set_ylabel("R [m]" if cyl else "x [m]", color="#52514e")
             ax.set_title(label, color="#0b0b0b", fontsize=11, loc="left", pad=6)
         axes[-1].set_xlabel("Z [m]   (dashed = coil stack ends; wave travels +Z)", color="#52514e")
         fig.suptitle(f"fields in the fluid at t = {times[iframe]:.4f} s  (cell-centred)",
-                    color="#0b0b0b", fontsize=13, fontweight="bold", x=0.01, ha="left")
+                     color="#0b0b0b", fontsize=13, fontweight="bold", x=0.01, ha="left")
         fig.tight_layout(rect=[0, 0, 1, 0.97])
         out_fields = os.path.join(run_dir, "fields.png")
         fig.savefig(out_fields, dpi=150, facecolor="#fcfcfb")
@@ -161,42 +210,50 @@ def get_current_B_fields_force_density(run_dir=".", eta=1.625e-3, freq=50, fluid
 
     if not give_areas_radii:
         return J_phi, B_R, B_Z, f_Z
-    
     else:
         return J_phi, B_R, B_Z, f_Z, areas, radii
-    
-def get_forces_with_time(run_dir=".", eta=1.625e-3, freq=50, fluid_region = 1, plot_force = -1, fluid_length = 0.950, fluid_radius = 0.040, plot_forces=True, give_areas_radii=False):
-    n_node, nodes, fluid_tris = read_mesh(run_dir=run_dir, fluid_region=fluid_region)
+
+
+def get_forces_with_time(run_dir=".", eta=None, freq=None, fluid_region=1, plot_force=-1,
+                         fluid_length=0.950, fluid_radius=0.040, plot_forces=True,
+                         give_areas_radii=False, cyl=None):
+    '''Axial force on the fluid at each plot frame, [N] in the cylinder or [N/m] in the slab.
+    eta, freq and cyl default to the values in the run's oft.in.
+    Returns (t, force, mean stall pressure [Pa], mean force) with means over the second half.'''
+    opt_cyl, opt_eta, opt_freq, mesh_file = read_run_options(run_dir)
+    cyl = opt_cyl if cyl is None else cyl
+    eta = opt_eta if eta is None else eta
+    freq = opt_freq if freq is None else freq
+
+    n_node, nodes, fluid_tris = read_mesh(run_dir=run_dir, fluid_region=fluid_region, mesh_file=mesh_file)
 
     # Per-cell area and centroid radius, computed once.
     areas, radii = get_areas_radii(fluid_tris, nodes)
 
-    plot = h5py.File(os.path.join(run_dir, "oft_xdmf.0001.h5"), "r")["mugtok_td/smesh"]
-    frames = sorted(k for k in plot if isinstance(plot[k], h5py.Group) and "TIME" in plot[k])
-    if len(frames) < 3:
-        raise SystemExit(f"need at least 3 plot frames, found {len(frames)}; lower rst_freq")
-    times = np.array([float(plot[k]["TIME"][0]) for k in frames])
-    psis = np.array([plot[k]["psi"][:n_node] for k in frames])
-    RB_R = np.array([plot[k]["B*R"][:n_node, 0] for k in frames])
+    plot, frames, times, psis, RB_R = read_frames(run_dir, n_node, cyl)
 
     # Central differences in time, so the first and last samples are dropped
-    force = np.array([axial_force(RB_R[i], (psis[i + 1] - psis[i - 1]) / (times[i + 1] - times[i - 1]), fluid_tris, radii, areas, eta)
-                    for i in range(1, len(frames) - 1)])
+    force = np.array([axial_force(RB_R[i], (psis[i + 1] - psis[i - 1]) / (times[i + 1] - times[i - 1]),
+                                  fluid_tris, radii, areas, eta, cyl=cyl)
+                      for i in range(1, len(frames) - 1)])
     t = times[1:-1]
 
     # psi oscillates at the drive frequency, so a central difference over the frame
-    # spacing h under-reads dpsi/dt by sinc(w*h) -- 10% at h = 2.5 ms, 50 Hz. Undo it,
-    # otherwise the answer depends on rst_freq rather than on the physics.
+    # spacing under-estimates dpsi/dt by sinc(w*h), which we correct here
     wh = 2.0 * np.pi * freq * (times[1] - times[0])
     force /= np.sin(wh) / wh
 
-    bore = nodes[fluid_tris][:, :, 0].max()
-    head = force / (np.pi * bore ** 2)      # equivalent stall pressure rise [Pa]
+    if cyl:
+        r_in = nodes[fluid_tris][:, :, 0].min()     # 0 for a pipe, > 0 for an annulus
+        r_out = nodes[fluid_tris][:, :, 0].max()
+        head = force / (np.pi * (r_out ** 2 - r_in ** 2))   # equivalent stall pressure rise [Pa]
+    else:
+        gap = nodes[fluid_tris][:, :, 0].max() - nodes[fluid_tris][:, :, 0].min()
+        head = force / gap                      # equivalent stall pressure rise [Pa]
+    unit = "N" if cyl else "N/m"
 
-        # --- Report ------------------------------------------------------------------
+    # --- Report ------------------------------------------------------------------
     settled = t > 0.5 * t.max()             # ignore the drive ramp
-    # print(f"  run              {run_dir}")
-    # print(f"  mean F_Z         {force[settled].mean():+.6e} N   (over the second half)")
 
     if plot_forces:
         print("plotting forces")
@@ -205,7 +262,8 @@ def get_forces_with_time(run_dir=".", eta=1.625e-3, freq=50, fluid_region = 1, p
         ax.set_facecolor("#fcfcfb")
         ax.plot(t, force, lw=2, color="#2a78d6")
         ax.axhline(0, color="#52514e", lw=1, ls="--", alpha=0.6)
-        ax.annotate(f"mean {force[settled].mean():+.4g} N\n= {head[settled].mean():+.1f} Pa across the bore",
+        ax.annotate(f"mean {force[settled].mean():+.4g} {unit}\n= {head[settled].mean():+.1f} Pa across the "
+                    f"{'bore' if cyl else 'gap'}",
                     xy=(t[-1], force[-1]), xytext=(-10, 12), textcoords="offset points",
                     ha="right", color="#2a78d6", fontsize=9, fontweight="bold")
         for side in ("top", "right"):
@@ -216,28 +274,29 @@ def get_forces_with_time(run_dir=".", eta=1.625e-3, freq=50, fluid_region = 1, p
         ax.set_axisbelow(True)
         ax.tick_params(colors="#52514e", labelsize=9)
         ax.set_xlabel("time [s]", color="#52514e")
-        ax.set_ylabel("axial force on the fluid  F_Z [N]", color="#52514e")
+        ax.set_ylabel(f"axial force on the fluid  F_Z [{unit}]", color="#52514e")
         ax.set_title(f"stall force,  {os.path.basename(os.path.abspath(run_dir))}",
-                    color="#0b0b0b", fontsize=12, loc="left", pad=8)
+                     color="#0b0b0b", fontsize=12, loc="left", pad=8)
         fig.tight_layout()
         out = os.path.join(run_dir, "force.png")
         fig.savefig(out, dpi=150, facecolor="#fcfcfb")
-        # print(f"  wrote            {out}")
 
     if give_areas_radii:
         return t, force, head[settled].mean(), force[settled].mean(), areas, radii
-
     else:
         return t, force, head[settled].mean(), force[settled].mean()
 
+
 def main():
-    print("about to analyze fields")
-    get_current_B_fields_force_density()
-    get_forces_with_time()
-    print("about to analyze forces")
-    return
+    run_dir = sys.argv[1] if len(sys.argv) > 1 else "."
+    cyl = read_run_options(run_dir)[0]
+    print(f"  run              {run_dir}")
+    print(f"  geometry         {'cylindrical' if cyl else 'slab (force per metre of depth)'}")
+    get_current_B_fields_force_density(run_dir=run_dir)
+    t, force, head, mean_force = get_forces_with_time(run_dir=run_dir)
+    print(f"  mean F_Z         {mean_force:+.6e} {'N' if cyl else 'N/m'}   (over the second half)")
+    print(f"  stall pressure   {head:+.1f} Pa")
+
 
 if __name__ == "__main__":
     main()
-
-

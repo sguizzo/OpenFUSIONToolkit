@@ -1,7 +1,11 @@
-"""Build the cylindrical-duct induction pump mesh for the MUG em_pump driver.
+#!/usr/bin/env python3
+"""Build the cylindrical-duct induction pump mesh for the em_pump driver.
 
-Edit the INPUTS block below and run:  python3 make_pump_mesh.py
+Edit the INPUTS block below and run:  python3 make_cyl_pump_mesh.py
 
+The magnetic field boundary conditions in em_pump are conducting, not truly free-boundary.
+So, scans of air_z and air_r should be performed to ensure the air box is large enough that the 
+field is not affected by the boundary.
 """
 
 import os
@@ -35,6 +39,15 @@ chan_len      = 0.95    # full duct length; runs past the pump section at both e
 pump_len      = 0.95    # axial length of the coil stack, i.e. the active pump section
 iron_len      = 0.95    # axial length of the stator; >= pump_len, the excess becoming end teeth
 
+# --- Air ---------------------------------------------------------------------
+air_r         = 0.20    # air padding beyond the stator outer radius (yoke_rout)
+air_z         = 0.25    # air padding beyond each end of the longest part
+                        # 0.20 / 0.25 is the smallest box with the stall force within 0.1% of
+                        # much larger boxes (air scan, 2026-10-26)
+                        # If meshing fails with "unclaimed region detected", change air_z
+                        # slightly (e.g. by a few mm): for some box sizes the mesher's air
+                        # seed point lands exactly on the outer edge.
+
 # --- Winding -----------------------------------------------------------------
 n_seg         = int(sys.argv[3]) if len(sys.argv) > 3 else 6      # number of coil segments
 print(f"using {n_seg} coil segments")
@@ -49,18 +62,17 @@ fluid_dx      = fluid_rad_thickness/4   # channel
 wall_dx       = 0.007   # duct wall
 coil_dx       = 0.024   # coils
 iron_dx       = seg_gap/3.125   # iron; must resolve the tooth, so keep it below seg_gap
-vac_dx        = 0.024   # vacuum
+vac_dx        = 0.080   # vacuum (air box)
 airgap_dx     = 0.007   # airgap
 
 # --- Output ------------------------------------------------------------------
-mesh_file     = "pump_mesh_native.h5"   # OFT native format, what the Fortran driver reads
+mesh_file     = "cyl_pump_mesh_native.h5"   # OFT native format, what the Fortran driver reads
 show_plots    = True                    # draw the topology and the finished mesh
 
 
 # =============================================================================
 # SETUP
 # =============================================================================
-os.environ["OFT_ROOTPATH"] = '/Users/eleanorwinkler/Documents/Lab_Computational_Work/OpenFUSIONToolkit/install_release'
 tokamaker_python_path = os.getenv('OFT_ROOTPATH')
 if tokamaker_python_path is not None:
     sys.path.append(os.path.join(tokamaker_python_path,'python'))
@@ -88,7 +100,8 @@ seg_zc = -pump_len / 2.0 + (np.arange(n_seg) + 0.5) * seg_pitch
 # Regions are declared first, then drawn.  Each piece is a rectangle in (R,Z)
 # given as (centre_R, centre_Z, width, height), all as children of "air".
 
-gs_mesh = gs_Domain()
+z_ext = max(chan_len, pump_len, iron_len) / 2.0 + air_z
+gs_mesh = gs_Domain(rextent=yoke_rout + air_r, zextents=[-z_ext, z_ext])
 
 gs_mesh.define_region("air", vac_dx, "boundary")
 gs_mesh.define_region("channel", fluid_dx, "plasma")
@@ -202,6 +215,7 @@ for name, rid in sorted(ids.items(), key=lambda kv: kv[1]):
     if not name.startswith("COIL_"):
         print(f"  {rid:3d}  {name}")
 print(f"  {ids['COIL_00']:3d} .. {ids[f'COIL_{n_seg-1:02d}']:<3d}  COIL_00 .. COIL_{n_seg-1:02d}")
-print(f"\n&em_pump_options:  first_wall_region={ids['FIRST_WALL']} air_gap_region={ids['AIR_GAP']} second_wall_region={ids['SECOND_WALL']}  iron_region={ids['IRON_YOKE']}"
-      f"  coil_reg0={ids['COIL_00']}  n_seg={n_seg}  pump_len={pump_len}  chan_zmax={chan_len/2}")
-
+print(f"\n&em_pump_options:  cyl=T  first_wall_region={ids['FIRST_WALL']}  second_wall_region={ids['SECOND_WALL']}"
+      f"  iron_region={ids['IRON_YOKE']}  coil_reg0={ids['COIL_00']}  n_seg={n_seg}")
+if iron_core_rout:
+    print(f"                   iron_core_region={ids['IRON_CORE']}  iron_core_wall_region={ids['INNER_WALL']}")
