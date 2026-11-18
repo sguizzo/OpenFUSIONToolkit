@@ -85,6 +85,7 @@ REAL(r8) :: visc_sol_dT = 10.d0 !< Width of the visc_sol_mult transition [eV]
 LOGICAL :: visc_sol_on_psi = .FALSE. !< Key the visc_sol_mult boost on normalized flux instead of T: boost where psiN > visc_sol_psiN0 (tanh width visc_sol_dpsiN), i.e. outside the LCFS (see xmhd_2d visc_sol_on_psi)
 REAL(r8) :: visc_sol_psiN0 = 1.d0 !< Middle of the psi-keyed transition (normalized flux)
 REAL(r8) :: visc_sol_dpsiN = 0.002d0 !< Width of the psi-keyed transition (normalized flux)
+REAL(r8) :: F0_vac = 22.49d0 !< Vacuum F0 = R*B_phi [T m] outside the plasma (equil%I%f_offset). Default: SPARC. MUG sets F = SQRT(F0**2 + 2*int FF' dpsi), so the sign is not used (B_phi > 0); with toroidal_flow off the R-Z dynamics do not depend on it (DIII-D: |rcentr*bcentr| = 3.5966)
 LOGICAL :: fix_F_boundary = .TRUE. !< Hold F = R B_phi at its initial value on the outer mesh boundary (fixed TF current, as M3D-C1's default iconst_bz=1; default); .FALSE. = the natural condition that conserves the domain's toroidal flux (runs before 2026-10-26)
 LOGICAL :: ohmic_heating = .FALSE. !< Ohmic heating eta*J^2 in the temperature equation (xmhd_2d option ohmic; current frozen once per step, explicit source). Default off (runs before 2026-10-26 have none)
 LOGICAL :: eta_implicit = .FALSE. !< Backward-Euler Spitzer resistivity (xmhd_2d eta_implicit): eta from the current Newton iterate instead of the start-of-step T, with the psi time derivative against the psi^n snapshot. Default off (lagged eta, as before 2026-11-09)
@@ -161,7 +162,7 @@ NAMELIST/sparc_vde_options/force_rst,rst_start,visc_kick,visc_post,mass_scale_ki
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,lin_rtol,nl_tol,mf_b0,T_clip, &
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile,kick_dt_adapt,dt_kick_max, &
-  T_floor,kappa_par,visc_hyper,visc_hyper_pol,T_floor_cap,T_floor_rate,p_floor_T,p_floor_dT,eta_implicit,spitzer_smooth,eta_implicit_jac,ohmic_eta_implicit,eta_gap_pol,gap_regs,pol_mult_regs,pol_mult,eta_vac_pol
+  T_floor,kappa_par,visc_hyper,visc_hyper_pol,T_floor_cap,T_floor_rate,p_floor_T,p_floor_dT,eta_implicit,spitzer_smooth,eta_implicit_jac,ohmic_eta_implicit,eta_gap_pol,gap_regs,pol_mult_regs,pol_mult,eta_vac_pol,F0_vac
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -277,7 +278,8 @@ ALLOCATE(equil%coil_currs(machine%ncoil_regs))
 CALL hdf5_read(equil%coil_currs,TRIM(filename_eq),"tokamaker/coil_currents",success)
 equil%coil_currs = equil%coil_currs*mu0
 equil%mode = 0
-equil%I%f_offset = 22.49d0
+equil%I%f_offset = ABS(F0_vac)
+WRITE(*,'(A,ES12.4,A)')' Vacuum F0 = R*B_phi (F0_vac) =',ABS(F0_vac),' T m'
 
 ! Faithful (wall-timescale) setup: keep PHYSICAL plasma resistivity (Spitzer, on by
 ! default) so the plasma current is preserved (its L/R time ~ seconds >> the run),
@@ -367,7 +369,7 @@ DO i=1,SIZE(pol_mult_regs) ! multiply the poloidal (in-plane) eta of listed cond
   IF(pol_mult_regs(i) <= 1 .OR. pol_mult_regs(i) > machine%mesh%nreg)CYCLE
   IF(eta_reg(pol_mult_regs(i),1) <= 0.d0) CALL oft_abort('pol_mult_regs lists a non-conductor region','driver',__FILE__)
   eta_reg(pol_mult_regs(i),1) = eta_reg(pol_mult_regs(i),1)*pol_mult(i)
-  WRITE(*,'(A,I4,A,F8.2,A,ES12.4,A)')' Region',pol_mult_regs(i),': poloidal eta x',pol_mult(i),' =',eta_reg(pol_mult_regs(i),1)*mu0,' Ohm*m'
+  WRITE(*,'(A,I4,A,ES10.3,A,ES12.4,A)')' Region',pol_mult_regs(i),': poloidal eta x',pol_mult(i),' =',eta_reg(pol_mult_regs(i),1)*mu0,' Ohm*m'
 END DO
 IF(eta_gap_pol > 0.d0)THEN ! gaps conduct poloidal current only (in-plane eta for the F equation; psi unchanged)
   DO i=1,SIZE(gap_regs)
