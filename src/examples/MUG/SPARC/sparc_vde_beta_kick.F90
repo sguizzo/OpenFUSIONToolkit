@@ -114,7 +114,7 @@ REAL(r8) :: pre_its_ratio = 1.5d0 !< With pre_adapt: also rebuild once a reused-
 REAL(r8) :: dt_refactor_tol = 0.d0 !< dt changes within this relative distance of the preconditioner's dt rebuild only the vacuum operator (oft_mugtok_td%dt_refactor_tol; 0: every dt change rebuilds)
 LOGICAL :: dt_adapt = .FALSE. !< Adaptive dt in the phases with a nominal dt cap (oft_mugtok_td%dt_adapt; replaces dt_grow_steps there): dt targets lin_its_target GMRES iterations per step, at most the phase's nominal dt. dt_min_frac then also stops a run whose controller drives dt below dt_min_frac x that cap
 INTEGER(i4) :: lin_its_target = 20 !< With dt_adapt: target GMRES iterations per step
-LOGICAL :: kick_dt_adapt = .FALSE. !< Adaptive dt during the kick (phase 1) too: starts at 1e-5 s, then targets lin_its_target GMRES iterations per step, capped at dt_kick_max; the last kick step is shortened to end exactly at t_kick_start+t_kick_dur, and the post-kick phase continues from the kick's last dt (ramping to dt_post) instead of starting at dt_post. Off: fixed 1e-5 s kick steps
+LOGICAL :: kick_dt_adapt = .FALSE. !< Adaptive dt during the kick (phase 1) too: starts at MIN(1e-5 s, dt_kick_max), then targets lin_its_target GMRES iterations per step, capped at dt_kick_max; the last kick step is shortened to end exactly at t_kick_start+t_kick_dur, and the post-kick phase continues from the kick's last dt (ramping to dt_post) instead of starting at dt_post. Off: fixed 1e-5 s kick steps
 REAL(r8) :: dt_kick_max = 1.d-4 !< With kick_dt_adapt: dt cap during the kick [s]
 INTEGER(i4) :: dt_hist = 5 !< With dt_adapt: steps in the dt/GMRES history
 LOGICAL :: step_profile = .FALSE. !< Print a per-step profile of wall and CPU time by part of the step (oft_mugtok_td%step_profile)
@@ -574,6 +574,7 @@ DO i=rst_start+1,nstep_total
       b_sim%dt_adapt = .FALSE.
     CASE(1) ! kick: transiently enhance kappa_perp
       dt = 1.0d-5
+      IF(kick_dt_adapt) dt = MIN(dt, dt_kick_max) ! first kick step no larger than the kick dt cap
       b_sim%mug%kappa(1) = kappa_kick
       b_sim%mug%chi_par_mult = kappa_par/b_sim%mug%kappa(1) ! keep kappa_par fixed
       b_sim%mug%nu(1) = visc_kick
