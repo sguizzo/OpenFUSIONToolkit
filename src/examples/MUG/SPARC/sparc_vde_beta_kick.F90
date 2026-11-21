@@ -107,6 +107,7 @@ REAL(r8) :: dt_rst = -1.d0 !< Timestep read from the restart file when resuming
 REAL(r8) :: dt_min_frac = 0.125d0 !< Stop the run (then plot) once step() retries have cut dt below dt_min_frac times the current phase's starting dt; <=0 disables (set in oft.in group sparc_vde_options)
 REAL(r8) :: dt_phase = 0.d0 !< Starting (nominal) dt of the current kick phase, the reference for dt_min_frac
 REAL(r8) :: dt_post = 5.d-4 !< Nominal post-kick timestep [s] (kick_phase 2); also the cap for dt_grow_steps and the reference for dt_min_frac. A restart still starts at the restart file's dt and reaches dt_post only through dt_grow_steps
+REAL(r8) :: dt_start = -1.d0 !< First post-kick timestep [s] when the post-kick phase starts fresh (not when resuming from a restart file, which keeps its own dt, nor after an adaptive kick, which continues from the kick's last dt); dt then grows toward the cap dt_post through dt_adapt (or dt_grow_steps). <= 0 (default): start at dt_post. dt_min_frac stays relative to dt_post
 INTEGER(i4) :: dt_grow_steps = 0 !< If > 0: after this many consecutive steps with no retry, double dt again (capped at the phase's nominal dt), so a dt halved by step() retries can recover; 0 = never (dt stays reduced)
 LOGICAL :: pre_adapt = .FALSE. !< Post-kick (phase 2) only: cost-based preconditioner refresh instead of pre_freq (oft_mugtok_td%pre_adapt)
 INTEGER(i4) :: pre_max_age = 0 !< With pre_adapt: also rebuild after this many steps (0: no limit)
@@ -160,7 +161,7 @@ TYPE(oft_mugtok_td):: b_sim
 CLASS(flux_func), POINTER :: n_prof => NULL(), T_prof => NULL()
 NAMELIST/sparc_vde_options/force_rst,rst_start,visc_kick,visc_post,mass_scale_kick,mass_scale_post,pre_freq,plot_only,dt_min_frac, &
   visc_bulk_ratio,visc_dynamic,visc_nref,drop_convection,visc_sol_mult,visc_sol_T0,visc_sol_dT,lin_tol,lin_rtol,nl_tol,mf_b0,T_clip, &
-  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
+  visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,dt_start,newton_backtrack,resid_dump, &
   dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile,kick_dt_adapt,dt_kick_max, &
   T_floor,kappa_par,visc_hyper,visc_hyper_pol,T_floor_cap,T_floor_rate,p_floor_T,p_floor_dT,eta_implicit,spitzer_smooth,eta_implicit_jac,ohmic_eta_implicit,eta_gap_pol,gap_regs,pol_mult_regs,pol_mult,eta_vac_pol,F0_vac, &
   n_offset,T_offset,T_scale,kappa_kick,kappa_base,t_kick_start,t_kick_dur
@@ -473,6 +474,11 @@ IF(T_floor > 0.d0)WRITE(*,'(A,F8.2,A,F8.3)')' T_floor source cap =',T_floor_cap,
 WRITE(*,'(A,F8.2,A)')' Temperature floor T_floor (per-cell, xmhd.F90 scheme) =',T_floor,' eV (<= 0: off)'
 WRITE(*,'(A,I4,A)')' dt recovery: double dt after',dt_grow_steps,' clean steps (0: off)'
 WRITE(*,'(A,ES12.4,A)')' Post-kick nominal dt (dt_post) =',dt_post,' s'
+IF(dt_start > 0.d0)THEN
+  WRITE(*,'(A,ES12.4,A)')' Post-kick starting dt (dt_start) =',MIN(dt_start,dt_post),' s (fresh start only; grows to dt_post)'
+  IF(dt_min_frac > 0.d0 .AND. MIN(dt_start,dt_post) < dt_min_frac*dt_post) &
+    CALL oft_abort('dt_start is below dt_min_frac*dt_post: the run would stop itself at the first step','driver',__FILE__)
+END IF
 WRITE(*,'(A,ES12.4,A,ES12.4)')' Parallel conductivity kappa_par =',kappa_par,' 1/(m s); post-kick kappa_par/kappa_perp =',kappa_par/kappa_base
 b_sim%nksolver%backtrack = newton_backtrack
 WRITE(*,'(A,L2)')' Newton backtracking:',newton_backtrack
@@ -607,6 +613,8 @@ DO i=rst_start+1,nstep_total
     END SELECT
     IF(visc_dynamic) b_sim%mug%nu_n(1) = b_sim%mug%nu(1)*visc_nref ! nu = nu(1)*visc_nref/n
     dt_phase = dt ! reference for the dt_min_frac stop (the phase's nominal dt, even when resuming)
+    ! Separate starting dt for the post-kick phase (cap stays dt_post); overridden below after an adaptive kick or when resuming
+    IF(kick_phase == 2 .AND. dt_start > 0.d0) dt = MIN(dt_start, dt_post)
     ! Adaptive kick run straight into the post-kick phase: continue from the kick's last dt and let the
     ! controller ramp toward dt_post (as a restart from the end of the kick does), instead of jumping to dt_post
     IF(kick_dt_adapt .AND. kick_phase == 2 .AND. kick_phase_prev == 1) dt = dt_kick_last
