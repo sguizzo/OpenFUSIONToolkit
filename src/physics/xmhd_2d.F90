@@ -142,6 +142,9 @@ TYPE, public :: oft_xmhd_2d_sim
   REAL(r8) :: visc_sol_psiN0 = 1.d0 !< Normalized flux at the middle of the psi-keyed visc_sol_mult transition
   REAL(r8) :: visc_sol_dpsiN = 0.002d0 !< Width in normalized flux of the psi-keyed visc_sol_mult transition
   REAL(r8) :: drag_rate = 0.d0 !< Linear drag rate kappa [1/s] on the poloidal velocity (R and Z): adds +kappa*v to dv/dt, i.e. a force -m_i*n*kappa*v_pol in the MHD region (a TSC-style 'drag term'). Not gradient based, so it damps flow at all scales equally and adds no wall-layer dissipation; 0 = off
+  REAL(r8) :: kappa_sol = -1.d0 !< Cross-field conductivity kappa=chi*n [1/(m s)] on open field lines: where kappa(reg) exceeds it, kappa_perp -> kappa(reg) + (kappa_sol - kappa(reg))*f with f = (1+tanh((psiN-kappa_sol_psiN0)/kappa_sol_dpsiN))/2 (psiN from psi_norm_bounds, current iterate's psi, no Jacobian term for the psi dependence); the field-aligned conductivity chi_par_mult*kappa(reg) is kept. For a TQ kappa_perp raised only inside the LCFS. <= 0 or kappa not allocated: off
+  REAL(r8) :: kappa_sol_psiN0 = 1.d0 !< Normalized flux at the middle of the kappa_sol transition
+  REAL(r8) :: kappa_sol_dpsiN = 0.01d0 !< Width in normalized flux of the kappa_sol transition
   REAL(r8) :: psi_norm_bounds(2) = [0.d0,1.d0] !< [LCFS, axis] poloidal flux for psiN (set by the caller each step, e.g. from gs_equil%plasma_bounds)
   REAL(r8) :: nu2_ratio = 0.d0 !< Ratio nu2/nu1 of bulk (compressive) to shear kinematic viscosity. Adds a -nu2*grad(div(v)) bulk-viscosity term to the momentum equation, damping compressive motion independently of shear (nu1). Default 0 recovers the original pure-shear (grad^2) viscosity exactly, with nu1=nu(:)
   REAL(r8), ALLOCATABLE :: gamma(:) !< adiabatic index, by region, by region
@@ -839,7 +842,7 @@ INTEGER(i4) :: i,l
 REAL(r8) :: k_boltz = elec_charge
 REAL(r8) :: m_i=proton_mass
 REAL(r8) :: chi, eta(2), nu, nu1, nu2, D_diff, gamma, diag_vals(5), B_0(3), diag_vec(3)
-REAL(r8) :: T_visc, visc_fac, psiN_visc
+REAL(r8) :: T_visc, visc_fac, psiN_visc, par_mult
 REAL(r8), POINTER, DIMENSION(:) :: n_weights,T_weights,psi_weights,by_weights, T_res, &
                               n_res, psi_res, by_res, vtmp, velx_res, vely_res, velz_res
 REAL(r8), POINTER, DIMENSION(:,:) :: vel_weights
@@ -946,7 +949,7 @@ REAL(r8), ALLOCATABLE, DIMENSION(:,:) :: vel_weights_loc,basis_grads, basis_grad
 !$omp T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, T_mass, psi_n_loc, psi_dt, &
 !$omp ohm_q_loc, ohm_by_loc, q_ohm, dby_ohm, heat_ohm, n_ohm, eta_ohm, &
 !$omp nu4q, rfac, Wv, dW, W_weights_loc, resW_loc, Tm, sm, qpf, &
-!$omp chi, m_i, eta, nu, nu1, nu2, T_visc, visc_fac, psiN_visc, gamma, D_diff) reduction(+:diag_vals)
+!$omp chi, par_mult, m_i, eta, nu, nu1, nu2, T_visc, visc_fac, psiN_visc, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 ALLOCATE(n_weights_loc(oft_blagrange%nce),&
         psi_weights_loc(oft_blagrange%nce), by_weights_loc(oft_blagrange%nce),&
@@ -1160,7 +1163,9 @@ DO i=1,mesh%nc
       nu1 = nu*visc_fac/(1.d0+self%parent_sim%nu2_ratio)
       nu2 = nu1*self%parent_sim%nu2_ratio
     END IF
-    kappa_T = chi_tensor(chi, self%parent_sim%chi_par_mult, self%parent_sim%chi_aniso, btmp)
+    par_mult = self%parent_sim%chi_par_mult
+    IF (use_kappa) CALL kappa_sol_adjust(self%parent_sim, psi, self%parent_sim%kappa(mesh%reg(i)), n, chi, par_mult)
+    kappa_T = chi_tensor(chi, par_mult, self%parent_sim%chi_aniso, btmp)
     !---Ohmic heating per particle, Q/(n k) [eV/s] with Q = eta_pol*J_pol^2 + eta_tor*J_phi^2:
     !   J_pol = grad(F) x grad(phi)/mu0 from the frozen F, mu0*J_phi = -q from the frozen projection;
     !   eta is the (frozen) resistivity above, stored as eta_phys/mu0; n is the frozen density when
@@ -1806,6 +1811,25 @@ IF(PRESENT(deta_dT))THEN
 END IF
 end subroutine spitzer_eta
 !---------------------------------------------------------------------------
+!> Open-field-line cross-field conductivity (kappa_sol): lowers kappa_perp outside the LCFS to kappa_sol where the
+!! region value kappa_reg is larger, keeping the field-aligned conductivity chi_par_mult*kappa_reg. Returns the
+!! local chi = kappa_perp/n and the local parallel/perpendicular ratio. No-op when kappa_sol <= 0 or psiN is undefined.
+!---------------------------------------------------------------------------
+PURE SUBROUTINE kappa_sol_adjust(sim, psi, kappa_reg, n, chi, par_mult)
+CLASS(oft_xmhd_2d_sim), INTENT(in) :: sim
+REAL(r8), INTENT(in) :: psi, kappa_reg, n
+REAL(r8), INTENT(inout) :: chi, par_mult
+REAL(r8) :: dpb, psiN, f, kap
+IF (sim%kappa_sol <= 0.d0 .OR. kappa_reg <= sim%kappa_sol) RETURN
+dpb = sim%psi_norm_bounds(2) - sim%psi_norm_bounds(1)
+IF (ABS(dpb) <= 1.d-12*MAX(ABS(sim%psi_norm_bounds(2)), 1.d-30)) RETURN
+psiN = (sim%psi_norm_bounds(2) - psi)/dpb
+f = 0.5d0*(1.d0 + TANH((psiN - sim%kappa_sol_psiN0)/sim%kappa_sol_dpsiN))
+kap = kappa_reg + (sim%kappa_sol - kappa_reg)*f
+chi = kap/n
+par_mult = par_mult*kappa_reg/kap
+END SUBROUTINE kappa_sol_adjust
+!---------------------------------------------------------------------------
 !> Anisotropic thermal diffusivity tensor chi_perp*I + (chi_par-chi_perp)*bb^T,
 !! where b is the local unit vector along the magnetic field B. Reduces to the
 !! isotropic tensor chi_perp*I when aniso=.FALSE. or B is (near) zero.
@@ -2018,7 +2042,7 @@ INTEGER(i4) :: i
 REAL(r8) :: k_boltz=elec_charge
 REAL(r8) :: m_i = proton_mass
 REAL(r8) :: chi, eta(2), nu, nu1, nu2, D_diff, gamma, B_0(3), diag_vals(7), dt_fac
-REAL(r8) :: T_visc, visc_fac, psiN_visc
+REAL(r8) :: T_visc, visc_fac, psiN_visc, par_mult
 LOGICAL :: hyp_on
 LOGICAL :: ohm_impl !< ohmic_eta_implicit active: d(heating)/dT in the (T,T) block
 REAL(r8), POINTER, DIMENSION(:) :: ohm_q_weights, ohm_by_weights
@@ -2103,7 +2127,7 @@ type(oft_local_mat), allocatable, dimension(:,:) :: jac_loc
 !$omp dT_dpsi,deta_dT,r_geo,d6_eta,d7_eta,T_eta_loc,T_eta_val,n_eta_loc,n_eta_val, sink_term, dsink_dT, psi_n_loc, psi_dt, &
 !$omp ohm_q_loc, ohm_by_loc, q_ohm, dby_ohm, n_ohm, eta_ohm, deta_ohm, dheat_dT, &
 !$omp nu4q, rfac, Tm, sm, dsm, qpf, &
-!$omp chi, m_i, eta, nu, nu1, nu2, visc_row, T_visc, visc_fac, psiN_visc, gamma, D_diff) reduction(+:diag_vals)
+!$omp chi, par_mult, m_i, eta, nu, nu1, nu2, visc_row, T_visc, visc_fac, psiN_visc, gamma, D_diff) reduction(+:diag_vals)
 ALLOCATE(basis_vals(oft_blagrange%nce),basis_grads(3,oft_blagrange%nce))
 IF (incomp) ALLOCATE(basis_vals_p(oft_blagrange_p%nce),basis_grads_p(3,oft_blagrange_p%nce))
 ALLOCATE(vel_weights_loc(3, oft_blagrange%nce),&
@@ -2304,7 +2328,9 @@ DO i=1,mesh%nc
       nu1 = nu*visc_fac/(1.d0+self%nu2_ratio)
       nu2 = nu1*self%nu2_ratio
     END IF
-    kappa_T = chi_tensor(chi, self%chi_par_mult, self%chi_aniso, btmp)
+    par_mult = self%chi_par_mult
+    IF (use_kappa) CALL kappa_sol_adjust(self, psi, self%kappa(mesh%reg(i)), n, chi, par_mult)
+    kappa_T = chi_tensor(chi, par_mult, self%chi_aniso, btmp)
     !---Momentum-only pressure floor (p_floor_T), as nlfun_apply; dsm = d(sm)/dT
     Tm = T; sm = 1.d0; dsm = 0.d0
     IF (self%p_floor_T > 0.d0) THEN

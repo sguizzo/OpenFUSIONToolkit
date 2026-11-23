@@ -123,6 +123,9 @@ REAL(r8) :: dt_rst = -1.d0 !< Timestep read from the restart file when resuming
 REAL(r8) :: dt_min_frac = 0.125d0 !< Stop the run (then plot) once step() retries have cut dt below dt_min_frac times the current phase's starting dt; <=0 disables (set in oft.in group sparc_vde_options)
 REAL(r8) :: dt_phase = 0.d0 !< Starting (nominal) dt of the current kick phase, the reference for dt_min_frac
 REAL(r8) :: kappa_tq2 = 3.084d25 !< kappa_perp [1/(m s)] from the second thermal quench on (M3D-C1: 0.2 normalized)
+REAL(r8) :: kappa_sol = -1.d0 !< kappa_perp [1/(m s)] on open field lines (psiN > kappa_sol_psiN0) wherever kappa_perp is larger, e.g. the pre-TQ value 1.542e20 so that kappa_tq2 acts only inside the LCFS; kappa_par is kept (xmhd_2d kappa_sol). <= 0: off (uniform kappa_perp)
+REAL(r8) :: kappa_sol_psiN0 = 1.d0 !< Middle of the kappa_sol transition (normalized flux)
+REAL(r8) :: kappa_sol_dpsiN = 0.01d0 !< Width of the kappa_sol transition (normalized flux)
 REAL(r8) :: tq2_t_start = -1.d0 !< Start of the second thermal quench [s]; <= 0: the restart time
 REAL(r8) :: tq2_dur = 2.d-5 !< Length of the short-step quench phase [s]
 REAL(r8) :: dt_tq2 = 5.d-7 !< Timestep during the quench phase [s] (with dt_tq2_adapt: the starting dt of that phase)
@@ -178,7 +181,7 @@ NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_sc
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile, &
   T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq,eta_implicit,spitzer_smooth,eta_implicit_jac,ohmic_eta_implicit,eta_gap_pol,gap_regs,pol_mult_regs,pol_mult,eta_vac_pol,visc_hyper,visc_hyper_pol,dt_tq2_adapt,dt_tq2_max, &
-  F0_vac,n_offset,T_offset,T_scale
+  F0_vac,n_offset,T_offset,T_scale,kappa_sol,kappa_sol_psiN0,kappa_sol_dpsiN
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -467,6 +470,11 @@ b_sim%mug%visc_sol_dT = visc_sol_dT
 b_sim%mug%visc_sol_on_psi = visc_sol_on_psi
 b_sim%mug%visc_sol_psiN0 = visc_sol_psiN0
 b_sim%mug%visc_sol_dpsiN = visc_sol_dpsiN
+b_sim%mug%kappa_sol = kappa_sol
+b_sim%mug%kappa_sol_psiN0 = kappa_sol_psiN0
+b_sim%mug%kappa_sol_dpsiN = kappa_sol_dpsiN
+IF(kappa_sol>0.d0)WRITE(*,'(A,ES12.4,A,F8.4,A,F8.4,A)')' Open-field-line kappa_perp (kappa_sol) =',kappa_sol, &
+  ' 1/(m s) where psiN >',kappa_sol_psiN0,' (width',kappa_sol_dpsiN,'); kappa_par kept'
 WRITE(*,'(A,ES12.4,A)')' Linear drag on V_pol (post-kick): drag_rate =',drag_rate,' 1/s (0: off)'
 IF(visc_sol_on_psi)WRITE(*,'(A,F8.4,A,F8.4,A)')' Viscosity: SOL multiplier keyed on psiN (not T): above psiN0 =',visc_sol_psiN0,' (width',visc_sol_dpsiN,')'
 WRITE(*,'(A,F8.2,A,F8.2,A,F8.2,A)')' Viscosity: post-kick SOL multiplier =',visc_sol_mult, &
