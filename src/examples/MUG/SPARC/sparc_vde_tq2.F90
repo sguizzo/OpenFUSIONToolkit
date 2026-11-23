@@ -124,6 +124,7 @@ REAL(r8) :: dt_min_frac = 0.125d0 !< Stop the run (then plot) once step() retrie
 REAL(r8) :: dt_phase = 0.d0 !< Starting (nominal) dt of the current kick phase, the reference for dt_min_frac
 REAL(r8) :: kappa_tq2 = 3.084d25 !< kappa_perp [1/(m s)] from the second thermal quench on (M3D-C1: 0.2 normalized)
 REAL(r8) :: kappa_sol = -1.d0 !< kappa_perp [1/(m s)] on open field lines (psiN > kappa_sol_psiN0) wherever kappa_perp is larger, e.g. the pre-TQ value 1.542e20 so that kappa_tq2 acts only inside the LCFS; kappa_par is kept (xmhd_2d kappa_sol). <= 0: off (uniform kappa_perp)
+LOGICAL :: evolve_pressure_cq = .TRUE. !< Pressure-conserving density diffusion (xmhd_2d evolve_pressure) in the current-quench phase (phase 4); .FALSE. removes its T source (D*T*lap(n)/n) there. The other phases always use .TRUE.
 REAL(r8) :: kappa_sol_psiN0 = 1.d0 !< Middle of the kappa_sol transition (normalized flux)
 REAL(r8) :: kappa_sol_dpsiN = 0.01d0 !< Width of the kappa_sol transition (normalized flux)
 REAL(r8) :: tq2_t_start = -1.d0 !< Start of the second thermal quench [s]; <= 0: the restart time
@@ -181,7 +182,7 @@ NAMELIST/sparc_vde_options/rst_start,visc_kick,visc_post,mass_scale_kick,mass_sc
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,newton_backtrack,resid_dump, &
   dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile, &
   T_floor,kappa_par,kappa_tq2,tq2_t_start,tq2_dur,dt_tq2,dt_cq,mass_scale_tq2,mass_scale_cq,eta_implicit,spitzer_smooth,eta_implicit_jac,ohmic_eta_implicit,eta_gap_pol,gap_regs,pol_mult_regs,pol_mult,eta_vac_pol,visc_hyper,visc_hyper_pol,dt_tq2_adapt,dt_tq2_max, &
-  F0_vac,n_offset,T_offset,T_scale,kappa_sol,kappa_sol_psiN0,kappa_sol_dpsiN
+  F0_vac,n_offset,T_offset,T_scale,kappa_sol,kappa_sol_psiN0,kappa_sol_dpsiN,evolve_pressure_cq
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -475,6 +476,7 @@ b_sim%mug%kappa_sol_psiN0 = kappa_sol_psiN0
 b_sim%mug%kappa_sol_dpsiN = kappa_sol_dpsiN
 IF(kappa_sol>0.d0)WRITE(*,'(A,ES12.4,A,F8.4,A,F8.4,A)')' Open-field-line kappa_perp (kappa_sol) =',kappa_sol, &
   ' 1/(m s) where psiN >',kappa_sol_psiN0,' (width',kappa_sol_dpsiN,'); kappa_par kept'
+WRITE(*,'(A,L2)')' Pressure-conserving density diffusion in the current quench (evolve_pressure_cq):',evolve_pressure_cq
 WRITE(*,'(A,ES12.4,A)')' Linear drag on V_pol (post-kick): drag_rate =',drag_rate,' 1/s (0: off)'
 IF(visc_sol_on_psi)WRITE(*,'(A,F8.4,A,F8.4,A)')' Viscosity: SOL multiplier keyed on psiN (not T): above psiN0 =',visc_sol_psiN0,' (width',visc_sol_dpsiN,')'
 WRITE(*,'(A,F8.2,A,F8.2,A,F8.2,A)')' Viscosity: post-kick SOL multiplier =',visc_sol_mult, &
@@ -560,6 +562,7 @@ DO i=rst_start+1,nstep_total
     b_sim%mug%visc_sol_mult = visc_sol_mult
     b_sim%mug%m_i(1) = m_i_plasma*mass_scale_post
     b_sim%mug%evolve_pressure = .TRUE.
+    IF(kick_phase == 4) b_sim%mug%evolve_pressure = evolve_pressure_cq
     b_sim%mug%drag_rate = drag_rate
     SELECT CASE(kick_phase)
     CASE(2) ! before the quench: the parent run's post-kick settings
