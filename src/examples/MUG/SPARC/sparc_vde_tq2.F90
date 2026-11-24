@@ -193,6 +193,8 @@ CALL oft_init
 OPEN(NEWUNIT=io_unit,FILE=oft_env%ifile)
 READ(io_unit,sparc_vde_options,IOSTAT=ierr)
 CLOSE(io_unit)
+IF(ierr>0)CALL oft_abort('Error reading sparc_vde_options (unknown or malformed entry; the entries after it would be left at their defaults)', &
+  'sparc_vde_tq2',__FILE__)
 !---------------------------------------------------------------------------
 ! Setup grid
 !---------------------------------------------------------------------------

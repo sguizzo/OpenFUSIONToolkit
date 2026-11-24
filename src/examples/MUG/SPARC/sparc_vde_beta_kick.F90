@@ -21,7 +21,8 @@ USE oft_gs_util, ONLY: gs_profile_load
 USE oft_lag_basis, ONLY: oft_lag_setup,oft_scalar_bfem, oft_blag_eval, oft_blag_geval, oft_2D_lagrange_cast
 USE fem_base, ONLY: oft_ml_fem_type
 USE mugtok_td
-USE xmhd_2d, ONLY: spitzer_smooth_2d => spitzer_smooth, xmhd_2d_force_terms, spitzer_fac_2d => spitzer_fac
+USE xmhd_2d, ONLY: spitzer_smooth_2d => spitzer_smooth, xmhd_2d_force_terms, spitzer_fac_2d => spitzer_fac, &
+  spitzer_T_off_2d => spitzer_T_off
 USE oft_lu, ONLY: oft_lusolver
 USE oft_native_solvers, ONLY: oft_bjprecond
 
@@ -140,6 +141,7 @@ REAL(r8) :: T_offset = 7.8d0 !< Temperature offset [eV]
 REAL(r8) :: p_axis_eq, p_axis_nT !< Equilibrium vs. 2*k*n*T pressure on axis [Pa] (diagnostic)
 REAL(r8) :: lin_tol = 1.d-7 !< Absolute tolerance of the linear (GMRES) solve (set in oft.in group sparc_vde_options)
 REAL(r8) :: lin_rtol = 1.d-14 !< Relative tolerance of the linear (GMRES) solve, |r|/|r0| (mugtok_td lin_rtol): GMRES stops at whichever of lin_tol / lin_rtol is met first. Default: off (absolute lin_tol only)
+REAL(r8) :: spitzer_T_off = 7.5d0 !< Spitzer temperature offset [eV] (xmhd_2d spitzer_T_off): eta ~ (T - spitzer_T_off)^(-3/2); 7.5 = M3D-C1, 0 = plain Spitzer
 REAL(r8) :: spitzer_fac = 1.d0 !< Factor on the Spitzer resistivity coefficient (xmhd_2d spitzer_fac): 1 = perpendicular Spitzer (runs before 2026-10-27), 0.511 = parallel Spitzer as in M3D-C1
 LOGICAL :: spitzer_smooth = .FALSE. !< Smooth eta cap (xmhd_2d spitzer_smooth): eta = 1/(sigma_Spitzer + 1/eta_cap) instead of min(eta_Spitzer, eta_cap). Default off
 REAL(r8) :: nl_tol = 1.d-6 !< Absolute tolerance on the Newton residual |F| (set in oft.in group sparc_vde_options). Newton stalls at a round-off floor that rises at lower mass_scale (~5e-7 at mass_scale 1000, ~1-3e-6 at 100 for dt 0.5 ms); if nl_tol is below that floor every step fails and is retried with dt halved
@@ -164,7 +166,7 @@ NAMELIST/sparc_vde_options/force_rst,rst_start,visc_kick,visc_post,mass_scale_ki
   visc_sol_on_psi,visc_sol_psiN0,visc_sol_dpsiN,drag_rate,fix_F_boundary,ohmic_heating,lu_reanalyze,pre_nlocal,pre_overlap,pre_part,spitzer_fac,lu_package,dt_grow_steps,dt_post,dt_start,newton_backtrack,resid_dump, &
   dt_refactor_tol,pre_adapt,pre_max_age,pre_its_ratio,dt_adapt,lin_its_target,dt_hist,step_profile,kick_dt_adapt,dt_kick_max, &
   T_floor,kappa_par,visc_hyper,visc_hyper_pol,T_floor_cap,T_floor_rate,p_floor_T,p_floor_dT,eta_implicit,spitzer_smooth,eta_implicit_jac,ohmic_eta_implicit,eta_gap_pol,gap_regs,pol_mult_regs,pol_mult,eta_vac_pol,F0_vac, &
-  n_offset,T_offset,T_scale,kappa_kick,kappa_base,t_kick_start,t_kick_dur
+  n_offset,T_offset,T_scale,kappa_kick,kappa_base,t_kick_start,t_kick_dur,spitzer_T_off
 !------------------------------------------------------------------------------
 ! Initialize enviroment
 !---------------------------------------------------------------------------- d--
@@ -173,6 +175,8 @@ CALL oft_init
 OPEN(NEWUNIT=io_unit,FILE=oft_env%ifile)
 READ(io_unit,sparc_vde_options,IOSTAT=ierr)
 CLOSE(io_unit)
+IF(ierr>0)CALL oft_abort('Error reading sparc_vde_options (unknown or malformed entry; the entries after it would be left at their defaults)', &
+  'sparc_vde_beta_kick',__FILE__)
 !---------------------------------------------------------------------------
 ! Setup grid
 !---------------------------------------------------------------------------
@@ -395,6 +399,8 @@ b_sim%pre_part = pre_part
 b_sim%lin_rtol = lin_rtol
 spitzer_fac_2d = spitzer_fac
 spitzer_smooth_2d = spitzer_smooth
+spitzer_T_off_2d = spitzer_T_off
+WRITE(*,'(A,F8.3)')' Spitzer temperature offset [eV] (spitzer_T_off; 7.5 = M3D-C1):',spitzer_T_off
 WRITE(*,'(A,F8.4)')' Spitzer resistivity factor (spitzer_fac; 1 = perpendicular, 0.511 = parallel as M3D-C1):',spitzer_fac
 WRITE(*,'(A,L2)')' Smooth Spitzer eta cap (spitzer_smooth): ',spitzer_smooth
 CALL b_sim%setup_mhd(equil, dt, lin_tol, nl_tol, mhd_flag, dens_reg, visc_reg, eta_reg=eta_reg, kappa_reg=kappa_reg, mass_scale=mass_scale_kick, D_reg=D_reg, toroidal_flow = .FALSE.)
