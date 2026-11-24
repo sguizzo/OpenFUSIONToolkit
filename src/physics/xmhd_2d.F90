@@ -217,6 +217,7 @@ TYPE, public :: oft_xmhd_2d_sim
 END TYPE oft_xmhd_2d_sim
 TYPE(oft_xmhd_2d_sim), POINTER :: current_sim => NULL() !Active 2D MHD simulation
 LOGICAL, PUBLIC :: spitzer_smooth = .FALSE. !< Smooth cap in spitzer_eta: eta = 1/(sigma_Spitzer + 1/eta_cap) (conductivities add) instead of min(eta_Spitzer, eta_cap). Removes the kink (d(eta)/dT jumping from 0 to its steepest value at the cap, T - T_off = (spitzer_fac*C/eta_cap)^(2/3), 0.31 eV for spitzer_fac = 1) that makes Newton non-smooth with eta_implicit. Same limits: eta -> eta_cap below T_off, -> eta_Spitzer far above; at the old cap point eta is eta_cap/2
+REAL(r8), PUBLIC :: spitzer_T_off = 7.5d0 !< Temperature offset T_off [eV] in spitzer_eta, eta ~ (T - T_off)^(-3/2). 7.5 = M3D-C1 eta_te_offset (all runs before 2026-11-24); 0 = plain Spitzer
 REAL(r8), PUBLIC :: spitzer_fac = 1.d0 !< Factor on the Spitzer coefficient in spitzer_eta (applied before the cap). 1 = the perpendicular coefficient 1.03e-4*Z*lnLam used so far; 0.511 = parallel Spitzer (the 0.51 Spitzer-Harm factor for Z=1), which is what M3D-C1's eta field shows (eta_C1 = 0.511 x this formula, 2026-10-27)
 !
 CLASS(multigrid_mesh), POINTER :: mg_mesh => NULL() !< Multigrid mesh object
@@ -1752,7 +1753,7 @@ END SUBROUTINE xmhd_2d_force_terms
 !! eta = 1.03e-4*Zi*lnLam/(T - T_off)**1.5  [Ohm*m], capped at eta_cap
 !!
 !! M3D-C1 uses one isotropic eta with the perpendicular Spitzer coefficient,
-!! a fixed Coulomb log (lambda_coulomb = 17), T_off = eta_te_offset = 7.5 eV,
+!! a fixed Coulomb log (lambda_coulomb = 17), T_off = eta_te_offset = 7.5 eV (spitzer_T_off),
 !! and a cap of eta_max = eta_vac = 1 (normalized) = 1.94 Ohm*m. Density is
 !! not used (fixed lnLam) but is kept in the interface.
 !---------------------------------------------------------------------------
@@ -1763,14 +1764,13 @@ real(r8), intent(out) :: eta(2) !< [in-plane, out-of-plane] resistivity in units
 real(r8), intent(out), optional :: deta_dT(2) !< d(eta)/dT [in-plane, out-of-plane], units of mu0 per eV
 real(r8), parameter :: Zi = 1.d0         ! ion charge number
 real(r8), parameter :: lnLam = 17.d0     ! M3D-C1 lambda_coulomb (default)
-real(r8), parameter :: T_off = 7.5d0     ! M3D-C1 eta_te_offset [eV]
 real(r8), parameter :: eta_cap = 1.0d-2  ! M3D-C1 eta_max = eta_vac [Ohm*m]
 real(r8), parameter :: C_sp = 1.03d-4*Zi*lnLam ! perpendicular Spitzer coefficient [Ohm*m*eV^1.5]
 real(r8) :: dT, eta_phys, deta_phys_dT, sig_sp, dsig_dT
 LOGICAL :: capped
-!---Offset Spitzer, capped at eta_cap (the hard cap is reached for T < T_off + (spitzer_fac*C_sp/eta_cap)**(2/3),
+!---Offset Spitzer, capped at eta_cap (the hard cap is reached for T < spitzer_T_off + (spitzer_fac*C_sp/eta_cap)**(2/3),
 !   0.31 eV for spitzer_fac = 1); with spitzer_smooth the conductivities add instead (smooth, no kink)
-dT = T - T_off
+dT = T - spitzer_T_off
 IF(spitzer_smooth)THEN
   sig_sp = 0.d0; dsig_dT = 0.d0
   IF(dT > 0.d0)THEN
